@@ -194,12 +194,12 @@ if __name__ == "__main__":
         weight_dtype = torch.float16
         
     # Load the pretrained models
-    # transformer = TinySD3Transformer2DModel.from_pretrained(args.pretrained_model_name_or_path,subfolder="transformer", 
-    #                                         torch_dtype=weight_dtype, low_cpu_mem_usage=False, ignore_mismatched_sizes=True)
-    # vae = AutoencoderTiny.from_pretrained(args.vae_path, torch_dtype=weight_dtype)
-    transformer = TinySD3Transformer2DModel.from_config(args.pretrained_model_name_or_path,subfolder="transformer", 
+    transformer = TinySD3Transformer2DModel.from_pretrained(args.pretrained_model_name_or_path,subfolder="transformer", 
+                                            torch_dtype=weight_dtype, low_cpu_mem_usage=False, ignore_mismatched_sizes=True)
+    vae = AutoencoderTiny.from_pretrained(args.vae_path, torch_dtype=weight_dtype)
+    transformer = TinySD3Transformer2DModel.from_pretrained(args.pretrained_model_name_or_path,subfolder="transformer", 
                                                         torch_dtype=weight_dtype, low_cpu_mem_usage=False, ignore_mismatched_sizes=True)
-    vae = AutoencoderTiny.from_config(args.vae_path, torch_dtype=weight_dtype)
+    vae = AutoencoderTiny.from_pretrained(args.vae_path, torch_dtype=weight_dtype)
     
     if args.is_use_tile:
         _init_tiled_vae(vae, encoder_tile_size=args.vae_encoder_tiled_size, decoder_tile_size=args.vae_decoder_tiled_size)
@@ -213,8 +213,8 @@ if __name__ == "__main__":
     transformer.add_adapter(transformer_lora_config)
     transformer.enable_adapters()
 
-    # transformer_lora_state_dict = StableDiffusion3Pipeline.lora_state_dict(args.lora_dir, weight_name="transformer.safetensors")
-    # load_lora_state_dict(transformer_lora_state_dict, transformer)
+    transformer_lora_state_dict = StableDiffusion3Pipeline.lora_state_dict(args.lora_dir, weight_name="transformer.safetensors")
+    load_lora_state_dict(transformer_lora_state_dict, transformer)
 
     vae = vae.to(args.device, dtype=weight_dtype)
     transformer = transformer.to(args.device, dtype=weight_dtype)
