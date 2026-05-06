@@ -1,7 +1,7 @@
 python test/test_tinysr.py  \
---pretrained_model_name_or_path="/your/path/to/checkpoint/tinybackbone/prune-12-merge-tinysr" \
---vae_path="/your/path/to/checkpoint/vae/separable" \
---lora_dir="/your/path/to/checkpoint/tinysr" \
+--pretrained_model_name_or_path="checkpoint/tinybackbone/prune-12-merge-tinysr" \
+--vae_path="checkpoint/vae/separable" \
+--lora_dir="" \
 --embedding_dir="dataset/default/" \
 --output_dir="outputs/tinysr/" \
 --input_dir="dataset/test_image/" \
