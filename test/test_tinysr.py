@@ -29,6 +29,7 @@ def parse_args():
     parser.add_argument("--pretrained_model_name_or_path", type=str, default="path/to/your/model", help='path to the pretrained sd3')
     parser.add_argument("--vae_path", type=str, default="path/to/your/vae", help='path to tsd-sr lora weights')
     parser.add_argument("--lora_dir", type=str, default="path/to/your/lora", help='path to tsd-sr lora weights')
+    parser.add_argument("--cache_dir", type=str, default="/data/disk2/xby/models", help='cache directory for downloading models')
     parser.add_argument("--embedding_dir", type=str, default="dataset/default/", help='path to prompt embeddings')
     parser.add_argument("--output_dir", '-o', type=str, default="outputs/tinysr/", help='path to save results')
     parser.add_argument('--input_dir', '-i', type=str, default="path/to/your/input", help='path to the input image')
@@ -189,32 +190,35 @@ def main(args, pixel_values, size):
    
 if __name__ == "__main__":
     args = parse_args()
+    
+    # Set huggingface cache directory
+    os.environ['HF_HOME'] = args.cache_dir
+    os.environ['HF_HUB_CACHE'] = args.cache_dir
+    
     weight_dtype = torch.float32
     if args.mixed_precision == "fp16":
         weight_dtype = torch.float16
         
     # Load the pretrained models
     transformer = TinySD3Transformer2DModel.from_pretrained(args.pretrained_model_name_or_path,subfolder="transformer", 
-                                            torch_dtype=weight_dtype, low_cpu_mem_usage=False, ignore_mismatched_sizes=True)
-    vae = AutoencoderTiny.from_pretrained(args.vae_path, torch_dtype=weight_dtype)
-    transformer = TinySD3Transformer2DModel.from_pretrained(args.pretrained_model_name_or_path,subfolder="transformer", 
-                                                        torch_dtype=weight_dtype, low_cpu_mem_usage=False, ignore_mismatched_sizes=True)
-    vae = AutoencoderTiny.from_pretrained(args.vae_path, torch_dtype=weight_dtype)
+                                            torch_dtype=weight_dtype, low_cpu_mem_usage=False, ignore_mismatched_sizes=True, cache_dir=args.cache_dir)
+    vae = AutoencoderTiny.from_pretrained(args.vae_path, torch_dtype=weight_dtype, cache_dir=args.cache_dir)
     
     if args.is_use_tile:
         _init_tiled_vae(vae, encoder_tile_size=args.vae_encoder_tiled_size, decoder_tile_size=args.vae_decoder_tiled_size)
     
-    transformer_lora_config = LoraConfig(
-        r=args.rank,
-        lora_alpha=args.rank,
-        init_lora_weights="gaussian",
-        target_modules=["to_k", "to_q", "to_v", "to_out.0","proj","linear", "linear_1", "linear_2", "net.2"],
-    )
-    transformer.add_adapter(transformer_lora_config)
-    transformer.enable_adapters()
+    if args.lora_dir:
+        transformer_lora_config = LoraConfig(
+            r=args.rank,
+            lora_alpha=args.rank,
+            init_lora_weights="gaussian",
+            target_modules=["to_k", "to_q", "to_v", "to_out.0","proj","linear", "linear_1", "linear_2", "net.2"],
+        )
+        transformer.add_adapter(transformer_lora_config)
+        transformer.enable_adapters()
 
-    transformer_lora_state_dict = StableDiffusion3Pipeline.lora_state_dict(args.lora_dir, weight_name="transformer.safetensors")
-    load_lora_state_dict(transformer_lora_state_dict, transformer)
+        transformer_lora_state_dict = StableDiffusion3Pipeline.lora_state_dict(args.lora_dir, weight_name="transformer.safetensors", cache_dir=args.cache_dir)
+        load_lora_state_dict(transformer_lora_state_dict, transformer)
 
     vae = vae.to(args.device, dtype=weight_dtype)
     transformer = transformer.to(args.device, dtype=weight_dtype)
