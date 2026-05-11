@@ -71,6 +71,8 @@ def parse_args():
     parser.add_argument("--output_dir", type=str, default="outputs/w4a4_tinysr")
 
     parser.add_argument("--rank", type=int, default=64)
+    parser.add_argument("--svdq_rank", type=int, default=32)
+    parser.add_argument("--svdq_quantize_residual", action="store_true")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--upscale", type=int, default=4)
     parser.add_argument("--process_size", type=int, default=512)
@@ -536,6 +538,16 @@ def main():
             transformer,
             target_suffixes=target_suffixes,
             skip_keywords=("lora_",),
+            weight_quant_kind="svdq",
+            weight_quant_kwargs={
+                "bits": 4,
+                "symmetric": True,
+                "per_channel": True,
+                "ch_axis": 0,
+                "rank": args.svdq_rank,
+                "compensate": True,
+                "quantize_residual": args.svdq_quantize_residual,
+            },
         )
         print(f"[W4A4] replaced Linear layers: {len(replaced_layers)}")
         for layer_name in replaced_layers[:20]:
