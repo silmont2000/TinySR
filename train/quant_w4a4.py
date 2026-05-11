@@ -430,6 +430,7 @@ class LowRankAffineQuantComponent(QuantComponent):
         gptq_block_size=128,
         gptq_damp_percentage=0.01,
         max_gptq_samples=2048,
+        smooth_alpha=0.5,
     ):
         super().__init__()
         self.quantizer = UniformAffineQuantizer(
@@ -446,7 +447,10 @@ class LowRankAffineQuantComponent(QuantComponent):
         self.gptq_block_size = gptq_block_size
         self.gptq_damp_percentage = gptq_damp_percentage
         self.max_gptq_samples = max_gptq_samples
+        self.smooth_alpha = smooth_alpha
         self.branch = None
+        self.register_buffer("smooth_scale", None)
+        self.register_buffer("act_absmax", None)
         self.register_buffer("residual", None)
         self.input_cache = []
 
@@ -480,13 +484,19 @@ class LowRankAffineQuantComponent(QuantComponent):
 
     @torch.no_grad()
     def collect_inputs(self, x):
+        x = x.detach()
+        act_absmax = x.abs().reshape(-1, x.shape[-1]).amax(dim=0)
+        if self.act_absmax is None:
+            self.act_absmax = act_absmax.cpu()
+        else:
+            self.act_absmax = torch.maximum(self.act_absmax, act_absmax.cpu())
+
         if not self.quantize_residual or self.max_gptq_samples == 0:
             return
-        x = x.detach()
         x = x.reshape(-1, x.shape[-1])
         if x.numel() == 0:
             return
-        remaining = self.max_gptq_samples - sum(t.shape[0] for t in self.input_cache)
+        remaining = self.max_gptq_samples - sum(t.shape[0] for t in self.input_cache)# 防止为 GPTQ 收集输入时无限增长显存/内存
         if remaining <= 0:
             return
         self.input_cache.append(x[:remaining].cpu())
@@ -505,37 +515,48 @@ class LowRankAffineQuantComponent(QuantComponent):
         self.quantizer.zero_point = torch.tensor(0.0, device=device)
         self.quantizer.calibrated = False
         self.branch = None
+        self.smooth_scale = None
+        self.act_absmax = None
         self.residual = None
         self.input_cache = []
 
     @torch.no_grad()
-    def build_branch(self, weight, quant_weight=None):
+    def build_branch(self, weight, quant_weight=None, smooth_scale=None):
+        if smooth_scale is not None:
+            self.smooth_scale = smooth_scale.detach().to(device=weight.device, dtype=weight.dtype)
+        elif self.smooth_scale is None:
+            self.smooth_scale = torch.ones(weight.shape[1], device=weight.device, dtype=weight.dtype)
+
+        smooth_weight = weight * self.smooth_scale.reshape(1, -1)
         if self.rank == 0:
             self.branch = None
-            low_rank_weight = torch.zeros_like(weight)
+            low_rank_weight = torch.zeros_like(smooth_weight)
         else:
             if quant_weight is None:
                 quant_enabled = self.quantizer.enabled
                 self.quantizer.enabled = True
-                quant_weight = self.quantizer(weight)
+                quant_weight = self.quantizer(smooth_weight)
                 self.quantizer.enabled = quant_enabled
 
-            branch_weight = weight - quant_weight if self.compensate and quant_weight is not None else weight
+            branch_weight = smooth_weight - quant_weight if self.compensate and quant_weight is not None else smooth_weight
             self.branch = LowRankBranch(
-                weight.shape[1],
-                weight.shape[0],
+                smooth_weight.shape[1],
+                smooth_weight.shape[0],
                 rank=self.rank,
                 alpha=self.alpha,
                 weight=branch_weight,
             )
             low_rank_weight = self.branch.get_effective_weight()
             if low_rank_weight is None:
-                low_rank_weight = torch.zeros_like(weight)
+                low_rank_weight = torch.zeros_like(smooth_weight)
 
         self.residual = None
         if self.quantize_residual:
-            residual = weight - quant_weight - low_rank_weight if self.compensate else weight - low_rank_weight
-            inputs = torch.cat(self.input_cache, dim=0).to(device=weight.device) if self.input_cache else None
+            residual = smooth_weight - quant_weight - low_rank_weight if self.compensate else smooth_weight - low_rank_weight
+            inputs = None
+            if self.input_cache:
+                inputs = torch.cat(self.input_cache, dim=0).to(device=weight.device, dtype=weight.dtype)
+                inputs = inputs / self.smooth_scale.reshape(1, -1)
             self.residual = gptq_quantize_linear_weight(
                 residual,
                 inputs,
@@ -582,6 +603,8 @@ class LowRankAffineQuantComponent(QuantComponent):
             "quantize_residual": bool(self.quantize_residual),
             "gptq_block_size": int(self.gptq_block_size),
             "gptq_damp_percentage": float(self.gptq_damp_percentage),
+            "smooth_alpha": float(self.smooth_alpha),
+            "has_smooth_scale": self.smooth_scale is not None,
             "has_branch": self.branch is not None,
             "has_residual": self.residual is not None,
         }
@@ -617,13 +640,13 @@ class QuantLinearW4A4(nn.Module):
             self.bias = None
 
         weight_quant_kwargs = weight_quant_kwargs or {
-            "bits": 2,
+            "bits": 4,
             "symmetric": True,
             "per_channel": True,
             "ch_axis": 0,
         }
         act_quant_kwargs = act_quant_kwargs or {
-            "bits": 2,
+            "bits": 4,
             "symmetric": True,
             "per_channel": True,
             # Activations are typically shaped [B, ..., C] in this project.
@@ -650,8 +673,15 @@ class QuantLinearW4A4(nn.Module):
     def forward(self, x):
         if hasattr(self.weight_quantizer, "collect_inputs") and self.weight_quantizer.observer_enabled:
             self.weight_quantizer.collect_inputs(x)
+        smooth_scale = getattr(self.weight_quantizer, "smooth_scale", None)
+        if smooth_scale is not None:
+            x = x / smooth_scale.reshape(*([1] * (x.dim() - 1)), -1)
+            weight = self.weight * smooth_scale.reshape(1, -1)
+        else:
+            weight = self.weight
+
         x_q = self.act_quantizer(x)
-        w_q = self.weight_quantizer(self.weight)
+        w_q = self.weight_quantizer(weight)
         out = F.linear(x_q, w_q, self.bias)
         branch_out = self.weight_quantizer.branch_forward(x_q) if hasattr(self.weight_quantizer, "branch_forward") else None
         if branch_out is not None:
@@ -719,12 +749,21 @@ def set_observer_enabled(module: nn.Module, enabled=True):
 def freeze_quant_params(module: nn.Module):
     for m in module.modules():
         if isinstance(m, QuantLinearW4A4):
+            smooth_scale = None
+            if hasattr(m.weight_quantizer, "act_absmax") and m.weight_quantizer.act_absmax is not None:
+                act_absmax = m.weight_quantizer.act_absmax.to(device=m.weight.device, dtype=m.weight.dtype).clamp_min(1e-8)
+                weight_absmax = m.weight.detach().abs().amax(dim=0).clamp_min(1e-8)
+                alpha = m.weight_quantizer.smooth_alpha
+                smooth_scale = act_absmax.pow(alpha) / weight_absmax.pow(1.0 - alpha)
+                smooth_scale = smooth_scale.clamp_min(1e-8)
+
             # Collect weight stats from the static weight tensor to support
             # calibration mode where fake-quant is disabled.
-            m.weight_quantizer.collect_stats(m.weight)
+            stat_weight = m.weight * smooth_scale.reshape(1, -1) if smooth_scale is not None else m.weight
+            m.weight_quantizer.collect_stats(stat_weight)
             m.weight_quantizer.freeze()
             if hasattr(m.weight_quantizer, "build_branch"):
-                m.weight_quantizer.build_branch(m.weight)
+                m.weight_quantizer.build_branch(m.weight, smooth_scale=smooth_scale)
             m.act_quantizer.freeze()
 
 def set_quant_enabled(module: nn.Module, enabled=True):

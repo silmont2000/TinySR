@@ -73,6 +73,7 @@ def parse_args():
     parser.add_argument("--rank", type=int, default=64)
     parser.add_argument("--svdq_rank", type=int, default=32)
     parser.add_argument("--svdq_quantize_residual", action="store_true")
+    parser.add_argument("--svdq_smooth_alpha", type=float, default=0.5)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--upscale", type=int, default=4)
     parser.add_argument("--process_size", type=int, default=512)
@@ -547,6 +548,7 @@ def main():
                 "rank": args.svdq_rank,
                 "compensate": True,
                 "quantize_residual": args.svdq_quantize_residual,
+                "smooth_alpha": args.svdq_smooth_alpha,
             },
         )
         print(f"[W4A4] replaced Linear layers: {len(replaced_layers)}")
