@@ -125,8 +125,134 @@ class UniformAffineQuantizer(nn.Module):
         return x_dequant
 
 
+class QuantComponent(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.enabled = True
+        self.observer_enabled = True
+
+    @torch.no_grad()
+    def collect_stats(self, x):
+        return x
+
+    @torch.no_grad()
+    def freeze(self):
+        self.observer_enabled = False
+
+    @torch.no_grad()
+    def reset(self):
+        pass
+
+    def forward(self, x):
+        return x
+
+    def meta(self):
+        return {
+            "type": self.__class__.__name__,
+            "enabled": bool(self.enabled),
+            "observer_enabled": bool(self.observer_enabled),
+        }
+
+
+class AffineQuantComponent(QuantComponent):
+    def __init__(
+        self,
+        bits=4,
+        symmetric=True,
+        per_channel=False,
+        ch_axis=0,
+        eps=1e-8,
+    ):
+        super().__init__()
+        self.quantizer = UniformAffineQuantizer(
+            bits=bits,
+            symmetric=symmetric,
+            per_channel=per_channel,
+            ch_axis=ch_axis,
+            eps=eps,
+        )
+
+    @property
+    def enabled(self):
+        return self.quantizer.enabled
+
+    @enabled.setter
+    def enabled(self, value):
+        if "quantizer" in self._modules:
+            self.quantizer.enabled = value
+        else:
+            self.__dict__["enabled"] = value
+
+    @property
+    def observer_enabled(self):
+        return self.quantizer.observer_enabled
+
+    @observer_enabled.setter
+    def observer_enabled(self, value):
+        if "quantizer" in self._modules:
+            self.quantizer.observer_enabled = value
+            self.quantizer.observer.enabled = value
+        else:
+            self.__dict__["observer_enabled"] = value
+
+    @torch.no_grad()
+    def collect_stats(self, x):
+        self.quantizer.observer(x)
+        return x
+
+    @torch.no_grad()
+    def freeze(self):
+        self.quantizer.calculate_qparams()
+        self.observer_enabled = False
+
+    @torch.no_grad()
+    def reset(self):
+        device = self.quantizer.scale.device
+        self.quantizer.observer.min_val = torch.tensor(float("inf"), device=device)
+        self.quantizer.observer.max_val = torch.tensor(float("-inf"), device=device)
+        self.quantizer.scale = torch.tensor(1.0, device=device)
+        self.quantizer.zero_point = torch.tensor(0.0, device=device)
+        self.quantizer.calibrated = False
+
+    def forward(self, x):
+        return self.quantizer(x)
+
+    def meta(self):
+        scale = self.quantizer.scale.detach()
+        return {
+            "type": self.__class__.__name__,
+            "enabled": bool(self.enabled),
+            "observer_enabled": bool(self.observer_enabled),
+            "bits": int(self.quantizer.bits),
+            "symmetric": bool(self.quantizer.symmetric),
+            "per_channel": bool(self.quantizer.per_channel),
+            "ch_axis": int(self.quantizer.ch_axis),
+            "qmin": int(self.quantizer.qmin),
+            "qmax": int(self.quantizer.qmax),
+            "calibrated": bool(self.quantizer.calibrated),
+            "scale_shape": list(scale.shape),
+            "scale_min": float(scale.min().cpu()),
+            "scale_max": float(scale.max().cpu()),
+        }
+
+
+def build_quant_component(kind="affine", **kwargs):
+    if kind == "none":
+        return QuantComponent()
+    if kind == "affine":
+        return AffineQuantComponent(**kwargs)
+    raise ValueError(f"Unknown quant component kind: {kind}")
+
+
 class QuantLinearW4A4(nn.Module):
-    def __init__(self, linear: nn.Linear):
+    def __init__(
+        self,
+        linear: nn.Linear,
+        weight_quant_kind="affine",
+        act_quant_kind="affine",
+        weight_quant_kwargs=None,
+        act_quant_kwargs=None,
+    ):
         super().__init__()
         self.in_features = linear.in_features
         self.out_features = linear.out_features
@@ -137,19 +263,36 @@ class QuantLinearW4A4(nn.Module):
         else:
             self.bias = None
 
-        self.weight_quantizer = UniformAffineQuantizer(
-            bits=4,
-            symmetric=True,
-            per_channel=True,
-            ch_axis=0,
+        weight_quant_kwargs = weight_quant_kwargs or {
+            "bits": 4,
+            "symmetric": True,
+            "per_channel": True,
+            "ch_axis": 0,
+        }
+        act_quant_kwargs = act_quant_kwargs or {
+            "bits": 8,
+            "symmetric": True,
+            "per_channel": True,
+            # Activations are typically shaped [B, ..., C] in this project.
+            # Per-channel quantization uses the last dim by default.
+            "ch_axis": -1,
+        }
+
+        self.weight_quantizer = build_quant_component(
+            weight_quant_kind,
+            **weight_quant_kwargs,
+        )
+        self.act_quantizer = build_quant_component(
+            act_quant_kind,
+            **act_quant_kwargs,
         )
 
-        self.act_quantizer = UniformAffineQuantizer(
-            bits=4,
-            symmetric=True,
-            per_channel=False,
-            ch_axis=0,
-        )
+        # If activations are quantized per-channel, verify the chosen channel axis is valid
+        # for typical activation shapes to avoid silently quantizing on the wrong dim.
+        if getattr(self.act_quantizer, "quantizer", None) is not None:
+            q = self.act_quantizer.quantizer
+            if getattr(q, "per_channel", False) and getattr(q, "ch_axis", None) == -1:
+                pass
 
     def forward(self, x):
         x_q = self.act_quantizer(x)
@@ -161,6 +304,10 @@ def replace_linear_with_w4a4(
     module: nn.Module,
     target_suffixes=None,
     skip_keywords=("lora_",),
+    weight_quant_kind="affine",
+    act_quant_kind="affine",
+    weight_quant_kwargs=None,
+    act_quant_kwargs=None,
 ):
     replaced = []
 
@@ -180,7 +327,13 @@ def replace_linear_with_w4a4(
         parent_name, child_name = name.rsplit(".", 1) if "." in name else ("", name)
         parent = module.get_submodule(parent_name) if parent_name else module
 
-        quant_child = QuantLinearW4A4(child)
+        quant_child = QuantLinearW4A4(
+            child,
+            weight_quant_kind=weight_quant_kind,
+            act_quant_kind=act_quant_kind,
+            weight_quant_kwargs=weight_quant_kwargs,
+            act_quant_kwargs=act_quant_kwargs,
+        )
         quant_child = quant_child.to(device=child.weight.device, dtype=child.weight.dtype)
 
         setattr(parent, child_name, quant_child)
@@ -201,8 +354,6 @@ def set_observer_enabled(module: nn.Module, enabled=True):
         if isinstance(m, QuantLinearW4A4):
             m.weight_quantizer.observer_enabled = enabled
             m.act_quantizer.observer_enabled = enabled
-            m.weight_quantizer.observer.enabled = enabled
-            m.act_quantizer.observer.enabled = enabled
 
 
 @torch.no_grad()
@@ -211,13 +362,9 @@ def freeze_quant_params(module: nn.Module):
         if isinstance(m, QuantLinearW4A4):
             # Collect weight stats from the static weight tensor to support
             # calibration mode where fake-quant is disabled.
-            m.weight_quantizer.observer(m.weight)
-            m.weight_quantizer.calculate_qparams()
-            m.act_quantizer.calculate_qparams()
-            m.weight_quantizer.observer_enabled = False
-            m.act_quantizer.observer_enabled = False
-            m.weight_quantizer.observer.enabled = False
-            m.act_quantizer.observer.enabled = False
+            m.weight_quantizer.collect_stats(m.weight)
+            m.weight_quantizer.freeze()
+            m.act_quantizer.freeze()
 
 def set_quant_enabled(module: nn.Module, enabled=True):
     set_quant_state(module, weight_quant=enabled, act_quant=enabled)
@@ -239,13 +386,8 @@ def set_act_quant_enabled(module: nn.Module, enabled=True):
 def reset_observers(module: nn.Module):
     for m in module.modules():
         if isinstance(m, QuantLinearW4A4):
-            for quantizer in [m.weight_quantizer, m.act_quantizer]:
-                device = quantizer.scale.device
-                quantizer.observer.min_val = torch.tensor(float("inf"), device=device)
-                quantizer.observer.max_val = torch.tensor(float("-inf"), device=device)
-                quantizer.scale = torch.tensor(1.0, device=device)
-                quantizer.zero_point = torch.tensor(0.0, device=device)
-                quantizer.calibrated = False
+            m.weight_quantizer.reset()
+            m.act_quantizer.reset()
 
 
 def collect_quant_meta(module: nn.Module):
@@ -255,9 +397,6 @@ def collect_quant_meta(module: nn.Module):
         if not isinstance(m, QuantLinearW4A4):
             continue
 
-        weight_scale = m.weight_quantizer.scale.detach()
-        act_scale = m.act_quantizer.scale.detach()
-
         meta.append(
             {
                 "name": name,
@@ -265,30 +404,8 @@ def collect_quant_meta(module: nn.Module):
                 "in_features": int(m.in_features),
                 "out_features": int(m.out_features),
                 "has_bias": m.bias is not None,
-                "weight": {
-                    "bits": int(m.weight_quantizer.bits),
-                    "symmetric": bool(m.weight_quantizer.symmetric),
-                    "per_channel": bool(m.weight_quantizer.per_channel),
-                    "ch_axis": int(m.weight_quantizer.ch_axis),
-                    "qmin": int(m.weight_quantizer.qmin),
-                    "qmax": int(m.weight_quantizer.qmax),
-                    "calibrated": bool(m.weight_quantizer.calibrated),
-                    "scale_shape": list(weight_scale.shape),
-                    "scale_min": float(weight_scale.min().cpu()),
-                    "scale_max": float(weight_scale.max().cpu()),
-                },
-                "activation": {
-                    "bits": int(m.act_quantizer.bits),
-                    "symmetric": bool(m.act_quantizer.symmetric),
-                    "per_channel": bool(m.act_quantizer.per_channel),
-                    "ch_axis": int(m.act_quantizer.ch_axis),
-                    "qmin": int(m.act_quantizer.qmin),
-                    "qmax": int(m.act_quantizer.qmax),
-                    "calibrated": bool(m.act_quantizer.calibrated),
-                    "scale_shape": list(act_scale.shape),
-                    "scale_min": float(act_scale.min().cpu()),
-                    "scale_max": float(act_scale.max().cpu()),
-                },
+                "weight": m.weight_quantizer.meta(),
+                "activation": m.act_quantizer.meta(),
             }
         )
 
