@@ -425,8 +425,6 @@ class LowRankAffineQuantComponent(QuantComponent):
         eps=1e-8,
         rank=32,
         alpha=1.0,
-        compensate=True,
-        quantize_residual=False,
         gptq_block_size=128,
         gptq_damp_percentage=0.01,
         max_gptq_samples=2048,
@@ -442,8 +440,6 @@ class LowRankAffineQuantComponent(QuantComponent):
         )
         self.rank = rank
         self.alpha = alpha
-        self.compensate = compensate
-        self.quantize_residual = quantize_residual
         self.gptq_block_size = gptq_block_size
         self.gptq_damp_percentage = gptq_damp_percentage
         self.max_gptq_samples = max_gptq_samples
@@ -491,7 +487,7 @@ class LowRankAffineQuantComponent(QuantComponent):
         else:
             self.act_absmax = torch.maximum(self.act_absmax, act_absmax.cpu())
 
-        if not self.quantize_residual or self.max_gptq_samples == 0:
+        if self.max_gptq_samples == 0:
             return
         x = x.reshape(-1, x.shape[-1])
         if x.numel() == 0:
@@ -528,37 +524,27 @@ class LowRankAffineQuantComponent(QuantComponent):
             self.smooth_scale = torch.ones(weight.shape[1], device=weight.device, dtype=weight.dtype)
 
         smooth_weight = weight * self.smooth_scale.reshape(1, -1)
-        if self.rank == 0:
-            self.branch = None
-            low_rank_weight = torch.zeros_like(smooth_weight)
-        else:
-            if quant_weight is None:
-                quant_enabled = self.quantizer.enabled
-                self.quantizer.enabled = True
-                quant_weight = self.quantizer(smooth_weight)
-                self.quantizer.enabled = quant_enabled
 
-            branch_weight = smooth_weight - quant_weight if self.compensate and quant_weight is not None else smooth_weight
+        if self.rank > 0:
             self.branch = LowRankBranch(
                 smooth_weight.shape[1],
                 smooth_weight.shape[0],
                 rank=self.rank,
                 alpha=self.alpha,
-                weight=branch_weight,
+                weight=smooth_weight,
             )
-            low_rank_weight = self.branch.get_effective_weight()
-            if low_rank_weight is None:
-                low_rank_weight = torch.zeros_like(smooth_weight)
+            L = self.branch.get_effective_weight()
+        else:
+            self.branch = None
+            L = torch.zeros_like(smooth_weight)
 
-        self.residual = None
-        if self.quantize_residual:
-            residual = smooth_weight - quant_weight - low_rank_weight if self.compensate else smooth_weight - low_rank_weight
-            inputs = None
-            if self.input_cache:
-                inputs = torch.cat(self.input_cache, dim=0).to(device=weight.device, dtype=weight.dtype)
-                inputs = inputs / self.smooth_scale.reshape(1, -1)
+        R = smooth_weight - L
+
+        if self.input_cache:
+            inputs = torch.cat(self.input_cache, dim=0).to(device=weight.device, dtype=weight.dtype)
+            inputs = inputs / self.smooth_scale.reshape(1, -1)
             self.residual = gptq_quantize_linear_weight(
-                residual,
+                R,
                 inputs,
                 bits=self.quantizer.bits,
                 symmetric=self.quantizer.symmetric,
@@ -566,20 +552,32 @@ class LowRankAffineQuantComponent(QuantComponent):
                 damp_percentage=self.gptq_damp_percentage,
                 eps=self.quantizer.eps,
             )
-            self.input_cache = []
+        else:
+            self.residual = affine_fake_quant_weight(
+                R,
+                bits=self.quantizer.bits,
+                symmetric=self.quantizer.symmetric,
+                eps=self.quantizer.eps,
+            )
+
+        self.input_cache = []
         return self.branch
 
     def forward(self, x):
+        if self.observer_enabled:
+            self.quantizer.observer(x)
+        if not self.enabled:
+            return x
+        if self.residual is not None:
+            return self.residual
         return self.quantizer(x)
 
     def branch_forward(self, x):
         if not self.enabled:
             return None
-        out = self.branch(x) if self.branch is not None else None
-        if self.residual is not None:
-            residual_out = F.linear(x, self.residual)
-            out = residual_out if out is None else out + residual_out
-        return out
+        if self.branch is not None:
+            return self.branch(x)
+        return None
 
     def meta(self):
         scale = self.quantizer.scale.detach()
@@ -599,8 +597,6 @@ class LowRankAffineQuantComponent(QuantComponent):
             "scale_max": float(scale.max().cpu()),
             "rank": int(self.rank),
             "alpha": float(self.alpha),
-            "compensate": bool(self.compensate),
-            "quantize_residual": bool(self.quantize_residual),
             "gptq_block_size": int(self.gptq_block_size),
             "gptq_damp_percentage": float(self.gptq_damp_percentage),
             "smooth_alpha": float(self.smooth_alpha),
