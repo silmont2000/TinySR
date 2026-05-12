@@ -68,8 +68,11 @@ def parse_args():
     parser.add_argument("--cache_dir", type=str, default="/data/disk2/xby/models")
     parser.add_argument("--embedding_dir", type=str, default="dataset/default/")
     parser.add_argument("--input_dir", type=str, default="dataset/test_image/")
-    parser.add_argument("--output_dir", type=str, default="outputs/w4a4_tinysr")
+    parser.add_argument("--calib_input_dir", type=str, default="dataset/StableSR_testsets/DrealSRVal_crop128/test_LR")
+    parser.add_argument("--output_dir", type=str, default=None)
 
+    parser.add_argument("--w_bits", type=int, default=4)
+    parser.add_argument("--a_bits", type=int, default=4)
     parser.add_argument("--rank", type=int, default=64)
     parser.add_argument("--svdq_rank", type=int, default=32)
     parser.add_argument("--svdq_smooth_alpha", type=float, default=0.5)
@@ -525,8 +528,18 @@ def main():
     if len(image_names) == 0:
         raise RuntimeError(f"No input images found in {args.input_dir}")
 
+    calib_image_names = get_image_names(args.calib_input_dir)
+    if len(calib_image_names) == 0:
+        raise RuntimeError(f"No calibration images found in {args.calib_input_dir}")
+
     print(f"[INFO] images: {len(image_names)}")
+    print(f"[INFO] calib_images: {len(calib_image_names)}")
     print(f"[INFO] quant_scope: {args.quant_scope}")
+
+    if args.output_dir is None:
+        scope_tag = args.quant_scope
+        alpha_tag = str(int(args.svdq_smooth_alpha * 100))
+        args.output_dir = f"outputs/w{args.w_bits}a{args.a_bits}_svdq_r{args.svdq_rank}_{scope_tag}_a{alpha_tag}"
     print(f"[INFO] output_dir: {args.output_dir}")
 
     transformer, vae = load_models(args, device, weight_dtype)
@@ -540,12 +553,17 @@ def main():
             skip_keywords=("lora_",),
             weight_quant_kind="svdq",
             weight_quant_kwargs={
-                "bits": 4,
+                "bits": args.w_bits,
                 "symmetric": True,
                 "per_channel": True,
                 "ch_axis": 0,
                 "rank": args.svdq_rank,
                 "smooth_alpha": args.svdq_smooth_alpha,
+            },
+            act_quant_kwargs={
+                "bits": args.a_bits,
+                "symmetric": True,
+                "per_channel": False,
             },
         )
         print(f"[W4A4] replaced Linear layers: {len(replaced_layers)}")
@@ -569,7 +587,7 @@ def main():
         args,
         transformer,
         vae,
-        image_names,
+        calib_image_names,
         pooled_prompt_embeds,
         timesteps,
         weight_dtype,
