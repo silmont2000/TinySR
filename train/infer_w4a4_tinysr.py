@@ -1,3 +1,4 @@
+
 import argparse
 import glob
 import json
@@ -14,21 +15,24 @@ from peft import LoraConfig
 from torchvision import transforms
 from tqdm import tqdm
 from diffusers import StableDiffusion3Pipeline
-
+# fmt:off
 sys.path.append(".")
-
-from models.tinysr.tinysd3 import TinySD3Transformer2DModel
-from models.vae.autoencoder_tiny import AutoencoderTiny
-from utils.util import load_lora_state_dict
-from utils.wavelet_color_fix import adain_color_fix, wavelet_color_fix
 
 from train.quant_w4a4 import (
     replace_linear_with_w4a4,
+    replace_linear_with_w4a4_from_config,
     set_quant_enabled,
     set_observer_enabled,
     freeze_quant_params,
     collect_quant_meta,
+    save_calib_cache,
+    load_calib_cache,
 )
+from utils.wavelet_color_fix import adain_color_fix, wavelet_color_fix
+from utils.util import load_lora_state_dict
+from models.vae.autoencoder_tiny import AutoencoderTiny
+from models.tinysr.tinysd3 import TinySD3Transformer2DModel
+# fmt:on
 
 
 FFN_SUFFIXES = [
@@ -56,31 +60,44 @@ EXTRA_SUFFIXES = [
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Clean W4A4 fake-quant inference for TinySR.")
+    parser = argparse.ArgumentParser(
+        description="Clean W4A4 fake-quant inference for TinySR.")
 
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
         default="checkpoint/tinybackbone/prune-12-merge-tinysr",
     )
-    parser.add_argument("--vae_path", type=str, default="checkpoint/vae/separable")
+    parser.add_argument("--vae_path", type=str,
+                        default="checkpoint/vae/separable")
     parser.add_argument("--lora_dir", type=str, default="checkpoint/tinysr")
-    parser.add_argument("--cache_dir", type=str, default="/data/disk2/xby/models")
-    parser.add_argument("--embedding_dir", type=str, default="dataset/default/")
+    parser.add_argument("--cache_dir", type=str,
+                        default="/data/disk2/xby/models")
+    parser.add_argument("--embedding_dir", type=str,
+                        default="dataset/default/")
     parser.add_argument("--input_dir", type=str, default="dataset/test_image/")
-    parser.add_argument("--calib_input_dir", type=str, default="dataset/StableSR_testsets/DrealSRVal_crop128/test_LR")
+    parser.add_argument("--calib_input_dir", type=str,
+                        default="dataset/StableSR_testsets/DrealSRVal_crop128/test_LR")
     parser.add_argument("--output_dir", type=str, default=None)
 
     parser.add_argument("--w_bits", type=int, default=4)
     parser.add_argument("--a_bits", type=int, default=4)
+    parser.add_argument(
+        "--quant_config",
+        type=str,
+        default=None,
+        help="Optional JSON file that assigns quantization strategies to selected layers.",
+    )
     parser.add_argument("--rank", type=int, default=64)
     parser.add_argument("--svdq_rank", type=int, default=32)
     parser.add_argument("--svdq_smooth_alpha", type=float, default=0.5)
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--upscale", type=int, default=4)
     parser.add_argument("--process_size", type=int, default=512)
-    parser.add_argument("--mixed_precision", type=str, choices=["fp16", "fp32"], default="fp16")
-    parser.add_argument("--align_method", type=str, choices=["wavelet", "adain", "nofix"], default="adain")
+    parser.add_argument("--mixed_precision", type=str,
+                        choices=["fp16", "fp32"], default="fp16")
+    parser.add_argument("--align_method", type=str,
+                        choices=["wavelet", "adain", "nofix"], default="adain")
 
     parser.add_argument(
         "--quant_scope",
@@ -89,6 +106,10 @@ def parse_args():
         default="ffn_only",
     )
     parser.add_argument("--calib_images", type=int, default=8)
+    parser.add_argument("--calib_cache", type=str, default=None,
+                        help="Path to save/load calibration cache. If the file exists, "
+                             "skip calibration and load cached quant params; otherwise "
+                             "run calibration and save to this path. Default: None (always calibrate).")
     parser.add_argument("--warmup_images", type=int, default=1)
     parser.add_argument("--latent_tiled_size", type=int, default=64)
     parser.add_argument("--latent_tiled_overlap", type=int, default=8)
@@ -210,8 +231,10 @@ def gaussian_weights(tile_width, tile_height, nbatches, in_channels, device, dty
     x = torch.arange(tile_width, device=device, dtype=torch.float32)
     y = torch.arange(tile_height, device=device, dtype=torch.float32)
 
-    x_probs = torch.exp(-((x - midpoint_x) ** 2) / (tile_width * tile_width) / (2 * var))
-    y_probs = torch.exp(-((y - midpoint_y) ** 2) / (tile_height * tile_height) / (2 * var))
+    x_probs = torch.exp(-((x - midpoint_x) ** 2) /
+                        (tile_width * tile_width) / (2 * var))
+    y_probs = torch.exp(-((y - midpoint_y) ** 2) /
+                        (tile_height * tile_height) / (2 * var))
 
     weights = torch.outer(y_probs, x_probs)
     weights = weights.to(dtype=dtype)
@@ -254,13 +277,15 @@ def tile_sample(
     grid_rows = 0
     cur_x = 0
     while cur_x < width:
-        cur_x = max(grid_rows * tile_size - tile_overlap * grid_rows, 0) + tile_size
+        cur_x = max(grid_rows * tile_size -
+                    tile_overlap * grid_rows, 0) + tile_size
         grid_rows += 1
 
     grid_cols = 0
     cur_y = 0
     while cur_y < height:
-        cur_y = max(grid_cols * tile_size - tile_overlap * grid_cols, 0) + tile_size
+        cur_y = max(grid_cols * tile_size -
+                    tile_overlap * grid_cols, 0) + tile_size
         grid_cols += 1
 
     noise_preds = []
@@ -276,17 +301,21 @@ def tile_sample(
             else:
                 ofs_y = max(col * tile_size - tile_overlap * col, 0)
 
-            input_tile = lq_latent[:, :, ofs_y : ofs_y + tile_size, ofs_x : ofs_x + tile_size]
+            input_tile = lq_latent[:, :, ofs_y: ofs_y +
+                                   tile_size, ofs_x: ofs_x + tile_size]
             pred = transformer(
-                hidden_states=input_tile.to(lq_latent.device, dtype=weight_dtype),
+                hidden_states=input_tile.to(
+                    lq_latent.device, dtype=weight_dtype),
                 timestep=timesteps,
                 pooled_projections=pooled_prompt_embeds,
                 return_dict=False,
             )[0]
             noise_preds.append(pred)
 
-    noise_pred = torch.zeros(lq_latent.shape, device=lq_latent.device, dtype=weight_dtype)
-    contributors = torch.zeros(lq_latent.shape, device=lq_latent.device, dtype=weight_dtype)
+    noise_pred = torch.zeros(
+        lq_latent.shape, device=lq_latent.device, dtype=weight_dtype)
+    contributors = torch.zeros(
+        lq_latent.shape, device=lq_latent.device, dtype=weight_dtype)
 
     for row in range(grid_rows):
         for col in range(grid_cols):
@@ -301,8 +330,10 @@ def tile_sample(
                 ofs_y = max(col * tile_size - tile_overlap * col, 0)
 
             index = row * grid_cols + col
-            noise_pred[:, :, ofs_y : ofs_y + tile_size, ofs_x : ofs_x + tile_size] += noise_preds[index] * tile_weights
-            contributors[:, :, ofs_y : ofs_y + tile_size, ofs_x : ofs_x + tile_size] += tile_weights
+            noise_pred[:, :, ofs_y: ofs_y + tile_size, ofs_x: ofs_x +
+                       tile_size] += noise_preds[index] * tile_weights
+            contributors[:, :, ofs_y: ofs_y + tile_size,
+                         ofs_x: ofs_x + tile_size] += tile_weights
 
     model_pred = noise_pred / contributors.clamp_min(1e-8)
     return model_pred.to(lq_latent.device, dtype=weight_dtype)
@@ -316,9 +347,11 @@ def image_to_latent(args, vae, image_path, tensor_transform, device, weight_dtyp
         args.process_size,
     )
 
-    lr_scale = lr.resize((int(ori_width * args.upscale), int(ori_height * args.upscale)))
+    lr_scale = lr.resize((int(ori_width * args.upscale),
+                         int(ori_height * args.upscale)))
 
-    pixel_values = tensor_transform(lr).unsqueeze(0).to(device=device, dtype=weight_dtype)
+    pixel_values = tensor_transform(lr).unsqueeze(
+        0).to(device=device, dtype=weight_dtype)
     pixel_values = torch.nn.functional.interpolate(
         pixel_values,
         size=(new_height, new_width),
@@ -465,9 +498,11 @@ def run_inference(
             )
 
         if args.align_method == "adain":
-            image_pil = adain_color_fix(target=image_pil, source=image_info["lr"])
+            image_pil = adain_color_fix(
+                target=image_pil, source=image_info["lr"])
         elif args.align_method == "wavelet":
-            image_pil = wavelet_color_fix(target=image_pil, source=image_info["lr_scale"])
+            image_pil = wavelet_color_fix(
+                target=image_pil, source=image_info["lr_scale"])
 
         save_path = os.path.join(args.output_dir, os.path.basename(image_path))
         image_pil.save(save_path)
@@ -530,11 +565,14 @@ def main():
 
     calib_image_names = get_image_names(args.calib_input_dir)
     if len(calib_image_names) == 0:
-        raise RuntimeError(f"No calibration images found in {args.calib_input_dir}")
+        raise RuntimeError(
+            f"No calibration images found in {args.calib_input_dir}")
 
     print(f"[INFO] images: {len(image_names)}")
     print(f"[INFO] calib_images: {len(calib_image_names)}")
     print(f"[INFO] quant_scope: {args.quant_scope}")
+    if args.quant_config:
+        print(f"[INFO] quant_config: {args.quant_config}")
 
     if args.output_dir is None:
         scope_tag = args.quant_scope
@@ -544,31 +582,67 @@ def main():
 
     transformer, vae = load_models(args, device, weight_dtype)
 
+    # os.makedirs(args.output_dir, exist_ok=True)
+    # with open(os.path.join(args.output_dir, "transformer_structure.txt"), "w", encoding="utf-8") as f:
+    #     f.write("=== MODULE HIERARCHY ===\n")
+    #     f.write(str(transformer))
+    #     f.write("\n\n=== LINEAR LAYERS (weight shape) ===\n")
+    #     for name, module in transformer.named_modules():
+    #         if isinstance(module, nn.Linear):
+    #             f.write(f"{name}  weight={tuple(module.weight.shape)}\n")
+    #     f.write("\n=== ALL MODULES (name, type, params) ===\n")
+    #     for name, module in transformer.named_modules():
+    #         num_params = sum(p.numel()
+    #                          for p in module.parameters() if p.requires_grad)
+    #         if num_params > 0:
+    #             f.write(
+    #                 f"{name}  {type(module).__name__}  params={num_params}\n")
+    # print(
+    #     f"[INFO] saved original network structure to {args.output_dir}/transformer_structure.txt")
     replaced_layers = []
     if args.quant_scope != "none":
         target_suffixes = get_target_suffixes(args.quant_scope)
-        replaced_layers = replace_linear_with_w4a4(
-            transformer,
-            target_suffixes=target_suffixes,
-            skip_keywords=("lora_",),
-            weight_quant_kind="svdq",
-            weight_quant_kwargs={
-                "bits": args.w_bits,
-                "symmetric": True,
-                "per_channel": True,
-                "ch_axis": 0,
-                "rank": args.svdq_rank,
-                "smooth_alpha": args.svdq_smooth_alpha,
-            },
-            act_quant_kwargs={
-                "bits": args.a_bits,
-                "symmetric": True,
-                "per_channel": False,
-            },
-        )
+        weight_quant_kwargs = {
+            "bits": args.w_bits,
+            "symmetric": True,
+            "per_channel": True,
+            "ch_axis": 0,
+            "rank": args.svdq_rank,
+            "smooth_alpha": args.svdq_smooth_alpha,
+        }
+        act_quant_kwargs = {
+            "bits": args.a_bits,
+            "symmetric": True,
+            "per_channel": False,
+        }
+        if args.quant_config:
+            replaced_layers = replace_linear_with_w4a4_from_config(
+                transformer,
+                args.quant_config,
+                target_suffixes=target_suffixes,
+                skip_keywords=("lora_",),
+                default_weight_quant_kind="svdq",
+                default_weight_quant_kwargs=weight_quant_kwargs,
+                default_act_quant_kwargs=act_quant_kwargs,
+            )
+        else:
+            replaced_layers = replace_linear_with_w4a4(
+                transformer,
+                target_suffixes=target_suffixes,
+                skip_keywords=("lora_",),
+                weight_quant_kind="svdq",
+                weight_quant_kwargs=weight_quant_kwargs,
+                act_quant_kwargs=act_quant_kwargs,
+            )
         print(f"[W4A4] replaced Linear layers: {len(replaced_layers)}")
         for layer_name in replaced_layers[:20]:
-            print(f"  - {layer_name}")
+            if isinstance(layer_name, dict):
+                print(
+                    f"  - {layer_name['name']} "
+                    f"w{layer_name['weight_bits']}a{layer_name['activation_bits']}"
+                )
+            else:
+                print(f"  - {layer_name}")
         if len(replaced_layers) > 20:
             print(f"  ... and {len(replaced_layers) - 20} more")
 
@@ -583,17 +657,23 @@ def main():
         dtype=weight_dtype,
     )
 
-    calibrate_w4a4(
-        args,
-        transformer,
-        vae,
-        calib_image_names,
-        pooled_prompt_embeds,
-        timesteps,
-        weight_dtype,
-    )
+    if args.quant_scope != "none" and args.calib_cache and os.path.exists(args.calib_cache):
+        load_calib_cache(transformer, args.calib_cache)
+    else:
+        calibrate_w4a4(
+            args,
+            transformer,
+            vae,
+            calib_image_names,
+            pooled_prompt_embeds,
+            timesteps,
+            weight_dtype,
+        )
+        if args.calib_cache:
+            save_calib_cache(transformer, args.calib_cache)
 
-    quant_meta = collect_quant_meta(transformer) if args.quant_scope != "none" else []
+    quant_meta = collect_quant_meta(
+        transformer) if args.quant_scope != "none" else []
 
     timing = run_inference(
         args,

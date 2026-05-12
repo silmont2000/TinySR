@@ -1,4 +1,6 @@
 import math
+import json
+import re
 
 import torch
 import torch.nn as nn
@@ -56,7 +58,8 @@ class UniformAffineQuantizer(nn.Module):
         self.enabled = True
         self.observer_enabled = True
 
-        self.observer = MinMaxObserver(per_channel=per_channel, ch_axis=ch_axis)
+        self.observer = MinMaxObserver(
+            per_channel=per_channel, ch_axis=ch_axis)
 
         self.register_buffer("scale", torch.tensor(1.0))
         self.register_buffer("zero_point", torch.tensor(0.0))
@@ -118,7 +121,6 @@ class UniformAffineQuantizer(nn.Module):
 
         if torch.isinf(self.scale).any() or torch.isnan(self.scale).any():
             return x
-
 
         scale, zero_point = self.reshape_qparams(x)
 
@@ -218,7 +220,8 @@ def gptq_quantize_linear_weight(
         for local_col in range(c_end - c_start):
             column = block_weight[:, local_col]
             pos_diag = block_hessian_inv[local_col, local_col].clamp_min(eps)
-            qcolumn = torch.round(column.view(-1, 1) / scale + zero_point).clamp(qmin, qmax)
+            qcolumn = torch.round(column.view(-1, 1) /
+                                  scale + zero_point).clamp(qmin, qmax)
             qcolumn = ((qcolumn - zero_point) * scale).view(-1)
             qtensor[:, c_start + local_col] = qcolumn
             column_error = (column - qcolumn) / pos_diag
@@ -226,7 +229,8 @@ def gptq_quantize_linear_weight(
             block_weight[:, local_col:] -= column_error.view(-1, 1).matmul(
                 block_hessian_inv[local_col, local_col:].view(1, -1)
             )
-        work_weight[:, c_end:] -= block_error.matmul(hessian_inv[c_start:c_end, c_end:])
+        work_weight[:,
+                    c_end:] -= block_error.matmul(hessian_inv[c_start:c_end, c_end:])
 
     qtensor = qtensor[:, inverse_permute]
     if qtensor.isnan().any() or qtensor.isinf().any():
@@ -317,8 +321,10 @@ class AffineQuantComponent(QuantComponent):
     @torch.no_grad()
     def reset(self):
         device = self.quantizer.scale.device
-        self.quantizer.observer.min_val = torch.tensor(float("inf"), device=device)
-        self.quantizer.observer.max_val = torch.tensor(float("-inf"), device=device)
+        self.quantizer.observer.min_val = torch.tensor(
+            float("inf"), device=device)
+        self.quantizer.observer.max_val = torch.tensor(
+            float("-inf"), device=device)
         self.quantizer.scale = torch.tensor(1.0, device=device)
         self.quantizer.zero_point = torch.tensor(0.0, device=device)
         self.quantizer.calibrated = False
@@ -376,7 +382,8 @@ class LowRankBranch(nn.Module):
             return
 
         if weight.ndim >= 2:
-            assert weight.shape[2:].numel() == 1, "LowRankBranch only supports linear 2D weights"
+            assert weight.shape[2:].numel(
+            ) == 1, "LowRankBranch only supports linear 2D weights"
 
         weight = weight.view(weight.shape[0], -1)
         device, dtype = weight.device, weight.dtype
@@ -492,7 +499,9 @@ class LowRankAffineQuantComponent(QuantComponent):
         x = x.reshape(-1, x.shape[-1])
         if x.numel() == 0:
             return
-        remaining = self.max_gptq_samples - sum(t.shape[0] for t in self.input_cache)# 防止为 GPTQ 收集输入时无限增长显存/内存
+        remaining = self.max_gptq_samples - \
+            sum(t.shape[0]
+                for t in self.input_cache)  # 防止为 GPTQ 收集输入时无限增长显存/内存
         if remaining <= 0:
             return
         self.input_cache.append(x[:remaining].cpu())
@@ -505,8 +514,10 @@ class LowRankAffineQuantComponent(QuantComponent):
     @torch.no_grad()
     def reset(self):
         device = self.quantizer.scale.device
-        self.quantizer.observer.min_val = torch.tensor(float("inf"), device=device)
-        self.quantizer.observer.max_val = torch.tensor(float("-inf"), device=device)
+        self.quantizer.observer.min_val = torch.tensor(
+            float("inf"), device=device)
+        self.quantizer.observer.max_val = torch.tensor(
+            float("-inf"), device=device)
         self.quantizer.scale = torch.tensor(1.0, device=device)
         self.quantizer.zero_point = torch.tensor(0.0, device=device)
         self.quantizer.calibrated = False
@@ -519,9 +530,11 @@ class LowRankAffineQuantComponent(QuantComponent):
     @torch.no_grad()
     def build_branch(self, weight, quant_weight=None, smooth_scale=None):
         if smooth_scale is not None:
-            self.smooth_scale = smooth_scale.detach().to(device=weight.device, dtype=weight.dtype)
+            self.smooth_scale = smooth_scale.detach().to(
+                device=weight.device, dtype=weight.dtype)
         elif self.smooth_scale is None:
-            self.smooth_scale = torch.ones(weight.shape[1], device=weight.device, dtype=weight.dtype)
+            self.smooth_scale = torch.ones(
+                weight.shape[1], device=weight.device, dtype=weight.dtype)
 
         smooth_weight = weight * self.smooth_scale.reshape(1, -1)
 
@@ -541,7 +554,8 @@ class LowRankAffineQuantComponent(QuantComponent):
         R = smooth_weight - L
 
         if self.input_cache:
-            inputs = torch.cat(self.input_cache, dim=0).to(device=weight.device, dtype=weight.dtype)
+            inputs = torch.cat(self.input_cache, dim=0).to(
+                device=weight.device, dtype=weight.dtype)
             inputs = inputs / self.smooth_scale.reshape(1, -1)
             self.residual = gptq_quantize_linear_weight(
                 R,
@@ -679,7 +693,8 @@ class QuantLinearW4A4(nn.Module):
         x_q = self.act_quantizer(x)
         w_q = self.weight_quantizer(weight)
         out = F.linear(x_q, w_q, self.bias)
-        branch_out = self.weight_quantizer.branch_forward(x_q) if hasattr(self.weight_quantizer, "branch_forward") else None
+        branch_out = self.weight_quantizer.branch_forward(x_q) if hasattr(
+            self.weight_quantizer, "branch_forward") else None
         if branch_out is not None:
             out = out + branch_out
         return out
@@ -709,7 +724,8 @@ def replace_linear_with_w4a4(
             if not any(full_name.endswith(suf) for suf in target_suffixes):
                 continue
 
-        parent_name, child_name = name.rsplit(".", 1) if "." in name else ("", name)
+        parent_name, child_name = name.rsplit(
+            ".", 1) if "." in name else ("", name)
         parent = module.get_submodule(parent_name) if parent_name else module
 
         quant_child = QuantLinearW4A4(
@@ -719,10 +735,144 @@ def replace_linear_with_w4a4(
             weight_quant_kwargs=weight_quant_kwargs,
             act_quant_kwargs=act_quant_kwargs,
         )
-        quant_child = quant_child.to(device=child.weight.device, dtype=child.weight.dtype)
+        quant_child = quant_child.to(
+            device=child.weight.device, dtype=child.weight.dtype)
 
         setattr(parent, child_name, quant_child)
         replaced.append(full_name)
+
+    return replaced
+
+
+def _expand_braces(pattern):
+    pattern = re.escape(pattern)
+    pattern = pattern.replace(r"\*", ".*")
+    pattern = re.sub(r"\\\{([^{}]+)\\\}", lambda m: "(" + "|".join(re.escape(v)
+                     for v in m.group(1).split(",")) + ")", pattern)
+    return pattern
+
+
+def _compile_layer_pattern(pattern):
+    return re.compile("^" + _expand_braces(pattern) + "$")
+
+
+def _layer_matches(name, rule):
+    for pattern in rule.get("patterns", []):
+        if _compile_layer_pattern(pattern).match(name):
+            return True
+
+    for suffix in rule.get("suffixes", []):
+        if re.search(_expand_braces(suffix) + "$", name):
+            return True
+
+    for prefix in rule.get("prefix", []):
+        if re.match(_expand_braces(prefix), name):
+            return True
+
+    for exact_name in rule.get("names", []):
+        if re.match("^" + _expand_braces(exact_name) + "$", name):
+            return True
+
+    return False
+
+
+def _quant_kwargs_from_strategy(strategy, default_weight_kwargs, default_act_kwargs):
+    weight_kwargs = dict(default_weight_kwargs or {})
+    act_kwargs = dict(default_act_kwargs or {})
+
+    if "weight" in strategy:
+        weight_kwargs.update(strategy["weight"])
+    if "activation" in strategy:
+        act_kwargs.update(strategy["activation"])
+
+    if "w_bits" in strategy:
+        weight_kwargs["bits"] = strategy["w_bits"]
+    if "a_bits" in strategy:
+        act_kwargs["bits"] = strategy["a_bits"]
+
+    return weight_kwargs, act_kwargs
+
+
+def load_layer_quant_config(config_path):
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    if not isinstance(config, dict):
+        raise ValueError("Layer quant config must be a JSON object")
+    if "rules" not in config or not isinstance(config["rules"], list):
+        raise ValueError("Layer quant config must contain a 'rules' list")
+
+    return config
+
+
+def replace_linear_with_w4a4_from_config(
+    module: nn.Module,
+    config,
+    target_suffixes=None,
+    skip_keywords=("lora_",),
+    default_weight_quant_kind="affine",
+    default_act_quant_kind="affine",
+    default_weight_quant_kwargs=None,
+    default_act_quant_kwargs=None,
+):
+    if isinstance(config, str):
+        config = load_layer_quant_config(config)
+
+    default_rule = config.get("default", {})
+    rules = config.get("rules", [])
+    replaced = []
+
+    for name, child in list(module.named_modules()):
+        if not isinstance(child, nn.Linear):
+            continue
+
+        if any(k in name for k in skip_keywords):
+            continue
+
+        if target_suffixes is not None and not any(name.endswith(suf) for suf in target_suffixes):
+            continue
+
+        strategy = dict(default_rule)
+        for rule in rules:
+            if _layer_matches(name, rule):
+                strategy.update(rule)
+
+        if not strategy or not strategy.get("enabled", True):
+            continue
+
+        weight_quant_kind = strategy.get(
+            "weight_quant_kind", default_weight_quant_kind)
+        act_quant_kind = strategy.get("act_quant_kind", default_act_quant_kind)
+        weight_quant_kwargs, act_quant_kwargs = _quant_kwargs_from_strategy(
+            strategy,
+            default_weight_quant_kwargs,
+            default_act_quant_kwargs,
+        )
+
+        parent_name, child_name = name.rsplit(
+            ".", 1) if "." in name else ("", name)
+        parent = module.get_submodule(parent_name) if parent_name else module
+
+        quant_child = QuantLinearW4A4(
+            child,
+            weight_quant_kind=weight_quant_kind,
+            act_quant_kind=act_quant_kind,
+            weight_quant_kwargs=weight_quant_kwargs,
+            act_quant_kwargs=act_quant_kwargs,
+        )
+        quant_child = quant_child.to(
+            device=child.weight.device, dtype=child.weight.dtype)
+
+        setattr(parent, child_name, quant_child)
+        replaced.append(
+            {
+                "name": name,
+                "weight_bits": int(weight_quant_kwargs.get("bits", -1)),
+                "activation_bits": int(act_quant_kwargs.get("bits", -1)),
+                "weight_quant_kind": weight_quant_kind,
+                "act_quant_kind": act_quant_kind,
+            }
+        )
 
     return replaced
 
@@ -747,20 +897,26 @@ def freeze_quant_params(module: nn.Module):
         if isinstance(m, QuantLinearW4A4):
             smooth_scale = None
             if hasattr(m.weight_quantizer, "act_absmax") and m.weight_quantizer.act_absmax is not None:
-                act_absmax = m.weight_quantizer.act_absmax.to(device=m.weight.device, dtype=m.weight.dtype).clamp_min(1e-8)
+                act_absmax = m.weight_quantizer.act_absmax.to(
+                    device=m.weight.device, dtype=m.weight.dtype).clamp_min(1e-8)
                 weight_absmax = m.weight.detach().abs().amax(dim=0).clamp_min(1e-8)
                 alpha = m.weight_quantizer.smooth_alpha
-                smooth_scale = act_absmax.pow(alpha) / weight_absmax.pow(1.0 - alpha)
+                smooth_scale = act_absmax.pow(
+                    alpha) / weight_absmax.pow(1.0 - alpha)
                 smooth_scale = smooth_scale.clamp_min(1e-8)
 
             # Collect weight stats from the static weight tensor to support
             # calibration mode where fake-quant is disabled.
-            stat_weight = m.weight * smooth_scale.reshape(1, -1) if smooth_scale is not None else m.weight
+            stat_weight = m.weight * \
+                smooth_scale.reshape(
+                    1, -1) if smooth_scale is not None else m.weight
             m.weight_quantizer.collect_stats(stat_weight)
             m.weight_quantizer.freeze()
             if hasattr(m.weight_quantizer, "build_branch"):
-                m.weight_quantizer.build_branch(m.weight, smooth_scale=smooth_scale)
+                m.weight_quantizer.build_branch(
+                    m.weight, smooth_scale=smooth_scale)
             m.act_quantizer.freeze()
+
 
 def set_quant_enabled(module: nn.Module, enabled=True):
     set_quant_state(module, weight_quant=enabled, act_quant=enabled)
@@ -816,3 +972,84 @@ def iter_quant_layers(module: nn.Module):
     for name, m in module.named_modules():
         if isinstance(m, QuantLinearW4A4):
             yield name, m
+
+
+@torch.no_grad()
+def save_calib_cache(transformer: nn.Module, path: str):
+    cache = {}
+    for name, m in iter_quant_layers(transformer):
+        entry = {}
+
+        act_q = m.act_quantizer
+        if isinstance(act_q, AffineQuantComponent):
+            entry["act_scale"] = act_q.quantizer.scale.detach().cpu()
+            entry["act_zero_point"] = act_q.quantizer.zero_point.detach().cpu()
+            entry["act_calibrated"] = act_q.quantizer.calibrated
+
+        w_q = m.weight_quantizer
+        if isinstance(w_q, (AffineQuantComponent, LowRankAffineQuantComponent)):
+            entry["w_scale"] = w_q.quantizer.scale.detach().cpu()
+            entry["w_zero_point"] = w_q.quantizer.zero_point.detach().cpu()
+            entry["w_calibrated"] = w_q.quantizer.calibrated
+
+        if isinstance(w_q, LowRankAffineQuantComponent):
+            if w_q.smooth_scale is not None:
+                entry["smooth_scale"] = w_q.smooth_scale.detach().cpu()
+            if w_q.residual is not None:
+                entry["residual"] = w_q.residual.detach().cpu()
+            if w_q.branch is not None and hasattr(w_q.branch, "a") and w_q.branch.a is not None:
+                entry["branch_a_weight"] = w_q.branch.a.weight.detach().cpu()
+                if hasattr(w_q.branch.b, "weight"):
+                    entry["branch_b_weight"] = w_q.branch.b.weight.detach().cpu()
+
+        cache[name] = entry
+
+    torch.save(cache, path)
+    print(f"[W4A4] calibration cache saved ({len(cache)} layers) -> {path}")
+
+
+@torch.no_grad()
+def load_calib_cache(transformer: nn.Module, path: str):
+    cache = torch.load(path, map_location="cpu")
+    for name, m in iter_quant_layers(transformer):
+        if name not in cache:
+            raise KeyError(
+                f"QuantLinearW4A4 '{name}' not found in calibration cache")
+        entry = cache[name]
+
+        device = m.weight.device
+        dtype = m.weight.dtype
+
+        act_q = m.act_quantizer
+        if isinstance(act_q, AffineQuantComponent):
+            act_q.quantizer.scale.copy_(entry["act_scale"].to(device, dtype=dtype))
+            act_q.quantizer.zero_point.copy_(
+                entry["act_zero_point"].to(device, dtype=dtype))
+            act_q.quantizer.calibrated = entry["act_calibrated"]
+
+        w_q = m.weight_quantizer
+        if isinstance(w_q, (AffineQuantComponent, LowRankAffineQuantComponent)):
+            w_q.quantizer.scale.copy_(
+                entry["w_scale"].to(device, dtype=dtype))
+            w_q.quantizer.zero_point.copy_(
+                entry["w_zero_point"].to(device, dtype=dtype))
+            w_q.quantizer.calibrated = entry["w_calibrated"]
+
+        if isinstance(w_q, LowRankAffineQuantComponent):
+            if "smooth_scale" in entry:
+                w_q.smooth_scale = entry["smooth_scale"].to(device, dtype=dtype)
+            if "residual" in entry:
+                w_q.residual = entry["residual"].to(device, dtype=dtype)
+            if "branch_a_weight" in entry and w_q.branch is not None:
+                w_q.branch.a.weight.copy_(
+                    entry["branch_a_weight"].to(device, dtype=dtype))
+                if "branch_b_weight" in entry and hasattr(w_q.branch.b, "weight"):
+                    w_q.branch.b.weight.copy_(
+                        entry["branch_b_weight"].to(device, dtype=dtype))
+
+        m.weight_quantizer.enabled = True
+        m.act_quantizer.enabled = True
+        m.weight_quantizer.observer_enabled = False
+        m.act_quantizer.observer_enabled = False
+
+    print(f"[W4A4] calibration cache loaded ({len(cache)} layers) <- {path}")

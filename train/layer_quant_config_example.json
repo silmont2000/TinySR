@@ -1,0 +1,20 @@
+{
+  "description": "Example per-layer quantization config for infer_w4a4_tinysr.py. Rules are applied in order; later matching rules override earlier/default fields.",
+  "default": {
+    "enabled": true,
+    "w_bits": 4,
+    "a_bits": 4,
+    "weight_quant_kind": "svdq",
+    "act_quant_kind": "affine"
+  },
+  "rules": [
+    {
+      "description": "Use W4A8 on attention Q/K/V layers with persistent activation channel outliers.",
+      "prefix": [
+        "transformer_blocks.{0,1,2,3,4,5}"
+      ],
+      "w_bits": 4,
+      "a_bits": 8
+    }
+  ]
+}
