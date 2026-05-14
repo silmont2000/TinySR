@@ -1211,7 +1211,9 @@ def freeze_quant_params(module: nn.Module, search_smooth_alpha: bool = False):
                 if search_smooth_alpha or alpha < 0:
                     alpha_stats[alpha] = alpha_stats.get(alpha, 0) + 1
                     alpha_per_layer.append((name, alpha))
-                    print(f"  [alpha_search] {name} -> alpha={alpha:.2f} {err_str}")
+                    inp_max2 = inputs_cat.abs().max().item() if inputs_cat is not None else 0.0
+                    inp_std2 = inputs_cat.std().item() if inputs_cat is not None else 0.0
+                    print(f"  [alpha_search] {name} -> alpha={alpha:.2f} {err_str} | inp_max={inp_max2:.4f} inp_std={inp_std2:.4f}")
                 else:
                     print(f"  [smooth_err] {name} -> alpha={alpha:.2f} {err_str}")
 
@@ -1295,6 +1297,159 @@ def freeze_quant_params(module: nn.Module, search_smooth_alpha: bool = False):
             wq.residual = w - branch.get_effective_weight().view_as(w)
             # Quantize residual into dequant float for forward.
             wq.residual = wq.quantizer(wq.residual)
+
+
+@torch.no_grad()
+def freeze_quant_params_layer_cascade(
+    module: nn.Module,
+    calib_data: list,
+    cascade_forward_fn: callable,
+    num_cascade_calib: int = 4,
+    search_smooth_alpha: bool = False,
+):
+    """Layer-by-layer cascade freeze. Each layer is frozen sequentially so that
+    layer N sees realistic (pre-quantized) activations from layers 0..N-1.
+
+    Phase 1: FP16 forward → collect act_absmax for all layers.
+    Phase 2: For each quantized layer in execution order:
+              reset act_absmax + input_cache → cascade forward (prev layers quantized)
+              → search alpha → freeze → enable quant.
+    """
+    # Phase 1: FP16 forward for act_absmax collection
+    set_observer_enabled(module, True)
+    set_quant_enabled(module, False)
+    for model_input, timesteps, pooled_prompt_embeds, weight_dtype in calib_data:
+        cascade_forward_fn(model_input, timesteps, pooled_prompt_embeds, weight_dtype)
+
+    # Clear all input_caches (re-collected per layer in cascade)
+    for _, m in iter_quant_layers(module):
+        m.weight_quantizer.input_cache = []
+
+    # Phase 2: Layer-by-layer cascade
+    set_observer_enabled(module, False)
+    all_layers = list(iter_quant_layers(module))
+
+    alpha_stats: dict[float, int] = {}
+    alpha_per_layer: list[tuple[str, float]] = []
+    cascade_calib_count = min(num_cascade_calib, len(calib_data))
+
+    for layer_idx, (layer_name, m) in enumerate(all_layers):
+        # Reset this layer to collect cascaded inputs
+        m.weight_quantizer.act_absmax = None
+        m.weight_quantizer.input_cache = []
+        m.weight_quantizer.observer_enabled = True
+        if hasattr(m, "act_quantizer") and hasattr(m.act_quantizer, "quantizer"):
+            obs = m.act_quantizer.quantizer.observer
+            obs.min_val.fill_(float("inf"))
+            obs.max_val.fill_(float("-inf"))
+            obs.enabled = True
+            m.act_quantizer.observer_enabled = True
+            m.act_quantizer.quantizer.observer_enabled = True
+
+        # Run cascade forward: all previously frozen layers are quantized,
+        # this layer collects input_cache from realistic activations
+        for i in range(cascade_calib_count):
+            cascade_forward_fn(*calib_data[i])
+
+        # Disable observer
+        m.weight_quantizer.observer_enabled = False
+        if hasattr(m, "act_quantizer"):
+            m.act_quantizer.observer_enabled = False
+
+        # Search alpha + freeze + enable quant for this layer
+        _layer_cascade_freeze_one(
+            m, layer_name, search_smooth_alpha, alpha_stats, alpha_per_layer)
+        m.weight_quantizer.enabled = True
+        m.act_quantizer.enabled = True
+
+    if search_smooth_alpha and alpha_stats:
+        print("[alpha_search] per-layer results:")
+        for al, cnt in sorted(alpha_stats.items()):
+            print(f"  alpha={al:.2f} -> {cnt} layers")
+        total = sum(alpha_stats.values())
+        primary = max(alpha_stats, key=alpha_stats.get)
+        print(f"  total: {total} layers, most common: alpha={primary:.2f} ({alpha_stats[primary]} layers)")
+
+
+@torch.no_grad()
+def _layer_cascade_freeze_one(
+    m: QuantLinearW4A4,
+    layer_name: str,
+    search_smooth_alpha: bool,
+    alpha_stats: dict,
+    alpha_per_layer: list,
+):
+    """Freeze a single quantized layer: search alpha → smooth → quant → branch."""
+    smooth_scale = None
+    if hasattr(m.weight_quantizer, "act_absmax") and m.weight_quantizer.act_absmax is not None:
+        act_absmax = m.weight_quantizer.act_absmax.to(
+            device=m.weight.device, dtype=m.weight.dtype).clamp_min(1e-8)
+        weight_absmax = m.weight.detach().abs().amax(dim=0).clamp_min(1e-8)
+        alpha = m.weight_quantizer.smooth_alpha
+
+        act_quantizer = getattr(m, "act_quantizer", None)
+        if act_quantizer and hasattr(act_quantizer, "quantizer") and act_quantizer.observer_enabled:
+            act_quantizer.freeze()
+            act_bits = act_quantizer.quantizer.bits
+            act_sym = act_quantizer.quantizer.symmetric
+            act_scale_val = act_quantizer.quantizer.scale.detach().clone()
+        else:
+            act_bits, act_sym, act_scale_val = 8, True, None
+
+        input_cache = getattr(m.weight_quantizer, "input_cache", None)
+        if search_smooth_alpha or alpha < 0:
+            alpha = search_smooth_alpha_for_layer(
+                weight=m.weight,
+                act_absmax=act_absmax,
+                weight_quantizer=m.weight_quantizer,
+                input_cache=input_cache,
+                act_bits=act_bits,
+                act_symmetric=act_sym,
+                act_scale=act_scale_val,
+            )
+            m.weight_quantizer.smooth_alpha = alpha
+
+        inputs_cat = None
+        if input_cache is not None and len(input_cache) > 0:
+            inputs_cat = torch.cat(input_cache, dim=0).to(
+                device=m.weight.device, dtype=m.weight.dtype)
+            # Diagnostic: verify cascade inputs differ from FP16 cache
+            inp_max = inputs_cat.abs().max().item()
+            inp_std = inputs_cat.std().item()
+        else:
+            inp_max = inp_std = 0.0
+        if inputs_cat is not None:
+            err = _eval_smooth_quant_error(
+                weight=m.weight,
+                act_absmax=act_absmax,
+                weight_absmax=weight_absmax,
+                weight_quantizer=m.weight_quantizer,
+                inputs=inputs_cat,
+                alpha=alpha,
+                act_bits=act_bits,
+                act_symmetric=act_sym,
+                act_scale=act_scale_val,
+            )
+            err_str = f"err={err.item():.6e}"
+        else:
+            err_str = "err=N/A"
+
+        if search_smooth_alpha or alpha < 0:
+            alpha_stats[alpha] = alpha_stats.get(alpha, 0) + 1
+            alpha_per_layer.append((layer_name, alpha))
+            print(f"  [alpha_search] {layer_name} -> alpha={alpha:.2f} {err_str} | inp_max={inp_max:.4f} inp_std={inp_std:.4f}")
+        else:
+            print(f"  [smooth_err] {layer_name} -> alpha={alpha:.2f} {err_str}")
+
+        smooth_scale = act_absmax.pow(alpha) / weight_absmax.pow(1.0 - alpha)
+        smooth_scale = smooth_scale.clamp_min(1e-8)
+
+    stat_weight = m.weight * smooth_scale.reshape(1, -1) if smooth_scale is not None else m.weight
+    m.weight_quantizer.collect_stats(stat_weight)
+    m.weight_quantizer.freeze()
+    if hasattr(m.weight_quantizer, "build_branch"):
+        m.weight_quantizer.build_branch(m.weight, smooth_scale=smooth_scale)
+    m.act_quantizer.freeze()
 
 
 def set_quant_enabled(module: nn.Module, enabled=True):

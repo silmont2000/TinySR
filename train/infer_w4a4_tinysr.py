@@ -28,6 +28,7 @@ from train.quant_w4a4 import (
     set_quant_enabled,
     set_observer_enabled,
     freeze_quant_params,
+    freeze_quant_params_layer_cascade,
     collect_quant_meta,
     save_calib_cache,
     load_calib_cache,
@@ -102,6 +103,19 @@ def parse_args():
              "SearchBasedCalibrator / SmoothCalibConfig strategy). When set, "
              "the best alpha is selected per layer via grid search over "
              "reconstruction error, overriding --svdq_smooth_alpha.",
+    )
+    parser.add_argument(
+        "--layer_cascade_smooth_alpha",
+        action="store_true",
+        help="Enable layer-by-layer cascade freeze. Each layer is frozen "
+             "sequentially so layer N sees realistic (pre-quantized) activations "
+             "from layers 0..N-1 during alpha search.",
+    )
+    parser.add_argument(
+        "--cascade_calib_images",
+        type=int,
+        default=4,
+        help="Number of calibration images used per layer cascade forward (default: 4).",
     )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--upscale", type=int, default=4)
@@ -445,7 +459,32 @@ def calibrate_w4a4(
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    freeze_quant_params(transformer, search_smooth_alpha=args.search_smooth_alpha)
+    if args.layer_cascade_smooth_alpha:
+        # Build calib data list for cascade forward passes
+        calib_data_list = []
+        for image_path in calib_names[:args.cascade_calib_images]:
+            model_input, _ = image_to_latent(
+                args, vae, image_path, tensor_transform, device, weight_dtype)
+            calib_data_list.append(
+                (model_input, timesteps, pooled_prompt_embeds, weight_dtype))
+
+        def _layer_cascade_forward(model_input, timesteps, pooled_prompt_embeds, weight_dtype):
+            tile_sample(
+                model_input, transformer, timesteps, pooled_prompt_embeds,
+                weight_dtype,
+                latent_tiled_size=args.latent_tiled_size,
+                latent_tiled_overlap=args.latent_tiled_overlap,
+            )
+
+        freeze_quant_params_layer_cascade(
+            transformer,
+            calib_data=calib_data_list,
+            cascade_forward_fn=_layer_cascade_forward,
+            num_cascade_calib=args.cascade_calib_images,
+            search_smooth_alpha=args.search_smooth_alpha,
+        )
+    else:
+        freeze_quant_params(transformer, search_smooth_alpha=args.search_smooth_alpha)
     set_quant_enabled(transformer, True)
     set_observer_enabled(transformer, False)
 
@@ -731,7 +770,9 @@ def main():
 
     if args.output_dir is None:
         scope_tag = args.quant_scope
-        if args.search_smooth_alpha:
+        if args.layer_cascade_smooth_alpha:
+            alpha_tag = "layer_cascade"
+        elif args.search_smooth_alpha:
             alpha_tag = "sa"
         else:
             alpha_tag = str(int(args.svdq_smooth_alpha * 100))
