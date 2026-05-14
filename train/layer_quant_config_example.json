@@ -1,19 +1,27 @@
 {
-  "description": "Example per-layer quantization config for infer_w4a4_tinysr.py. Rules are applied in order; later matching rules override earlier/default fields.",
+  "description": "Mixed-precision FFN quantization: sensitive layers W8A8, others W4A8.",
   "default": {
     "enabled": true,
     "w_bits": 4,
-    "a_bits": 4,
+    "a_bits": 8,
     "weight_quant_kind": "svdq",
     "act_quant_kind": "affine"
   },
   "rules": [
     {
-      "description": "Use W4A8 on attention Q/K/V layers with persistent activation channel outliers.",
-      "prefix": [
-        "transformer_blocks.{0,1,2,3,4,5}"
+      "description": "High-kurtosis FFN input proj in blocks 0,1,3,4,5,6,10 — W8A8",
+      "patterns": [
+        "transformer_blocks.{0,1,3,4,5,6,10}.ff.net.0.proj.base_layer"
       ],
-      "w_bits": 4,
+      "w_bits": 8,
+      "a_bits": 8
+    },
+    {
+      "description": "Block 0 FFN output net.2 — W8A8 (kurtosis 161)",
+      "patterns": [
+        "transformer_blocks.0.ff.net.2.base_layer"
+      ],
+      "w_bits": 8,
       "a_bits": 8
     }
   ]

@@ -1,0 +1,8 @@
+# Alpha Sweep Results - Wed May 13 07:10:20 PM CST 2026
+# Config: w4a8 svdq_r32 scope=dit_full
+# Dataset: dataset/StableSR_testsets/DrealSRVal_crop128/test_LR
+# Alphas: 0.55
+
+===== Average Metrics for [w4a8_svdq_r32_dit_full_a55] =====
+PSNR: 27.3465; SSIM: 0.7229; LPIPS: 0.3449; DISTS: 0.2504; CLIPIQA: 0.6980; NIQE: 5.6304; MUSIQ: 63.0063; MANIQA: 0.5042 | FID: 162.881511 | FID Runtime: 14.13 sec
+

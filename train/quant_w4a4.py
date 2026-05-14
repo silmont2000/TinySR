@@ -452,6 +452,11 @@ class LowRankAffineQuantComponent(QuantComponent):
         self.max_gptq_samples = max_gptq_samples
         self.smooth_alpha = smooth_alpha
         self.branch = None
+        # Optional deepcompressor-style grouping for joint QKV branches.
+        # When set (string), freeze_quant_params() may build a shared low-rank A
+        # and slice B for each projection in the same group.
+        self.joint_group = None
+        self.joint_tag = None
         self.register_buffer("smooth_scale", None)
         self.register_buffer("act_absmax", None)
         self.register_buffer("residual", None)
@@ -877,6 +882,107 @@ def replace_linear_with_w4a4_from_config(
     return replaced
 
 
+def _get_module_and_parent(root: nn.Module, name: str) -> tuple[nn.Module, nn.Module, str]:
+    """Return (module, parent_module, child_attr_name) for a dotted module name."""
+    parent_name, child_name = name.rsplit(".", 1) if "." in name else ("", name)
+    parent = root.get_submodule(parent_name) if parent_name else root
+    return parent.get_submodule(child_name), parent, child_name
+
+
+def replace_qkv_with_joint_w4a4(
+    module: nn.Module,
+    *,
+    q_suffix: str = ".attn.to_q",
+    k_suffix: str = ".attn.to_k",
+    v_suffix: str = ".attn.to_v",
+    skip_keywords=("lora_",),
+    weight_quant_kind: str = "svdq",
+    act_quant_kind: str = "affine",
+    weight_quant_kwargs=None,
+    act_quant_kwargs=None,
+    joint_group_name: str = "qkv",
+):
+    """Replace attention q/k/v Linear layers with QuantLinearW4A4 and enable joint low-rank branch.
+
+    This implements the *grouping* behavior used by deepcompressor: Q/K/V are treated
+    as a logical group so the low-rank branch can be *shared* across them.
+
+    Notes:
+    - This does not fuse projections into a single Linear. It keeps 3 Linear modules,
+      but makes the low-rank factor A shared and slices B per projection.
+    - Requires weight_quant_kind="svdq" so LowRankAffineQuantComponent exists.
+    """
+    weight_quant_kwargs = dict(weight_quant_kwargs or {})
+    act_quant_kwargs = dict(act_quant_kwargs or {})
+    replaced = []
+
+    # Group candidates by common prefix before the suffix (per attention block).
+    qkv_groups: dict[str, dict[str, str]] = {}
+    for name, child in list(module.named_modules()):
+        if not isinstance(child, nn.Linear):
+            continue
+        if any(k in name for k in skip_keywords):
+            continue
+        if name.endswith(q_suffix):
+            prefix = name[: -len(q_suffix)]
+            qkv_groups.setdefault(prefix, {})["q"] = name
+        elif name.endswith(k_suffix):
+            prefix = name[: -len(k_suffix)]
+            qkv_groups.setdefault(prefix, {})["k"] = name
+        elif name.endswith(v_suffix):
+            prefix = name[: -len(v_suffix)]
+            qkv_groups.setdefault(prefix, {})["v"] = name
+
+    for prefix, group in qkv_groups.items():
+        if not ("q" in group and "k" in group and "v" in group):
+            continue
+
+        # Replace each projection with QuantLinearW4A4.
+        q_name, k_name, v_name = group["q"], group["k"], group["v"]
+        q_mod, q_parent, q_attr = _get_module_and_parent(module, q_name)
+        k_mod, k_parent, k_attr = _get_module_and_parent(module, k_name)
+        v_mod, v_parent, v_attr = _get_module_and_parent(module, v_name)
+        if not (isinstance(q_mod, nn.Linear) and isinstance(k_mod, nn.Linear) and isinstance(v_mod, nn.Linear)):
+            continue
+
+        q_quant = QuantLinearW4A4(
+            q_mod,
+            weight_quant_kind=weight_quant_kind,
+            act_quant_kind=act_quant_kind,
+            weight_quant_kwargs=weight_quant_kwargs,
+            act_quant_kwargs=act_quant_kwargs,
+        ).to(device=q_mod.weight.device, dtype=q_mod.weight.dtype)
+        k_quant = QuantLinearW4A4(
+            k_mod,
+            weight_quant_kind=weight_quant_kind,
+            act_quant_kind=act_quant_kind,
+            weight_quant_kwargs=weight_quant_kwargs,
+            act_quant_kwargs=act_quant_kwargs,
+        ).to(device=k_mod.weight.device, dtype=k_mod.weight.dtype)
+        v_quant = QuantLinearW4A4(
+            v_mod,
+            weight_quant_kind=weight_quant_kind,
+            act_quant_kind=act_quant_kind,
+            weight_quant_kwargs=weight_quant_kwargs,
+            act_quant_kwargs=act_quant_kwargs,
+        ).to(device=v_mod.weight.device, dtype=v_mod.weight.dtype)
+
+        setattr(q_parent, q_attr, q_quant)
+        setattr(k_parent, k_attr, k_quant)
+        setattr(v_parent, v_attr, v_quant)
+
+        # Mark low-rank components as a joint group. The actual shared branch is built
+        # later in freeze_quant_params().
+        for proj, tag in ((q_quant, "q"), (k_quant, "k"), (v_quant, "v")):
+            wq = proj.weight_quantizer
+            if isinstance(wq, LowRankAffineQuantComponent):
+                wq.joint_group = f"{prefix}.{joint_group_name}"
+                wq.joint_tag = tag
+        replaced.extend([q_name, k_name, v_name])
+
+    return replaced
+
+
 def set_quant_state(module: nn.Module, weight_quant=True, act_quant=True):
     for m in module.modules():
         if isinstance(m, QuantLinearW4A4):
@@ -893,6 +999,7 @@ def set_observer_enabled(module: nn.Module, enabled=True):
 
 @torch.no_grad()
 def freeze_quant_params(module: nn.Module):
+    # First pass: freeze quant params for all layers and build per-layer branches.
     for m in module.modules():
         if isinstance(m, QuantLinearW4A4):
             smooth_scale = None
@@ -916,6 +1023,61 @@ def freeze_quant_params(module: nn.Module):
                 m.weight_quantizer.build_branch(
                     m.weight, smooth_scale=smooth_scale)
             m.act_quantizer.freeze()
+
+    # Second pass: build *shared* low-rank branches for joint QKV groups.
+    # This is the deepcompressor-style behavior: share A across q/k/v, slice B.
+    joint_groups: dict[str, list[tuple[str, QuantLinearW4A4]]] = {}
+    for name, m in iter_quant_layers(module):
+        wq = m.weight_quantizer
+        if isinstance(wq, LowRankAffineQuantComponent) and getattr(wq, "joint_group", None):
+            joint_groups.setdefault(wq.joint_group, []).append((name, m))
+
+    for group_name, items in joint_groups.items():
+        # Expect q/k/v; skip if incomplete.
+        if len(items) < 2:
+            continue
+        # Sort deterministically by joint_tag if present.
+        def _order_key(kv):
+            _name, _m = kv
+            tag = getattr(_m.weight_quantizer, "joint_tag", "")
+            return {"q": 0, "k": 1, "v": 2}.get(tag, 99)
+
+        items = sorted(items, key=_order_key)
+        mods = [m for _, m in items]
+        # All projections should share the same in_features.
+        in_features = mods[0].in_features
+        if any(mm.in_features != in_features for mm in mods):
+            continue
+        out_features = sum(mm.out_features for mm in mods)
+        rank = mods[0].weight_quantizer.rank
+
+        # Use the smoothed weight if available on each module.
+        weights = []
+        for mm in mods:
+            wq = mm.weight_quantizer
+            w = mm.weight
+            if getattr(wq, "smooth_scale", None) is not None:
+                w = w * wq.smooth_scale.reshape(1, -1)
+            weights.append(w)
+        st = torch.cat(weights, dim=0)
+
+        shared = LowRankBranch(in_features, out_features, rank=rank, weight=st)
+        # Now slice shared branch to each projection, and update residuals accordingly.
+        oc_idx = 0
+        for (_, mm), w in zip(items, weights, strict=True):
+            wq = mm.weight_quantizer
+            oc = mm.out_features
+            branch = LowRankBranch(in_features, oc, rank=rank)
+            branch.a = shared.a
+            branch.b.to(dtype=w.dtype, device=w.device)
+            branch.b.weight.copy_(shared.b.weight[oc_idx : oc_idx + oc])
+            oc_idx += oc
+            wq.branch = branch
+            # Recompute residual based on the new shared branch.
+            wq.residual = w - branch.get_effective_weight().view_as(w)
+            # Quantize residual into dequant float for forward.
+            wq.residual = wq.quantizer(wq.residual)
+
 
 
 def set_quant_enabled(module: nn.Module, enabled=True):
@@ -1022,22 +1184,39 @@ def load_calib_cache(transformer: nn.Module, path: str):
 
         act_q = m.act_quantizer
         if isinstance(act_q, AffineQuantComponent):
-            act_q.quantizer.scale.copy_(entry["act_scale"].to(device, dtype=dtype))
-            act_q.quantizer.zero_point.copy_(
-                entry["act_zero_point"].to(device, dtype=dtype))
+            act_scale = entry["act_scale"].to(device=device, dtype=dtype)
+            act_zero = entry["act_zero_point"].to(device=device, dtype=dtype)
+
+            # 直接替换buffer，避免从标量 copy_ 到向量时报错
+            act_q.quantizer.scale = act_scale
+            act_q.quantizer.zero_point = act_zero
             act_q.quantizer.calibrated = entry["act_calibrated"]
 
         w_q = m.weight_quantizer
         if isinstance(w_q, (AffineQuantComponent, LowRankAffineQuantComponent)):
-            w_q.quantizer.scale.copy_(
-                entry["w_scale"].to(device, dtype=dtype))
-            w_q.quantizer.zero_point.copy_(
-                entry["w_zero_point"].to(device, dtype=dtype))
+            w_scale = entry["w_scale"].to(device=device, dtype=dtype)
+            w_zero = entry["w_zero_point"].to(device=device, dtype=dtype)
+
+            # 可读错误：cache和当前层结构不一致
+            if w_q.quantizer.per_channel:
+                ch_axis = w_q.quantizer.ch_axis % m.weight.dim()
+                expected = m.weight.shape[ch_axis]
+                if w_scale.numel() != expected:
+                    raise ValueError(
+                        f"[calib_cache mismatch] layer={name}, "
+                        f"expected per-channel scale numel={expected}, got {w_scale.numel()}. "
+                        f"Please regenerate calib cache with current model/config."
+                    )
+
+            # 直接替换buffer，避免 copy_ 形状冲突
+            w_q.quantizer.scale = w_scale
+            w_q.quantizer.zero_point = w_zero
             w_q.quantizer.calibrated = entry["w_calibrated"]
 
         if isinstance(w_q, LowRankAffineQuantComponent):
             if "smooth_scale" in entry:
-                w_q.smooth_scale = entry["smooth_scale"].to(device, dtype=dtype)
+                w_q.smooth_scale = entry["smooth_scale"].to(
+                    device, dtype=dtype)
             if "residual" in entry:
                 w_q.residual = entry["residual"].to(device, dtype=dtype)
             if "branch_a_weight" in entry and w_q.branch is not None:

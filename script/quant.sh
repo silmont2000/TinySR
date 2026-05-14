@@ -1,10 +1,13 @@
 python train/infer_w4a4_tinysr.py  \
 --rank 64  \
 --w_bits 4  \
---a_bits 4 \
+--a_bits 8 \
 --svdq_rank 32  \
---svdq_smooth_alpha 0.98  \
---quant_scope ffn_only  \
---calib_images 10  \
---input_dir dataset/test_image/  \
---quant_config train/layer_quant_config_example.json
+--svdq_smooth_alpha 0.55  \
+--quant_scope dit_full  \
+--calib_images 100  \
+--input_dir /data/disk2/xby/TinySR/dataset/test_image  \
+--quant_config /data/disk2/xby/TinySR/train/layer_quant_config_example.json  \
+--save_quant_meta
+# --calib_input_dir dataset/StableSR_testsets/DrealSRVal_crop128/test_LR \
+# --calib_cache outputs/calib_cache.pt  \

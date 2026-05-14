@@ -15,11 +15,25 @@ import numpy as np
 import torch
 
 import pyiqa
-from basicsr.utils import img2tensor
+# from basicsr.utils import img2tensor
+
+
+def img2tensor(img, bgr2rgb=False, float32=True):
+    # img: HWC, uint8/float, numpy array
+    if img.ndim == 2:
+        img = img[:, :, None]  # HW -> HWC(1)
+    if bgr2rgb and img.shape[2] == 3:
+        img = img[:, :, ::-1]
+    t = torch.from_numpy(np.ascontiguousarray(img)).permute(2, 0, 1)  # CHW
+    if float32:
+        t = t.float()
+    return t
+
 
 def get_timestamp():
     """Returns the current timestamp in a specific format."""
     return datetime.now().strftime('%y%m%d-%H%M%S')
+
 
 def setup_logger(logger_name, root, phase, level=logging.INFO, screen=False, tofile=False):
     """
@@ -51,6 +65,7 @@ def setup_logger(logger_name, root, phase, level=logging.INFO, screen=False, tof
         sh.setFormatter(formatter)
         logger.addHandler(sh)
 
+
 def dict2str(opt, indent=1):
     """
     Converts a dictionary to a formatted string for logging.
@@ -72,8 +87,10 @@ def dict2str(opt, indent=1):
             msg += ' ' * (indent * 2) + f"{k}: {v}\n"
     return msg
 
+
 def main():
-    parser = argparse.ArgumentParser(description="Image Quality Assessment Script")
+    parser = argparse.ArgumentParser(
+        description="Image Quality Assessment Script")
 
     parser.add_argument(
         "--inp_imgs",
@@ -106,7 +123,8 @@ def main():
     args = parser.parse_args()
 
     # Set device
-    device = torch.device("cuda") if torch.cuda.is_available() else torch.device("cpu")
+    device = torch.device(
+        "cuda") if torch.cuda.is_available() else torch.device("cpu")
 
     # Create log directory if it doesn't exist
     os.makedirs(args.log, exist_ok=True)
@@ -117,7 +135,8 @@ def main():
         args.log_name = args.inp_imgs[0].split('/')[8]
     except IndexError:
         args.log_name = 'METRICS'
-    setup_logger('base', args.log, f'test_{args.log_name}', level=logging.INFO, screen=True, tofile=True)
+    setup_logger('base', args.log, f'test_{args.log_name}',
+                 level=logging.INFO, screen=True, tofile=True)
     logger = logging.getLogger('base')
     logger.info("===== Configuration =====")
     logger.info(dict2str(vars(args)))
@@ -144,7 +163,8 @@ def main():
 
     # Validate input and GT directories
     if len(args.inp_imgs) != len(args.gt_imgs):
-        logger.error("The number of input image directories and GT image directories must be the same.")
+        logger.error(
+            "The number of input image directories and GT image directories must be the same.")
         sys.exit(1)
 
     init_imgs_names = []
@@ -156,8 +176,10 @@ def main():
         dir_name = os.path.basename(os.path.normpath(init_dir))
         init_imgs_names.append(dir_name)
 
-        logger.info(f"Directory [{dir_name}]: {len(img_gt_list)} GT images vs {len(img_sr_list)} SR images.")
-        assert len(img_gt_list) == len(img_sr_list), f"Mismatch in number of images for directory: {dir_name}"
+        logger.info(
+            f"Directory [{dir_name}]: {len(img_gt_list)} GT images vs {len(img_sr_list)} SR images.")
+        assert len(img_gt_list) == len(
+            img_sr_list), f"Mismatch in number of images for directory: {dir_name}"
 
     logger.info("\n===== Starting Evaluation =====\n")
 
@@ -188,8 +210,10 @@ def main():
                 logger.warning(f"Image read failed for {img_name}. Skipping.")
                 continue
 
-            sr_tensor = img2tensor(sr_img, bgr2rgb=True, float32=True).unsqueeze(0).to(device).contiguous() / 255.0
-            gt_tensor = img2tensor(gt_img, bgr2rgb=True, float32=True).unsqueeze(0).to(device).contiguous() / 255.0
+            sr_tensor = img2tensor(sr_img, bgr2rgb=True, float32=True).unsqueeze(
+                0).to(device).contiguous() / 255.0
+            gt_tensor = img2tensor(gt_img, bgr2rgb=True, float32=True).unsqueeze(
+                0).to(device).contiguous() / 255.0
 
             # Compute metrics
             with torch.no_grad():
@@ -209,12 +233,15 @@ def main():
             runtime = end_time - start_time
 
             # Log per-image metrics and runtime
-            metrics_str = "; ".join([f"{k}: {v:.6f}" for k, v in metrics.items()])
-            logger.info(f"{dir_name}/{img_name} | {metrics_str} | Runtime: {runtime:.2f} sec")
+            metrics_str = "; ".join(
+                [f"{k}: {v:.6f}" for k, v in metrics.items()])
+            logger.info(
+                f"{dir_name}/{img_name} | {metrics_str} | Runtime: {runtime:.2f} sec")
 
         # Compute average metrics
         num_images = len(img_sr_list)
-        avg_metrics = {k: round(v / num_images, 4) for k, v in metrics_accum.items()}
+        avg_metrics = {k: round(v / num_images, 4)
+                       for k, v in metrics_accum.items()}
 
         # Compute FID for the directory
         fid_start_time = time.time()
@@ -223,12 +250,15 @@ def main():
         fid_runtime = fid_end_time - fid_start_time
 
         # Log average metrics for the directory
-        avg_metrics_str = "; ".join([f"{k}: {v:.4f}" for k, v in avg_metrics.items()])
-        logger.info(f"\n===== Average Metrics for [{dir_name}] =====\n{avg_metrics_str} | FID: {fid_value:.6f} | FID Runtime: {fid_runtime:.2f} sec\n")
+        avg_metrics_str = "; ".join(
+            [f"{k}: {v:.4f}" for k, v in avg_metrics.items()])
+        logger.info(
+            f"\n===== Average Metrics for [{dir_name}] =====\n{avg_metrics_str} | FID: {fid_value:.6f} | FID Runtime: {fid_runtime:.2f} sec\n")
 
         # Optionally, you can accumulate FID if needed for overall statistics
 
     logger.info("===== Evaluation Completed =====")
+
 
 if __name__ == "__main__":
     main()

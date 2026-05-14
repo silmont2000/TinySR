@@ -3,8 +3,8 @@ python test/test_tinysr.py  \
 --vae_path="checkpoint/vae/separable" \
 --lora_dir="checkpoint/tinysr" \
 --embedding_dir="dataset/default/" \
---output_dir="outputs/tinysr/" \
---input_dir="dataset/test_image/" \
+--output_dir="outputs/tinysr_real/" \
+--input_dir="dataset/StableSR_testsets/RealSRVal_crop128/test_LR" \
 --rank=64 \
 --rank_vae=64 \
 --is_use_tile=False \

@@ -1,0 +1,15 @@
+===== Average Metrics for [tinysr_dreal] =====
+PSNR: 27.4753; SSIM: 0.7459; LPIPS: 0.3116; DISTS: 0.2205; CLIPIQA: 0.7092; NIQE: 5.6699; MUSIQ: 65.3539; MANIQA: 0.5779 | FID: 146.789191 | FID Runtime: 27.45 sec
+===== Average Metrics for [tinysr_real] =====
+PSNR: 24.7896; SSIM: 0.7171; LPIPS: 0.2806; DISTS: 0.2123; CLIPIQA: 0.7039; NIQE: 4.7402; MUSIQ: 69.7806; MANIQA: 0.6212 | FID: 118.084716 | FID Runtime: 34.64 sec
+===== Average Metrics for [w4a8_svdq_r32_attn_only_a55] =====
+PSNR: 24.8472; SSIM: 0.7151; LPIPS: 0.2790; DISTS: 0.2135; CLIPIQA: 0.7001; NIQE: 4.7713; MUSIQ: 69.0811; MANIQA: 0.6038 | FID: 115.928113 | FID Runtime: 11.47 sec
+===== Average Metrics for [w4a8_svdq_r32_attn_only_a55] =====
+PSNR: 27.3741; SSIM: 0.7418; LPIPS: 0.3153; DISTS: 0.2262; CLIPIQA: 0.7057; NIQE: 5.6758; MUSIQ: 65.1577; MANIQA: 0.5644 | FID: 145.112666 | FID Runtime: 13.31 sec
+
+
+
+===== Average Metrics for [w4a8_svdq_r32_attn_only_a99_real] =====
+PSNR: 24.7655; SSIM: 0.6978; LPIPS: 0.2981; DISTS: 0.2340; CLIPIQA: 0.6720; NIQE: 4.6643; MUSIQ: 67.0564; MANIQA: 0.5657 | FID: 126.996875 | FID Runtime: 15.75 sec
+===== Average Metrics for [w4a8_svdq_r32_attn_only_a99_dreal] =====
+PSNR: 27.4976; SSIM: 0.7295; LPIPS: 0.3304; DISTS: 0.2471; CLIPIQA: 0.6708; NIQE: 5.6519; MUSIQ: 61.7475; MANIQA: 0.5145 | FID: 162.291005 | FID Runtime: 27.40 sec

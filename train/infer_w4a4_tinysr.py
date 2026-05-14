@@ -2,9 +2,11 @@
 import argparse
 import glob
 import json
+import math
 import os
 import sys
 import time
+from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -19,8 +21,10 @@ from diffusers import StableDiffusion3Pipeline
 sys.path.append(".")
 
 from train.quant_w4a4 import (
+    QuantLinearW4A4,
     replace_linear_with_w4a4,
     replace_linear_with_w4a4_from_config,
+    replace_qkv_with_joint_w4a4,
     set_quant_enabled,
     set_observer_enabled,
     freeze_quant_params,
@@ -105,6 +109,12 @@ def parse_args():
         choices=["none", "ffn_only", "attn_only", "dit_full"],
         default="ffn_only",
     )
+
+    parser.add_argument(
+        "--joint_qkv",
+        action="store_true",
+        help="Enable deepcompressor-style joint QKV low-rank branch for attn.to_{q,k,v}",
+    )
     parser.add_argument("--calib_images", type=int, default=8)
     parser.add_argument("--calib_cache", type=str, default=None,
                         help="Path to save/load calibration cache. If the file exists, "
@@ -116,6 +126,13 @@ def parse_args():
     parser.add_argument("--timestep", type=float, default=1000.0)
     parser.add_argument("--save_quant_meta", action="store_true")
     # parser.add_argument("--disable_color_fix_for_calib", action="store_true")
+
+    parser.add_argument("--analyze_activation", action="store_true",
+                        help="Enable per-layer activation quantization error analysis.")
+    parser.add_argument("--analyze_max_samples", type=int, default=200,
+                        help="Max activation samples stored per layer for analysis.")
+    parser.add_argument("--analyze_max_points", type=int, default=20000,
+                        help="Max points per activation sample (subsampled if larger).")
 
     return parser.parse_args()
 
@@ -547,6 +564,136 @@ def save_report(args, replaced_layers, quant_meta, timing):
     print(f"[DONE] report: {report_path}")
 
 
+class ActivationErrorAnalyzer:
+    def __init__(self, max_samples_per_layer=200, max_points_per_sample=20000, seed=42):
+        self.data = defaultdict(list)
+        self.max_samples = max_samples_per_layer
+        self.max_points = max_points_per_sample
+        self.rng = np.random.default_rng(seed)
+        self._last_input = {}
+        self.handles = []
+
+    def register_hooks(self, transformer):
+        for name, m in transformer.named_modules():
+            if not isinstance(m, QuantLinearW4A4):
+                continue
+            pre_handle = m.act_quantizer.register_forward_pre_hook(
+                self._make_pre_hook(name))
+            post_handle = m.act_quantizer.register_forward_hook(
+                self._make_post_hook(name))
+            self.handles.extend([pre_handle, post_handle])
+
+    def remove_hooks(self):
+        for h in self.handles:
+            h.remove()
+        self.handles.clear()
+        self._last_input.clear()
+
+    def _make_pre_hook(self, layer_name):
+        def hook(module, input):
+            self._last_input[layer_name] = input[0].detach().float().cpu()
+        return hook
+
+    def _make_post_hook(self, layer_name):
+        def hook(module, input, output):
+            x = self._last_input.pop(layer_name, None)
+            x_q = output.detach().float().cpu()
+            if x is None:
+                return
+            x_np = x.flatten().numpy()
+            x_q_np = x_q.flatten().numpy()
+            n = x_np.size
+            if n > self.max_points:
+                idx = self.rng.choice(n, size=self.max_points, replace=False)
+                x_np = x_np[idx]
+                x_q_np = x_q_np[idx]
+            store = self.data[layer_name]
+            if len(store) < self.max_samples:
+                store.append((x_np, x_q_np))
+        return hook
+
+    def compute_report(self):
+        report = {"layers": {}}
+        for layer_name in sorted(self.data.keys()):
+            samples = self.data[layer_name]
+            if not samples:
+                continue
+
+            all_x = np.concatenate([s[0] for s in samples])
+            all_x_q = np.concatenate([s[1] for s in samples])
+
+            error = all_x - all_x_q
+            mse = float(np.mean(error ** 2))
+            mae = float(np.mean(np.abs(error)))
+            max_abs_err = float(np.max(np.abs(error)))
+            signal_power = float(np.mean(all_x ** 2))
+            noise_power = mse
+            snr = float(10.0 * math.log10(signal_power / noise_power)
+                        ) if noise_power > 1e-12 else float("inf")
+            mean_err = float(np.mean(error))
+            std_err = float(np.std(error))
+
+            n = all_x_q.size
+            mu = float(np.mean(all_x_q))
+            std = float(np.std(all_x_q))
+            kurt = float(np.mean((all_x_q - mu) ** 4) /
+                         (std ** 4) - 3.0) if std > 1e-12 else 0.0
+            outlier_ratio = float(
+                np.mean(np.abs(all_x_q - mu) > 5.0 * std)) if std > 1e-12 else 0.0
+
+            sample_kurts = []
+            for _, x_q_s in samples:
+                s_mu = x_q_s.mean()
+                s_std = x_q_s.std()
+                if s_std > 1e-12 and x_q_s.size >= 4:
+                    sample_kurts.append(
+                        float(np.mean((x_q_s - s_mu) ** 4) / (s_std ** 4) - 3.0))
+                else:
+                    sample_kurts.append(0.0)
+            avg_sample_kurt = float(
+                np.mean(sample_kurts)) if sample_kurts else 0.0
+
+            mu_x = float(np.mean(all_x))
+            std_x = float(np.std(all_x))
+            kurt_x = float(np.mean((all_x - mu_x) ** 4) /
+                           (std_x ** 4) - 3.0) if std_x > 1e-12 else 0.0
+
+            report["layers"][layer_name] = {
+                "n_total": int(n),
+                "error": {
+                    "mse": mse,
+                    "mae": mae,
+                    "max_abs_err": max_abs_err,
+                    "snr": snr,
+                    "mean": mean_err,
+                    "std": std_err,
+                },
+                "quantized": {
+                    "mean": mu,
+                    "std": std,
+                    "kurtosis_excess": kurt,
+                    "outlier_ratio_5sigma": outlier_ratio,
+                    "avg_per_sample_kurtosis": avg_sample_kurt,
+                },
+                "unquantized": {
+                    "mean": mu_x,
+                    "std": std_x,
+                    "kurtosis_excess": kurt_x,
+                },
+            }
+
+        return report
+
+    def save_report(self, path, args_dict=None):
+        report = self.compute_report()
+        if args_dict:
+            report["args"] = args_dict
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(report, f, indent=2, ensure_ascii=False)
+        print(f"[Analyzer] activation error report -> {path}")
+
+
 def main():
     args = parse_args()
 
@@ -634,15 +781,28 @@ def main():
                 weight_quant_kwargs=weight_quant_kwargs,
                 act_quant_kwargs=act_quant_kwargs,
             )
-        print(f"[W4A4] replaced Linear layers: {len(replaced_layers)}")
-        for layer_name in replaced_layers[:20]:
-            if isinstance(layer_name, dict):
+
+        if args.joint_qkv:
+            joint_replaced = replace_qkv_with_joint_w4a4(
+                transformer,
+                weight_quant_kind="svdq",
+                act_quant_kind="affine",
+                weight_quant_kwargs=weight_quant_kwargs,
+                act_quant_kwargs=act_quant_kwargs,
+            )
+            if len(joint_replaced) > 0:
                 print(
-                    f"  - {layer_name['name']} "
-                    f"w{layer_name['weight_bits']}a{layer_name['activation_bits']}"
+                    f"[W4A4] joint QKV enabled for {len(joint_replaced)//3} attention blocks"
                 )
-            else:
-                print(f"  - {layer_name}")
+        # print(f"[W4A4] replaced Linear layers: {len(replaced_layers)}")
+        # for layer_name in replaced_layers[:20]:
+        #     if isinstance(layer_name, dict):
+        #         print(
+        #             f"  - {layer_name['name']} "
+        #             f"w{layer_name['weight_bits']}a{layer_name['activation_bits']}"
+        #         )
+        #     else:
+        #         print(f"  - {layer_name}")
         if len(replaced_layers) > 20:
             print(f"  ... and {len(replaced_layers) - 20} more")
 
@@ -675,6 +835,14 @@ def main():
     quant_meta = collect_quant_meta(
         transformer) if args.quant_scope != "none" else []
 
+    analyzer = None
+    if args.analyze_activation and args.quant_scope != "none":
+        analyzer = ActivationErrorAnalyzer(
+            max_samples_per_layer=args.analyze_max_samples,
+            max_points_per_sample=args.analyze_max_points,
+        )
+        analyzer.register_hooks(transformer)
+
     timing = run_inference(
         args,
         transformer,
@@ -684,6 +852,12 @@ def main():
         timesteps,
         weight_dtype,
     )
+
+    if analyzer is not None:
+        analyzer.remove_hooks()
+        report_path = os.path.join(
+            args.output_dir, "activation_error_report.json")
+        analyzer.save_report(report_path, args_dict=vars(args))
 
     print(
         "[TIME] "

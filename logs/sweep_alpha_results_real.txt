@@ -1,0 +1,8 @@
+# Alpha Sweep Results - Wed May 13 07:52:42 PM CST 2026
+# Config: w4a8 svdq_r32 scope=dit_full
+# Dataset: /data/disk2/xby/TinySR/dataset/StableSR_testsets/RealSRVal_crop128/test_LR
+# Alphas: 0.75
+
+===== Average Metrics for [w4a8_svdq_r32_dit_full_a75] =====
+PSNR: 24.6643; SSIM: 0.6965; LPIPS: 0.3048; DISTS: 0.2342; CLIPIQA: 0.6948; NIQE: 4.7071; MUSIQ: 67.7874; MANIQA: 0.5678 | FID: 128.159540 | FID Runtime: 12.90 sec
+

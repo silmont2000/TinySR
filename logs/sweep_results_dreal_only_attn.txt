@@ -1,0 +1,26 @@
+# Alpha Sweep Results (metrics only, no re-run)
+# Config: w4a8 svdq_r32 scope=attn_only
+# Dataset: dataset/StableSR_testsets/DrealSRVal_crop128
+# Date: Wed May 13 05:48:39 PM CST 2026
+
+===== Average Metrics for [w4a8_svdq_r32_attn_only_a50] =====
+PSNR: 27.2831; SSIM: 0.7344; LPIPS: 0.3212; DISTS: 0.2281; CLIPIQA: 0.7071; NIQE: 5.5875; MUSIQ: 65.2427; MANIQA: 0.5665 | FID: 148.895125 | FID Runtime: 13.51 sec
+
+===== Average Metrics for [w4a8_svdq_r32_attn_only_a55] =====
+PSNR: 27.4878; SSIM: 0.7450; LPIPS: 0.3119; DISTS: 0.2245; CLIPIQA: 0.7013; NIQE: 5.6756; MUSIQ: 64.6648; MANIQA: 0.5599 | FID: 144.332853 | FID Runtime: 13.38 sec
+
+===== Average Metrics for [w4a8_svdq_r32_attn_only_a60] =====
+PSNR: 27.4368; SSIM: 0.7383; LPIPS: 0.3205; DISTS: 0.2267; CLIPIQA: 0.7077; NIQE: 5.7631; MUSIQ: 64.9831; MANIQA: 0.5636 | FID: 148.549939 | FID Runtime: 13.75 sec
+
+===== Average Metrics for [w4a8_svdq_r32_attn_only_a65] =====
+PSNR: 27.6227; SSIM: 0.7433; LPIPS: 0.3152; DISTS: 0.2267; CLIPIQA: 0.7086; NIQE: 5.6391; MUSIQ: 64.3016; MANIQA: 0.5595 | FID: 147.320514 | FID Runtime: 13.55 sec
+
+===== Average Metrics for [w4a8_svdq_r32_attn_only_a70] =====
+PSNR: 27.5699; SSIM: 0.7400; LPIPS: 0.3183; DISTS: 0.2279; CLIPIQA: 0.7026; NIQE: 5.7315; MUSIQ: 64.3346; MANIQA: 0.5584 | FID: 146.163194 | FID Runtime: 14.08 sec
+
+===== Average Metrics for [w4a8_svdq_r32_attn_only_a75] =====
+PSNR: 27.5416; SSIM: 0.7406; LPIPS: 0.3197; DISTS: 0.2294; CLIPIQA: 0.6965; NIQE: 5.7027; MUSIQ: 64.0381; MANIQA: 0.5520 | FID: 149.577595 | FID Runtime: 13.29 sec
+
+===== Average Metrics for [w4a8_svdq_r32_attn_only_a80] =====
+PSNR: 27.6144; SSIM: 0.7395; LPIPS: 0.3168; DISTS: 0.2283; CLIPIQA: 0.6930; NIQE: 5.6246; MUSIQ: 63.1036; MANIQA: 0.5456 | FID: 150.693739 | FID Runtime: 14.07 sec
+
