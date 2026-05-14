@@ -5,6 +5,7 @@ import re
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import Union, List
 
 
 class MinMaxObserver(nn.Module):
@@ -884,7 +885,8 @@ def replace_linear_with_w4a4_from_config(
 
 def _get_module_and_parent(root: nn.Module, name: str) -> tuple[nn.Module, nn.Module, str]:
     """Return (module, parent_module, child_attr_name) for a dotted module name."""
-    parent_name, child_name = name.rsplit(".", 1) if "." in name else ("", name)
+    parent_name, child_name = name.rsplit(
+        ".", 1) if "." in name else ("", name)
     parent = root.get_submodule(parent_name) if parent_name else root
     return parent.get_submodule(child_name), parent, child_name
 
@@ -998,9 +1000,161 @@ def set_observer_enabled(module: nn.Module, enabled=True):
 
 
 @torch.no_grad()
-def freeze_quant_params(module: nn.Module):
+def _eval_smooth_quant_error(
+    weight: torch.Tensor,
+    act_absmax: torch.Tensor,
+    weight_absmax: torch.Tensor,
+    weight_quantizer: LowRankAffineQuantComponent,
+    inputs: Union[torch.Tensor, None],
+    alpha: float,
+    act_bits: int = 8,
+    act_symmetric: bool = True,
+    act_scale: Union[torch.Tensor, float, None] = None,
+) -> torch.Tensor:
+    """Compute smooth + SVD + quant reconstruction error for a single layer at given alpha.
+
+    Replicates the same pipeline as freeze → build_branch → forward:
+        smooth → SVD split → GPTQ residual quant → act quant → output error
+
+    Returns MSE between original and quantized output.
+    """
+    smooth_scale = act_absmax.pow(alpha) / weight_absmax.pow(1.0 - alpha)
+    smooth_scale = smooth_scale.clamp_min(1e-8)
+    smoothed_weight = weight * smooth_scale.reshape(1, -1)
+
+    bits = weight_quantizer.quantizer.bits
+    symmetric = weight_quantizer.quantizer.symmetric
+    eps = weight_quantizer.quantizer.eps
+
+    if inputs is not None:
+        inputs_smoothed = inputs / smooth_scale.reshape(1, -1)
+        orig_out = inputs @ weight.T
+
+        out_features, in_features = weight.shape
+        rank = weight_quantizer.rank
+        if rank > 0:
+            branch = LowRankBranch(
+                in_features, out_features,
+                rank=rank, alpha=weight_quantizer.alpha,
+                weight=smoothed_weight,
+            )
+            L = branch.get_effective_weight()
+        else:
+            branch = None
+            L = torch.zeros_like(smoothed_weight)
+        R = smoothed_weight - L
+
+        gptq_block_size = weight_quantizer.gptq_block_size
+        gptq_damp = weight_quantizer.gptq_damp_percentage
+        residual_q = gptq_quantize_linear_weight(
+            R, inputs_smoothed, bits=bits, symmetric=symmetric,
+            block_size=gptq_block_size, damp_percentage=gptq_damp, eps=eps,
+        )
+
+        q_inputs = _fake_quant_activation(
+            inputs_smoothed, bits=act_bits, symmetric=act_symmetric, eps=eps, scale=act_scale)
+
+        branch_out = branch(q_inputs) if branch is not None else 0.
+        q_out = q_inputs @ residual_q.T + branch_out
+        error = (orig_out - q_out).pow(2).mean()
+    else:
+        q_weight = affine_fake_quant_weight(
+            smoothed_weight, bits=bits, symmetric=symmetric, eps=eps)
+        error = (smoothed_weight - q_weight).pow(2).mean()
+
+    return error
+
+
+@torch.no_grad()
+def search_smooth_alpha_for_layer(
+    weight: torch.Tensor,
+    act_absmax: torch.Tensor,
+    weight_quantizer: LowRankAffineQuantComponent,
+    input_cache:  Union[list[torch.Tensor], None] = None,
+    alpha_grid: Union[list[float], None] = None,
+    num_grids: int = 11,
+    act_bits: int = 8,
+    act_symmetric: bool = True,
+    act_scale: Union[torch.Tensor, float, None] = None
+) -> float:
+    """Search the best smooth_alpha for a single layer using product error or weight MSE.
+
+    For each candidate alpha, calls _eval_smooth_quant_error to measure
+    reconstruction error. Returns the alpha with lowest error.
+
+    This is ported from deepcompressor's SearchBasedCalibrator / SmoothCalibrator
+    design (deepcompressor/calib/config/smooth.py, deepcompressor/calib/smooth.py).
+    """
+    if alpha_grid is None:
+        num_grids = max(num_grids, 2)
+        alpha_grid = [i / (num_grids - 1) for i in range(num_grids)]
+
+    weight_absmax = weight.detach().abs().amax(dim=0).clamp_min(1e-8)
+    act_absmax = act_absmax.to(
+        device=weight.device, dtype=weight.dtype).clamp_min(1e-8)
+
+    inputs_cat = None
+    if input_cache is not None and len(input_cache) > 0:
+        inputs_cat = torch.cat(input_cache, dim=0).to(
+            device=weight.device, dtype=weight.dtype)
+
+    best_alpha = alpha_grid[len(alpha_grid) // 2]
+    best_error = torch.tensor(
+        float("inf"), device=weight.device, dtype=weight.dtype)
+
+    for alpha in alpha_grid:
+        error = _eval_smooth_quant_error(
+            weight=weight,
+            act_absmax=act_absmax,
+            weight_absmax=weight_absmax,
+            weight_quantizer=weight_quantizer,
+            inputs=inputs_cat,
+            alpha=alpha,
+            act_bits=act_bits,
+            act_symmetric=act_symmetric,
+            act_scale=act_scale,
+        )
+        if error < best_error:
+            best_error = error
+            best_alpha = alpha
+
+    return best_alpha
+
+
+@torch.no_grad()
+def _fake_quant_activation(x: torch.Tensor, bits: int = 8, symmetric: bool = True, eps: float = 1e-8,
+                           scale: Union[torch.Tensor, float, None] = None) -> torch.Tensor:
+    """Per-tensor symmetric fake quantization for activations.
+
+    When scale is given (frozen act_quantizer scale), uses it directly to match
+    real inference where the scale was calibrated on UNSMOOTHED inputs but applied
+    to SMOOTHED inputs. When None, computes from current tensor's absmax.
+    """
+    if symmetric:
+        qmin = -(2 ** (bits - 1))
+        qmax = 2 ** (bits - 1) - 1
+        if scale is not None:
+            scale = scale.item() if isinstance(scale, torch.Tensor) else scale
+        else:
+            max_abs = x.abs().max().clamp_min(eps)
+            scale = max_abs / float(qmax)
+        zero_point = 0
+    else:
+        qmin = 0
+        qmax = 2 ** bits - 1
+        scale = (x.max() - x.min()).clamp_min(eps) / float(qmax - qmin)
+        zero_point = qmin - torch.round(x.min() / scale)
+        zero_point = zero_point.clamp(qmin, qmax)
+    x_int = torch.round(x / scale + zero_point).clamp(qmin, qmax)
+    return (x_int - zero_point) * scale
+
+
+@torch.no_grad()
+def freeze_quant_params(module: nn.Module, search_smooth_alpha: bool = False):
     # First pass: freeze quant params for all layers and build per-layer branches.
-    for m in module.modules():
+    alpha_stats: dict[float, int] = {}
+    alpha_per_layer: list[tuple[str, float]] = []
+    for name, m in module.named_modules():
         if isinstance(m, QuantLinearW4A4):
             smooth_scale = None
             if hasattr(m.weight_quantizer, "act_absmax") and m.weight_quantizer.act_absmax is not None:
@@ -1008,6 +1162,59 @@ def freeze_quant_params(module: nn.Module):
                     device=m.weight.device, dtype=m.weight.dtype).clamp_min(1e-8)
                 weight_absmax = m.weight.detach().abs().amax(dim=0).clamp_min(1e-8)
                 alpha = m.weight_quantizer.smooth_alpha
+
+                # Extract act quantizer params (freeze early so search uses real scale)
+                act_quantizer = getattr(m, "act_quantizer", None)
+                if act_quantizer and hasattr(act_quantizer, "quantizer") and act_quantizer.observer_enabled:
+                    act_quantizer.freeze()
+                    act_bits = act_quantizer.quantizer.bits
+                    act_sym = act_quantizer.quantizer.symmetric
+                    act_scale_val = act_quantizer.quantizer.scale.detach().clone()
+                else:
+                    act_bits, act_sym, act_scale_val = 8, True, None
+
+                input_cache = getattr(
+                    m.weight_quantizer, "input_cache", None)
+                if search_smooth_alpha or alpha < 0:
+                    alpha = search_smooth_alpha_for_layer(
+                        weight=m.weight,
+                        act_absmax=act_absmax,
+                        weight_quantizer=m.weight_quantizer,
+                        input_cache=input_cache,
+                        act_bits=act_bits,
+                        act_symmetric=act_sym,
+                        act_scale=act_scale_val,
+                    )
+                    m.weight_quantizer.smooth_alpha = alpha
+
+                # Compute reconstruction error for logging (both search and fixed-alpha)
+                inputs_cat = None
+                if input_cache is not None and len(input_cache) > 0:
+                    inputs_cat = torch.cat(input_cache, dim=0).to(
+                        device=m.weight.device, dtype=m.weight.dtype)
+                if inputs_cat is not None:
+                    err = _eval_smooth_quant_error(
+                        weight=m.weight,
+                        act_absmax=act_absmax,
+                        weight_absmax=weight_absmax,
+                        weight_quantizer=m.weight_quantizer,
+                        inputs=inputs_cat,
+                        alpha=alpha,
+                        act_bits=act_bits,
+                        act_symmetric=act_sym,
+                        act_scale=act_scale_val,
+                    )
+                    err_str = f"err={err.item():.6e}"
+                else:
+                    err_str = "err=N/A"
+
+                if search_smooth_alpha or alpha < 0:
+                    alpha_stats[alpha] = alpha_stats.get(alpha, 0) + 1
+                    alpha_per_layer.append((name, alpha))
+                    print(f"  [alpha_search] {name} -> alpha={alpha:.2f} {err_str}")
+                else:
+                    print(f"  [smooth_err] {name} -> alpha={alpha:.2f} {err_str}")
+
                 smooth_scale = act_absmax.pow(
                     alpha) / weight_absmax.pow(1.0 - alpha)
                 smooth_scale = smooth_scale.clamp_min(1e-8)
@@ -1024,6 +1231,16 @@ def freeze_quant_params(module: nn.Module):
                     m.weight, smooth_scale=smooth_scale)
             m.act_quantizer.freeze()
 
+    if search_smooth_alpha and alpha_stats:
+        print("[alpha_search] per-layer results:")
+        alphas_sorted = sorted(alpha_stats.items())
+        for al, cnt in alphas_sorted:
+            print(f"  alpha={al:.2f} -> {cnt} layers")
+        total = sum(alpha_stats.values())
+        primary = max(alpha_stats, key=alpha_stats.get)
+        print(
+            f"  total: {total} layers, most common: alpha={primary:.2f} ({alpha_stats[primary]} layers)")
+
     # Second pass: build *shared* low-rank branches for joint QKV groups.
     # This is the deepcompressor-style behavior: share A across q/k/v, slice B.
     joint_groups: dict[str, list[tuple[str, QuantLinearW4A4]]] = {}
@@ -1037,6 +1254,7 @@ def freeze_quant_params(module: nn.Module):
         if len(items) < 2:
             continue
         # Sort deterministically by joint_tag if present.
+
         def _order_key(kv):
             _name, _m = kv
             tag = getattr(_m.weight_quantizer, "joint_tag", "")
@@ -1070,14 +1288,13 @@ def freeze_quant_params(module: nn.Module):
             branch = LowRankBranch(in_features, oc, rank=rank)
             branch.a = shared.a
             branch.b.to(dtype=w.dtype, device=w.device)
-            branch.b.weight.copy_(shared.b.weight[oc_idx : oc_idx + oc])
+            branch.b.weight.copy_(shared.b.weight[oc_idx: oc_idx + oc])
             oc_idx += oc
             wq.branch = branch
             # Recompute residual based on the new shared branch.
             wq.residual = w - branch.get_effective_weight().view_as(w)
             # Quantize residual into dequant float for forward.
             wq.residual = wq.quantizer(wq.residual)
-
 
 
 def set_quant_enabled(module: nn.Module, enabled=True):

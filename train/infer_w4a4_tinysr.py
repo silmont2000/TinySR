@@ -95,6 +95,14 @@ def parse_args():
     parser.add_argument("--rank", type=int, default=64)
     parser.add_argument("--svdq_rank", type=int, default=32)
     parser.add_argument("--svdq_smooth_alpha", type=float, default=0.5)
+    parser.add_argument(
+        "--search_smooth_alpha",
+        action="store_true",
+        help="Enable per-layer smooth_alpha search (port of deepcompressor's "
+             "SearchBasedCalibrator / SmoothCalibConfig strategy). When set, "
+             "the best alpha is selected per layer via grid search over "
+             "reconstruction error, overriding --svdq_smooth_alpha.",
+    )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--upscale", type=int, default=4)
     parser.add_argument("--process_size", type=int, default=512)
@@ -437,7 +445,7 @@ def calibrate_w4a4(
         if device.type == "cuda":
             torch.cuda.empty_cache()
 
-    freeze_quant_params(transformer)
+    freeze_quant_params(transformer, search_smooth_alpha=args.search_smooth_alpha)
     set_quant_enabled(transformer, True)
     set_observer_enabled(transformer, False)
 
@@ -723,7 +731,10 @@ def main():
 
     if args.output_dir is None:
         scope_tag = args.quant_scope
-        alpha_tag = str(int(args.svdq_smooth_alpha * 100))
+        if args.search_smooth_alpha:
+            alpha_tag = "sa"
+        else:
+            alpha_tag = str(int(args.svdq_smooth_alpha * 100))
         args.output_dir = f"outputs/w{args.w_bits}a{args.a_bits}_svdq_r{args.svdq_rank}_{scope_tag}_a{alpha_tag}"
     print(f"[INFO] output_dir: {args.output_dir}")
 
