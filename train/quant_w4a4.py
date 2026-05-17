@@ -1,5 +1,6 @@
 import math
 import json
+import os
 import re
 
 import torch
@@ -1150,7 +1151,7 @@ def _fake_quant_activation(x: torch.Tensor, bits: int = 8, symmetric: bool = Tru
 
 
 @torch.no_grad()
-def freeze_quant_params(module: nn.Module, search_smooth_alpha: bool = False):
+def freeze_quant_params(module: nn.Module, search_smooth_alpha: bool = False, compute_error: bool = True):
     # First pass: freeze quant params for all layers and build per-layer branches.
     alpha_stats: dict[float, int] = {}
     alpha_per_layer: list[tuple[str, float]] = []
@@ -1187,26 +1188,29 @@ def freeze_quant_params(module: nn.Module, search_smooth_alpha: bool = False):
                     )
                     m.weight_quantizer.smooth_alpha = alpha
 
-                # Compute reconstruction error for logging (both search and fixed-alpha)
-                inputs_cat = None
-                if input_cache is not None and len(input_cache) > 0:
-                    inputs_cat = torch.cat(input_cache, dim=0).to(
-                        device=m.weight.device, dtype=m.weight.dtype)
-                if inputs_cat is not None:
-                    err = _eval_smooth_quant_error(
-                        weight=m.weight,
-                        act_absmax=act_absmax,
-                        weight_absmax=weight_absmax,
-                        weight_quantizer=m.weight_quantizer,
-                        inputs=inputs_cat,
-                        alpha=alpha,
-                        act_bits=act_bits,
-                        act_symmetric=act_sym,
-                        act_scale=act_scale_val,
-                    )
-                    err_str = f"err={err.item():.6e}"
+                # Compute reconstruction error for logging
+                if compute_error:
+                    inputs_cat = None
+                    if input_cache is not None and len(input_cache) > 0:
+                        inputs_cat = torch.cat(input_cache, dim=0).to(
+                            device=m.weight.device, dtype=m.weight.dtype)
+                    if inputs_cat is not None:
+                        err = _eval_smooth_quant_error(
+                            weight=m.weight,
+                            act_absmax=act_absmax,
+                            weight_absmax=weight_absmax,
+                            weight_quantizer=m.weight_quantizer,
+                            inputs=inputs_cat,
+                            alpha=alpha,
+                            act_bits=act_bits,
+                            act_symmetric=act_sym,
+                            act_scale=act_scale_val,
+                        )
+                        err_str = f"err={err.item():.6e}"
+                    else:
+                        err_str = "err=N/A"
                 else:
-                    err_str = "err=N/A"
+                    err_str = "err=skipped"
 
                 if search_smooth_alpha or alpha < 0:
                     alpha_stats[alpha] = alpha_stats.get(alpha, 0) + 1
@@ -1214,7 +1218,7 @@ def freeze_quant_params(module: nn.Module, search_smooth_alpha: bool = False):
                     inp_max2 = inputs_cat.abs().max().item() if inputs_cat is not None else 0.0
                     inp_std2 = inputs_cat.std().item() if inputs_cat is not None else 0.0
                     print(f"  [alpha_search] {name} -> alpha={alpha:.2f} {err_str} | inp_max={inp_max2:.4f} inp_std={inp_std2:.4f}")
-                else:
+                elif compute_error:
                     print(f"  [smooth_err] {name} -> alpha={alpha:.2f} {err_str}")
 
                 smooth_scale = act_absmax.pow(
@@ -1233,6 +1237,9 @@ def freeze_quant_params(module: nn.Module, search_smooth_alpha: bool = False):
                     m.weight, smooth_scale=smooth_scale)
             m.act_quantizer.freeze()
 
+    if not search_smooth_alpha:
+        total_layers = sum(1 for _, m in iter_quant_layers(module))
+        print(f"[W4A4] freeze done ({total_layers} layers, fixed alpha)")
     if search_smooth_alpha and alpha_stats:
         print("[alpha_search] per-layer results:")
         alphas_sorted = sorted(alpha_stats.items())
@@ -1306,6 +1313,7 @@ def freeze_quant_params_layer_cascade(
     cascade_forward_fn: callable,
     num_cascade_calib: int = 4,
     search_smooth_alpha: bool = False,
+    compute_error: bool = True,
 ):
     """Layer-by-layer cascade freeze. Each layer is frozen sequentially so that
     layer N sees realistic (pre-quantized) activations from layers 0..N-1.
@@ -1358,10 +1366,13 @@ def freeze_quant_params_layer_cascade(
 
         # Search alpha + freeze + enable quant for this layer
         _layer_cascade_freeze_one(
-            m, layer_name, search_smooth_alpha, alpha_stats, alpha_per_layer)
+            m, layer_name, search_smooth_alpha, alpha_stats, alpha_per_layer, compute_error)
         m.weight_quantizer.enabled = True
         m.act_quantizer.enabled = True
 
+    if not search_smooth_alpha:
+        total_layers = sum(1 for _, m in iter_quant_layers(module))
+        print(f"[W4A4] freeze done ({total_layers} layers, fixed alpha)")
     if search_smooth_alpha and alpha_stats:
         print("[alpha_search] per-layer results:")
         for al, cnt in sorted(alpha_stats.items()):
@@ -1378,6 +1389,7 @@ def _layer_cascade_freeze_one(
     search_smooth_alpha: bool,
     alpha_stats: dict,
     alpha_per_layer: list,
+    compute_error: bool = True,
 ):
     """Freeze a single quantized layer: search alpha → smooth → quant → branch."""
     smooth_scale = None
@@ -1418,7 +1430,7 @@ def _layer_cascade_freeze_one(
             inp_std = inputs_cat.std().item()
         else:
             inp_max = inp_std = 0.0
-        if inputs_cat is not None:
+        if compute_error and inputs_cat is not None:
             err = _eval_smooth_quant_error(
                 weight=m.weight,
                 act_absmax=act_absmax,
@@ -1431,14 +1443,16 @@ def _layer_cascade_freeze_one(
                 act_scale=act_scale_val,
             )
             err_str = f"err={err.item():.6e}"
-        else:
+        elif inputs_cat is None:
             err_str = "err=N/A"
+        else:
+            err_str = "err=skipped"
 
         if search_smooth_alpha or alpha < 0:
             alpha_stats[alpha] = alpha_stats.get(alpha, 0) + 1
             alpha_per_layer.append((layer_name, alpha))
             print(f"  [alpha_search] {layer_name} -> alpha={alpha:.2f} {err_str} | inp_max={inp_max:.4f} inp_std={inp_std:.4f}")
-        else:
+        elif compute_error:
             print(f"  [smooth_err] {layer_name} -> alpha={alpha:.2f} {err_str}")
 
         smooth_scale = act_absmax.pow(alpha) / weight_absmax.pow(1.0 - alpha)
@@ -1604,3 +1618,136 @@ def load_calib_cache(transformer: nn.Module, path: str):
         m.act_quantizer.observer_enabled = False
 
     print(f"[W4A4] calibration cache loaded ({len(cache)} layers) <- {path}")
+
+
+
+@torch.no_grad()
+def pack_int4_weight(
+    weight: torch.Tensor,
+    symmetric: bool = True,
+    group_size: int = None,
+) -> tuple[torch.Tensor, torch.Tensor, object]:
+    weight = weight.float()
+    out, inp = weight.shape
+    qmin, qmax = (-8, 7) if symmetric else (0, 15)
+    eps = 1e-8
+
+    if group_size is None:
+        scale = weight.abs().amax(dim=1, keepdim=True).clamp_min(eps) / float(qmax)
+        zp = None if symmetric else torch.zeros_like(scale)
+        q = torch.round(weight / scale).clamp(qmin, qmax).to(torch.int8)
+    else:
+        padded = inp
+        if inp % group_size != 0:
+            padded = ((inp + group_size - 1) // group_size) * group_size
+            weight = F.pad(weight, (0, padded - inp))
+        weight_g = weight.view(out, -1, group_size)
+        max_abs = weight_g.abs().amax(dim=2, keepdim=True).clamp_min(eps)
+        scale = max_abs / float(qmax)
+        q_g = torch.round(weight_g / scale).clamp(qmin, qmax).to(torch.int8)
+        q = q_g.view(out, padded)
+        zp = None if symmetric else torch.zeros_like(scale)
+
+    q_unsigned = (q + 8).to(torch.uint8)
+    if inp % 2 != 0:
+        q_unsigned = torch.nn.functional.pad(q_unsigned, (0, 1))
+    packed = q_unsigned[:, 0::2] | (q_unsigned[:, 1::2] << 4)
+    return packed.to(torch.uint8), scale.to(torch.float16), zp
+
+
+@torch.no_grad()
+def export_torchao_model(
+    transformer: nn.Module,
+    path: str,
+    replaced_layers: list,
+    quant_meta: list,
+    model_args: dict = None,
+):
+    layers_out = {}
+    total_size_bytes = 0
+    residual_bytes = 0
+    branch_bytes = 0
+    scale_bytes = 0
+
+    for name, m in iter_quant_layers(transformer):
+        wq = m.weight_quantizer
+        if not isinstance(wq, LowRankAffineQuantComponent):
+            continue
+        if wq.residual is None:
+            raise RuntimeError(
+                f"Layer '{name}' has no residual – run freeze/calibration before export."
+            )
+
+        residual = wq.residual
+        smooth_scale = wq.smooth_scale
+        if smooth_scale is None:
+            smooth_scale = torch.ones(
+                m.in_features, device=residual.device, dtype=torch.float16)
+
+        packed, scale, zp = pack_int4_weight(residual, symmetric=True)
+
+        ld: dict[str, object] = {
+            "residual_q_packed": packed.cpu(),
+            "residual_scale": scale.cpu(),
+            "residual_shape": list(residual.shape),
+            "smooth_scale": smooth_scale.cpu(),
+            "bias": m.bias.detach().cpu() if m.bias is not None else None,
+        }
+        if zp is not None:
+            ld["residual_zero_point"] = zp.cpu()
+
+        res_sz = packed.numel() * packed.element_size()
+        scl_sz = scale.numel() * scale.element_size()
+        total_size_bytes += res_sz + scl_sz
+        residual_bytes += res_sz
+        scale_bytes += scl_sz
+
+        if wq.branch is not None and hasattr(wq.branch, 'a') and wq.branch.a is not None:
+            a_w = wq.branch.a.weight.detach().cpu()
+            ld["branch_a_weight"] = a_w
+            br_sz = a_w.numel() * a_w.element_size()
+            total_size_bytes += br_sz
+            branch_bytes += br_sz
+            if hasattr(wq.branch.b, 'weight'):
+                b_w = wq.branch.b.weight.detach().cpu()
+                ld["branch_b_weight"] = b_w
+                br_sz2 = b_w.numel() * b_w.element_size()
+                total_size_bytes += br_sz2
+                branch_bytes += br_sz2
+            ld["branch_alpha"] = wq.branch.alpha
+
+        layers_out[name] = ld
+
+    data: dict = {
+        "layers": layers_out,
+        "replaced_layers": replaced_layers,
+        "quant_meta": quant_meta,
+    }
+    if model_args:
+        data["model_args"] = model_args
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    torch.save(data, path)
+
+    total_mb = total_size_bytes / (1024 * 1024)
+    res_mb = residual_bytes / (1024 * 1024)
+    br_mb = branch_bytes / (1024 * 1024)
+    scl_mb = scale_bytes / (1024 * 1024)
+    print(f"[torchao] exported model -> {path}")
+    print(f"[torchao]   layers: {len(layers_out)}")
+    print(f"[torchao]   total: {total_mb:.1f} MB  "
+          f"(residual_packed: {res_mb:.1f} MB, "
+          f"branch: {br_mb:.1f} MB, "
+          f"scale/etc: {scl_mb:.1f} MB)")
+
+
+@torch.no_grad()
+def load_quantized_model_state(transformer: nn.Module, path: str, device=None):
+    data = torch.load(path, map_location=device or "cpu")
+    missing, unexpected = transformer.load_state_dict(data["state_dict"], strict=False)
+    if missing:
+        print(f"[W4A4] load: missing keys ({len(missing)}): {missing[:10]}{'...' if len(missing) > 10 else ''}")
+    if unexpected:
+        print(f"[W4A4] load: unexpected keys ({len(unexpected)}): {unexpected[:10]}{'...' if len(unexpected) > 10 else ''}")
+    print(f"[W4A4] quantized model state loaded <- {path}")
+    return data.get("replaced_layers"), data.get("quant_meta", []), data.get("model_args", {})

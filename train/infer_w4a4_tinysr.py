@@ -32,6 +32,8 @@ from train.quant_w4a4 import (
     collect_quant_meta,
     save_calib_cache,
     load_calib_cache,
+    export_torchao_model,
+    load_quantized_model_state,
 )
 from utils.wavelet_color_fix import adain_color_fix, wavelet_color_fix
 from utils.util import load_lora_state_dict
@@ -96,6 +98,8 @@ def parse_args():
     parser.add_argument("--rank", type=int, default=64)
     parser.add_argument("--svdq_rank", type=int, default=32)
     parser.add_argument("--svdq_smooth_alpha", type=float, default=0.5)
+    parser.add_argument("--svdq_no_error", "--svdq_smooth_alpha_no_error", action="store_true", dest="svdq_no_error",
+                        help="Skip error log when using fixed --svdq_smooth_alpha. Saves one SVD+GPTQ pass per layer.")
     parser.add_argument(
         "--search_smooth_alpha",
         action="store_true",
@@ -147,6 +151,13 @@ def parse_args():
     parser.add_argument("--latent_tiled_overlap", type=int, default=8)
     parser.add_argument("--timestep", type=float, default=1000.0)
     parser.add_argument("--save_quant_meta", action="store_true")
+    parser.add_argument("--save_model_path", nargs="?", const="__auto__", default=None,
+                        help="Export torchao-ready quantized model. Use --save_model_path <path> or just --save_model_path for auto-path in output_dir. "
+                             "Exports packed int4 residual + SVD branch + smooth_scale per layer (no full-precision weight kept).")
+    parser.add_argument("--load_model_path", type=str, default=None,
+                        help="Load a previously saved fake-quant checkpoint (.pt) instead of running calibration. "
+                             "The base model, LoRA, and quant_scope must match what was used at save time. "
+                             "Note: this loads the old fake-quant format, not the torchao export format.")
     # parser.add_argument("--disable_color_fix_for_calib", action="store_true")
 
     parser.add_argument("--analyze_activation", action="store_true",
@@ -482,9 +493,10 @@ def calibrate_w4a4(
             cascade_forward_fn=_layer_cascade_forward,
             num_cascade_calib=args.cascade_calib_images,
             search_smooth_alpha=args.search_smooth_alpha,
+            compute_error=args.search_smooth_alpha or not args.svdq_no_error,
         )
     else:
-        freeze_quant_params(transformer, search_smooth_alpha=args.search_smooth_alpha)
+        freeze_quant_params(transformer, search_smooth_alpha=args.search_smooth_alpha, compute_error=args.search_smooth_alpha or not args.svdq_no_error)
     set_quant_enabled(transformer, True)
     set_observer_enabled(transformer, False)
 
@@ -869,23 +881,41 @@ def main():
         dtype=weight_dtype,
     )
 
-    if args.quant_scope != "none" and args.calib_cache and os.path.exists(args.calib_cache):
-        load_calib_cache(transformer, args.calib_cache)
+    if args.load_model_path:
+        replaced_layers, quant_meta, _ = load_quantized_model_state(
+            transformer, args.load_model_path, device=device)
+        print(f"[INFO] loaded saved quantized model from {args.load_model_path}")
     else:
-        calibrate_w4a4(
-            args,
-            transformer,
-            vae,
-            calib_image_names,
-            pooled_prompt_embeds,
-            timesteps,
-            weight_dtype,
-        )
-        if args.calib_cache:
-            save_calib_cache(transformer, args.calib_cache)
+        if args.quant_scope != "none" and args.calib_cache and os.path.exists(args.calib_cache):
+            load_calib_cache(transformer, args.calib_cache)
+        else:
+            calibrate_w4a4(
+                args,
+                transformer,
+                vae,
+                calib_image_names,
+                pooled_prompt_embeds,
+                timesteps,
+                weight_dtype,
+            )
+            if args.calib_cache:
+                save_calib_cache(transformer, args.calib_cache)
 
-    quant_meta = collect_quant_meta(
-        transformer) if args.quant_scope != "none" else []
+        quant_meta = collect_quant_meta(
+            transformer) if args.quant_scope != "none" else []
+
+        save_path = args.save_model_path
+        if save_path == "__auto__":
+            save_path = os.path.join(args.output_dir, "torchao_model.pt")
+        if save_path:
+            export_torchao_model(
+                transformer,
+                save_path,
+                replaced_layers,
+                quant_meta,
+                model_args=vars(args),
+            )
+
 
     analyzer = None
     if args.analyze_activation and args.quant_scope != "none":
