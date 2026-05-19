@@ -203,6 +203,7 @@ class LowRankAffineQuantComponent(QuantComponent):
         gptq_damp_percentage=0.01,
         max_gptq_samples=2048,
         smooth_alpha=0.5,
+        num_svd_iterations=0,
     ):
         super().__init__()
         self.quantizer = UniformAffineQuantizer(
@@ -218,6 +219,8 @@ class LowRankAffineQuantComponent(QuantComponent):
         self.gptq_damp_percentage = gptq_damp_percentage
         self.max_gptq_samples = max_gptq_samples
         self.smooth_alpha = smooth_alpha
+        self.num_svd_iterations = num_svd_iterations
+        self.svd_iter_trace: list[dict] = []
         self.branch = None
         self.register_buffer("smooth_scale", None)
         self.register_buffer("act_absmax", None)
@@ -292,6 +295,7 @@ class LowRankAffineQuantComponent(QuantComponent):
         self.act_absmax = None
         self.residual = None
         self.input_cache = []
+        self.svd_iter_trace = []
 
     @torch.no_grad()
     def build_branch(self, weight, quant_weight=None, smooth_scale=None):
@@ -303,42 +307,82 @@ class LowRankAffineQuantComponent(QuantComponent):
                 weight.shape[1], device=weight.device, dtype=weight.dtype)
 
         smooth_weight = weight * self.smooth_scale.reshape(1, -1)
+        self.svd_iter_trace = []
 
-        if self.rank > 0:
-            self.branch = LowRankBranch(
-                smooth_weight.shape[1],
-                smooth_weight.shape[0],
-                rank=self.rank,
-                alpha=self.alpha,
-                weight=smooth_weight,
-            )
-            L = self.branch.get_effective_weight()
-        else:
-            self.branch = None
-            L = torch.zeros_like(smooth_weight)
-
-        R = smooth_weight - L
-
+        # Prepare calibration inputs (used by GPTQ, reused across iterations)
+        inputs = None
         if self.input_cache:
             inputs = torch.cat(self.input_cache, dim=0).to(
                 device=weight.device, dtype=weight.dtype)
             inputs = inputs / self.smooth_scale.reshape(1, -1)
-            self.residual = gptq_quantize_linear_weight(
+
+        def _quantize_residual(R):
+            if inputs is not None:
+                return gptq_quantize_linear_weight(
+                    R, inputs,
+                    bits=self.quantizer.bits,
+                    symmetric=self.quantizer.symmetric,
+                    block_size=self.gptq_block_size,
+                    damp_percentage=self.gptq_damp_percentage,
+                    eps=self.quantizer.eps,
+                )
+            return affine_fake_quant_weight(
                 R,
-                inputs,
                 bits=self.quantizer.bits,
                 symmetric=self.quantizer.symmetric,
-                block_size=self.gptq_block_size,
-                damp_percentage=self.gptq_damp_percentage,
                 eps=self.quantizer.eps,
             )
-        else:
-            self.residual = affine_fake_quant_weight(
-                R,
-                bits=self.quantizer.bits,
-                symmetric=self.quantizer.symmetric,
-                eps=self.quantizer.eps,
-            )
+
+        def _svd_branch(W):
+            if self.rank <= 0:
+                return None, torch.zeros_like(W)
+            branch = LowRankBranch(
+                W.shape[1], W.shape[0],
+                rank=self.rank, alpha=self.alpha, weight=W)
+            return branch, branch.get_effective_weight()
+
+        # Initial SVD
+        self.branch, L = _svd_branch(smooth_weight)
+        R = smooth_weight - L
+        self.residual = _quantize_residual(R)
+
+        err = ((smooth_weight - L - self.residual) ** 2).mean().item()
+        self.svd_iter_trace.append({
+            "iter": 0,
+            "svd_error": float(((smooth_weight - L) ** 2).mean().cpu()),
+            "quant_error": err,
+        })
+
+        # Iterative refinement
+        for k in range(self.num_svd_iterations):
+            T = smooth_weight - self.residual                    # W - Q(R_{k-1})
+            cand_branch, cand_L = _svd_branch(T)                # SVD of compensation target
+            cand_R = smooth_weight - cand_L                     # new residual
+            cand_residual = _quantize_residual(cand_R)          # quantize it
+
+            cand_err = ((smooth_weight - cand_L - cand_residual)
+                        ** 2).mean().item()
+
+            if cand_err >= err:
+                # Error didn't decrease — keep previous, stop
+                print(
+                    f"    [svdq] iter {k + 1}: error stagnated {err:.6e} -> {cand_err:.6e}, stop")
+                break
+
+            # Accept this iteration
+            self.branch, self.residual = cand_branch, cand_residual
+            err = cand_err
+            self.svd_iter_trace.append({
+                "iter": k + 1,
+                "svd_error": float(((smooth_weight - cand_L) ** 2).mean().cpu()),
+                "quant_error": err,
+            })
+
+            # # Convergence check: relative improvement < 1e-5
+            # if len(self.svd_iter_trace) >= 2:
+            #     prev_err = self.svd_iter_trace[-2]["quant_error"]
+            #     if prev_err > 0 and (prev_err - best_err) / prev_err < 1e-8:
+            #         break
 
         self.input_cache = []
         return self.branch
@@ -384,6 +428,9 @@ class LowRankAffineQuantComponent(QuantComponent):
             "has_smooth_scale": self.smooth_scale is not None,
             "has_branch": self.branch is not None,
             "has_residual": self.residual is not None,
+            "num_svd_iterations": int(self.num_svd_iterations),
+            "svd_iter_actual": len(self.svd_iter_trace),
+            "svd_iter_trace": self.svd_iter_trace if self.svd_iter_trace else None,
         }
 
 

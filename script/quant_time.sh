@@ -1,0 +1,11 @@
+python test/test_quant_timing.py \
+  --load_quant_state outputs/quant_state.pt \
+  --quant_scope dit_full \
+  --w_bits 4 \
+  --a_bits 8 \
+  --svdq_rank 32 \
+  --svdq_smooth_alpha 0.55 \
+  --rank 64 \
+  --warmup 5 \
+  --num_images 10 \
+  --input_dir /data/disk2/xby/TinySR/dataset/test_image

@@ -227,11 +227,12 @@ def load_models(pretrained_model_name_or_path, vae_path, lora_dir, rank,
     return transformer, vae
 
 
-def build_layer_replacement_kwargs(w_bits, a_bits, svdq_rank, svdq_smooth_alpha):
+def build_layer_replacement_kwargs(w_bits, a_bits, svdq_rank, svdq_smooth_alpha, svdq_iterations=0):
     return {
         "weight_quant_kwargs": {
             "bits": w_bits, "symmetric": True, "per_channel": True,
             "ch_axis": 0, "rank": svdq_rank, "smooth_alpha": svdq_smooth_alpha,
+            "num_svd_iterations": svdq_iterations,
         },
         "act_quant_kwargs": {
             "bits": a_bits, "symmetric": True, "per_channel": False,
@@ -240,11 +241,13 @@ def build_layer_replacement_kwargs(w_bits, a_bits, svdq_rank, svdq_smooth_alpha)
 
 
 def replace_quant_layers(transformer, quant_scope, quant_config,
-                         w_bits, a_bits, svdq_rank, svdq_smooth_alpha):
+                         w_bits, a_bits, svdq_rank, svdq_smooth_alpha,
+                         svdq_iterations=0):
     if quant_scope == "none":
         return []
     target_suffixes = get_target_suffixes(quant_scope)
-    quant_kwargs = build_layer_replacement_kwargs(w_bits, a_bits, svdq_rank, svdq_smooth_alpha)
+    quant_kwargs = build_layer_replacement_kwargs(
+        w_bits, a_bits, svdq_rank, svdq_smooth_alpha, svdq_iterations)
 
     if quant_config:
         replaced = replace_linear_with_w4a4_from_config(
@@ -275,12 +278,20 @@ def calibrate_w4a4(
     transformer, vae, calib_image_names,
     pooled_prompt_embeds, timesteps, weight_dtype,
     quant_scope, calib_images,
-    search_smooth_alpha, layer_cascade_smooth_alpha,
-    cascade_calib_images, svdq_no_error,
+    search_mode,
+    cascade_calib_images,
     load_smooth_alpha_report, latent_tiled_size, latent_tiled_overlap,
     device="cuda", upscale=4, process_size=512,
     alpha_grid_size=7,
 ):
+    """Run calibration with the smooth_alpha priority chain.
+
+    search_mode: None → use svdq_smooth_alpha from layer construction
+                 "grid" → single-pass grid search
+                 "cascade" → layer-by-layer cascade freeze
+    The caller is responsible for setting the correct svdq_smooth_alpha
+    in weight_quant_kwargs before calling this function.
+    """
     if quant_scope == "none":
         return
     device = torch.device(device)
@@ -307,11 +318,9 @@ def calibrate_w4a4(
     calibrate_and_freeze(
         transformer, calib_data_list, _forward_fn,
         quant_scope=quant_scope,
-        search_smooth_alpha=search_smooth_alpha,
-        layer_cascade_smooth_alpha=layer_cascade_smooth_alpha,
+        search_mode=search_mode,
         cascade_calib_images=cascade_calib_images,
         smooth_alpha_override=smooth_alpha_override,
-        svdq_no_error=svdq_no_error,
         latent_tiled_size=latent_tiled_size,
         latent_tiled_overlap=latent_tiled_overlap,
         alpha_grid_size=alpha_grid_size,

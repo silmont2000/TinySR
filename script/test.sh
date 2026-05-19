@@ -3,8 +3,8 @@ python test/test_tinysr.py  \
 --vae_path="checkpoint/vae/separable" \
 --lora_dir="checkpoint/tinysr" \
 --embedding_dir="dataset/default/" \
---output_dir="outputs/tinysr_DIV2K_V2/" \
---input_dir="/data/disk2/xby/TinySR/dataset/StableSR_testsets/DIV2K_V2_val/test_LR" \
+--output_dir="outputs/tinysr_test/" \
+--input_dir="/data/disk2/xby/TinySR/dataset/test_image" \
 --rank=64 \
 --rank_vae=64 \
 --is_use_tile=False \

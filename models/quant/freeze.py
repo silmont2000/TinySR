@@ -241,6 +241,15 @@ def freeze_one_layer(
         smooth_scale = act_absmax.pow(alpha) / weight_absmax.pow(1.0 - alpha)
         smooth_scale = smooth_scale.clamp_min(1e-8)
 
+    else:
+        # Config mode: no calibration data — apply weight-only smoothing via preset alpha
+        alpha = max(getattr(m.weight_quantizer, "smooth_alpha", 0.5), 0.0)
+        if alpha > 0:
+            weight_absmax = m.weight.detach().abs().amax(dim=0).clamp_min(1e-8)
+            smooth_scale = weight_absmax.pow(alpha - 1.0)
+        else:
+            smooth_scale = None
+
     # Weight stats + freeze + branch build
     stat_weight = m.weight * \
         smooth_scale.reshape(1, -1) if smooth_scale is not None else m.weight

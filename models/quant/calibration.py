@@ -13,29 +13,26 @@ def calibrate_and_freeze(
     cascade_forward_fn: callable,
     *,
     quant_scope: str = "none",
-    search_smooth_alpha: bool = False,
-    layer_cascade_smooth_alpha: bool = False,
+    search_mode: str = None,
     cascade_calib_images: int = 4,
     smooth_alpha_override=None,
-    svdq_no_error: bool = False,
     latent_tiled_size: int = 64,
     latent_tiled_overlap: int = 8,
     alpha_grid_size: int = 7,
 ):
     """Calibrate and freeze quantization parameters for the transformer.
 
-    This is a convenience function that wraps the full calibration protocol:
-    observer toggling, forward pass, freeze (single-pass or cascade),
-    and post-freeze state reset.
-
-    *calib_data_list*: list of (model_input, timesteps, pooled_prompt_embeds, weight_dtype) tuples
-                       used for both observer collection (all entries) and cascade forward (first
-                       cascade_calib_images entries).
-    *cascade_forward_fn*: callable(model_input, timesteps, pooled_prompt_embeds, weight_dtype)
-                          that runs a forward pass through the transformer.
+    *search_mode*: None → use preset smooth_alpha (from layer construction)
+                   "grid" → single-pass grid search (no cascade)
+                   "cascade" → layer-by-layer cascade freeze
+    *compute_error* is automatically derived: True only when searching.
     """
     if quant_scope == "none":
         return
+
+    search = search_mode is not None
+    cascade = (search_mode == "cascade")
+    compute_error = search
 
     set_quant_enabled(transformer, False)
     set_observer_enabled(transformer, True)
@@ -47,9 +44,7 @@ def calibrate_and_freeze(
         if calib_data_list and calib_data_list[0][0].device.type == "cuda":
             torch.cuda.empty_cache()
 
-    compute_error = search_smooth_alpha or not svdq_no_error
-
-    if layer_cascade_smooth_alpha:
+    if cascade:
         cascade_calib = calib_data_list[:min(
             cascade_calib_images, len(calib_data_list))]
         freeze_quant_params_layer_cascade(
@@ -65,7 +60,7 @@ def calibrate_and_freeze(
     else:
         freeze_quant_params(
             transformer,
-            search_smooth_alpha=search_smooth_alpha,
+            search_smooth_alpha=search,
             compute_error=compute_error,
             smooth_alpha_override=smooth_alpha_override,
             alpha_grid_size=alpha_grid_size,

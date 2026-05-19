@@ -26,9 +26,11 @@ ATTN_SUFFIXES = [
     "attn.to_out.0",
 ]
 
+# EXTRA_SUFFIXES = [
+#     "proj_out.base_layer",
+#     "proj_out",
+# ]
 EXTRA_SUFFIXES = [
-    "proj_out.base_layer",
-    "proj_out",
 ]
 
 
@@ -155,6 +157,10 @@ def _quant_kwargs_from_strategy(strategy, default_weight_kwargs, default_act_kwa
         weight_kwargs["bits"] = strategy["w_bits"]
     if "a_bits" in strategy:
         act_kwargs["bits"] = strategy["a_bits"]
+
+    for k in ("smooth_alpha", "smooth_scale", "rank", "per_channel", "ch_axis", "eps"):
+        if k in strategy:
+            weight_kwargs[k] = strategy[k]
 
     return weight_kwargs, act_kwargs
 
