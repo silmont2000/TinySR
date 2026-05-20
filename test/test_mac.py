@@ -1,3 +1,13 @@
+# fmt:off
+import sys
+sys.path.append(".")
+import os
+import time
+import glob
+import argparse
+from PIL import Image
+import torch
+import torch.nn as nn
 from thop import profile, clever_format
 from models.vae.autoencoder_tiny import AutoencoderTiny
 from models.tinysr.tinysd3 import TinySD3Transformer2DModel
@@ -7,15 +17,6 @@ from diffusers import (
 from peft import LoraConfig
 from tqdm import tqdm
 from torchvision import transforms
-import torch.nn as nn
-import torch
-from PIL import Image
-import argparse
-import glob
-import time
-import os
-import sys
-sys.path.append(".")
 
 
 def parse_args():

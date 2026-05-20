@@ -118,8 +118,9 @@ class UniformAffineQuantizer(nn.Module):
             return x
 
         scale, zero_point = self.reshape_qparams(x)
+        return x
 
-        x_int = torch.round(x / scale + zero_point)
-        x_int = torch.clamp(x_int, self.qmin, self.qmax)
-        x_dequant = (x_int - zero_point) * scale
-        return x_dequant
+        # x_int = torch.round(x / scale + zero_point)
+        # x_int = torch.clamp(x_int, self.qmin, self.qmax)
+        # x_dequant = (x_int - zero_point) * scale
+        # return x_dequant

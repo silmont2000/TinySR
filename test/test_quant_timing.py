@@ -57,13 +57,16 @@ def parse_args():
                         help="Save decoded images to this directory (I/O excluded from timing).")
 
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--mixed_precision", type=str, choices=["fp16", "fp32"], default="fp16")
+    parser.add_argument("--mixed_precision", type=str, choices=["fp16", "bf16", "fp32"], default="fp16")
     parser.add_argument("--upscale", type=int, default=4)
     parser.add_argument("--process_size", type=int, default=512)
     parser.add_argument("--latent_tiled_size", type=int, default=64)
     parser.add_argument("--latent_tiled_overlap", type=int, default=8)
     parser.add_argument("--timestep", type=float, default=1000.0)
     parser.add_argument("--rank", type=int, default=64, help="LoRA rank (must match calibration).")
+
+    parser.add_argument("--int4_cuda", action="store_true",
+                        help="Use WMMA int8 Tensor Core kernel for true int4 matmul.")
 
     return parser.parse_args()
 
@@ -204,6 +207,28 @@ if __name__ == "__main__":
         print(f"[bench]   unexpected keys (saved but not in model): {len(unexpected)}")
     if quant_injected:
         print(f"[bench]   quantizer state injected (residual/branch): {quant_injected} layers")
+
+    # Pass 4: inject act_quantizer scales from state_dict (required by int4 CUDA)
+    act_loaded = 0
+    for rec in replaced:
+        name = rec["name"]
+        m = transformer.get_submodule(name)
+        aq_key = name + ".act_quantizer.quantizer.scale"
+        if aq_key in state:
+            m.act_quantizer.quantizer.scale = state[aq_key].to(device=m.weight.device)
+            m.act_quantizer.quantizer.calibrated = True
+            act_loaded += 1
+    if act_loaded:
+        print(f"[bench]   act scales injected: {act_loaded} layers")
+
+    # Optionally switch to the WMMA int8 Tensor Core path
+    if args.int4_cuda:
+        from models.quant.int4_pack import pack_all_quant_layers
+        n_packed = pack_all_quant_layers(transformer)
+        if n_packed:
+            print(f"[bench]   int4 CUDA (WMMA INT8 TC) enabled: {n_packed} layers")
+        else:
+            print("[bench]   int4 CUDA skipped (no layers packed)")
 
     set_observer_enabled(transformer, False)
     set_quant_enabled(transformer, True)
