@@ -1,38 +1,80 @@
 #include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <c10/cuda/CUDAException.h>
 #include <cuda_fp16.h>
 
-__global__ void dequant_int4_kernel(
+__global__ void dequant_int4_kernel_half2(
     const uint8_t* __restrict__ packed,
-    __half* __restrict__ output,
+    __half2* __restrict__ output,
     const __half* __restrict__ scale,
-    int N, int K2
+    int N,
+    int K2
 ) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    int total = N * K2;
-    int stride = blockDim.x * gridDim.x;
-    int K = K2 * 2;
-    for (int i = idx; i < total; i += stride) {
-        int row = i / K2, col2 = i % K2;
-        uint8_t byte = packed[i];
-        int8_t lo = byte & 0xF; lo = (lo >= 8) ? lo - 16 : lo;
-        int8_t hi = (byte >> 4) & 0xF; hi = (hi >= 8) ? hi - 16 : hi;
-        float s = __half2float(scale[row]);
-        output[row * K + 2 * col2]     = __float2half((float)lo * s);
-        output[row * K + 2 * col2 + 1] = __float2half((float)hi * s);
+    int row = blockIdx.y;
+    int col2 = blockIdx.x * blockDim.x + threadIdx.x;
+
+    if (row >= N || col2 >= K2) {
+        return;
     }
+
+    int offset = row * K2 + col2;
+    uint8_t byte = packed[offset];
+
+    int lo = byte & 0x0f;
+    int hi = (byte >> 4) & 0x0f;
+
+    lo = lo >= 8 ? lo - 16 : lo;
+    hi = hi >= 8 ? hi - 16 : hi;
+
+    __half2 q = __halves2half2(
+        __int2half_rn(lo),
+        __int2half_rn(hi)
+    );
+
+    __half2 s = __half2half2(scale[row]);
+
+    output[offset] = __hmul2(q, s);
 }
 
 torch::Tensor dequant_int4_cuda(
-    torch::Tensor packed, torch::Tensor scale)
-{
-    int N = packed.size(0), K2 = packed.size(1);
-    auto out = torch::empty({N, K2 * 2}, packed.options().dtype(c10::kHalf));
-    int total = N * K2;
-    int block = 256, grid = std::min((total + block - 1) / block, 65535);
-    dequant_int4_kernel<<<grid, block>>>(
+    torch::Tensor packed,
+    torch::Tensor scale
+) {
+    TORCH_CHECK(packed.is_cuda(), "packed must be CUDA tensor");
+    TORCH_CHECK(scale.is_cuda(), "scale must be CUDA tensor");
+    TORCH_CHECK(packed.dtype() == torch::kUInt8, "packed must be uint8");
+    TORCH_CHECK(scale.dtype() == torch::kHalf, "scale must be float16");
+    TORCH_CHECK(packed.is_contiguous(), "packed must be contiguous");
+    TORCH_CHECK(scale.is_contiguous(), "scale must be contiguous");
+    TORCH_CHECK(packed.dim() == 2, "packed must be 2D");
+    TORCH_CHECK(scale.dim() == 1, "scale must be 1D");
+    TORCH_CHECK(scale.size(0) == packed.size(0), "scale size mismatch");
+
+    int N = packed.size(0);
+    int K2 = packed.size(1);
+
+    auto out = torch::empty(
+        {N, K2 * 2},
+        packed.options().dtype(torch::kHalf)
+    );
+
+    int block = 256;
+    dim3 grid((K2 + block - 1) / block, N);
+
+    dequant_int4_kernel_half2<<<
+        grid,
+        block,
+        0,
+        at::cuda::getCurrentCUDAStream()
+    >>>(
         packed.data_ptr<uint8_t>(),
-        (__half*)out.data_ptr<at::Half>(),
-        (const __half*)scale.data_ptr<at::Half>(),
-        N, K2);
+        reinterpret_cast<__half2*>(out.data_ptr<at::Half>()),
+        reinterpret_cast<const __half*>(scale.data_ptr<at::Half>()),
+        N,
+        K2
+    );
+
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+
     return out;
 }
