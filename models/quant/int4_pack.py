@@ -71,6 +71,8 @@ def pack_all_quant_layers(transformer):
             m._act_scale = torch.tensor(1.0, device=residual.device, dtype=torch.float16)
 
         wq.residual = None
+        if hasattr(m, 'weight') and m.weight is not None:
+            del m.weight
         n_packed += 1
 
     return n_packed

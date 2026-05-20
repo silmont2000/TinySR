@@ -81,8 +81,6 @@ def main(args, pixel_values, new_height, new_width, transformer, vae, timesteps,
         model_pred = tile_sample(model_input, transformer, timesteps, pooled_prompt_embeds, weight_dtype,
                                  latent_tiled_size=args.latent_tiled_size, latent_tiled_overlap=args.latent_tiled_overlap)
         latent_stu = model_input - model_pred
-        if args.skip_decode:
-            return None
         image = vae.decode(latent_stu / vae.config.scaling_factor, return_dict=False)[0].squeeze(0).clamp(-1, 1)
         return image
 
@@ -201,6 +199,10 @@ if __name__ == "__main__":
         print(f"[bench]   shape-changed (direct assign): {reshaped}")
     if not_found - not_found_skipped:
         print(f"[bench]   not in model (skipped): {not_found - not_found_skipped}")
+
+    # Free state dict references — they hold parameter tensors alive
+    del model_sd
+
     if missing:
         print(f"[bench]   missing keys (backbone, expected): {len(missing)}")
     if unexpected:
@@ -221,14 +223,20 @@ if __name__ == "__main__":
     if act_loaded:
         print(f"[bench]   act scales injected: {act_loaded} layers")
 
-    # Optionally switch to the WMMA int8 Tensor Core path
+    # Optionally switch to int4 dequant + cuBLAS fp16 path
     if args.int4_cuda:
         from models.quant.int4_pack import pack_all_quant_layers
         n_packed = pack_all_quant_layers(transformer)
         if n_packed:
-            print(f"[bench]   int4 CUDA (WMMA INT8 TC) enabled: {n_packed} layers")
+            print(f"[bench]   int4 dequant + cuBLAS fp16 enabled: {n_packed} layers")
         else:
             print("[bench]   int4 CUDA skipped (no layers packed)")
+
+    # Release FP16 residuals from CUDA cache so they don't inflate peak mem
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize()
+    model_mem = torch.cuda.memory_allocated() / 1024**2
+    print(f"[bench]   model memory (weights+buffers): {model_mem:.0f} MB")
 
     set_observer_enabled(transformer, False)
     set_quant_enabled(transformer, True)
@@ -277,6 +285,7 @@ if __name__ == "__main__":
     # ---- Timing ----
     print(f"[bench] timing {n_timed} images ...")
     times = []
+    mem_records = []
 
     for image_path in tqdm(used[:n_timed], desc="Timing"):
         # I/O + resize logic — outside timing (same as tinysr L250-270)
@@ -284,23 +293,18 @@ if __name__ == "__main__":
         resize_flag, new_width, new_height, ori_width, ori_height = preprocess_one_image(lr, args.upscale, args.process_size)
         pixel_values = tensor_transform(lr).unsqueeze(0).to(device, dtype=weight_dtype)
 
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-            t0 = time.time()
-        else:
-            t0 = time.perf_counter()
-
+        # torch.cuda.synchronize()
+        torch.cuda.reset_peak_memory_stats()
+        t0 = time.time()
         # --- TIMING START ---
         decoded = main(args, pixel_values, new_height, new_width, transformer, vae, timesteps, pooled_prompt_embeds, weight_dtype)
         # --- TIMING END ---
-
-        if device.type == "cuda":
-            torch.cuda.synchronize()
-            elapsed = time.time() - t0
-        else:
-            elapsed = time.perf_counter() - t0
+        torch.cuda.synchronize()
+        elapsed = time.time() - t0
+        peak_mem = torch.cuda.max_memory_allocated() / 1024**2
 
         times.append(elapsed)
+        mem_records.append(peak_mem)
         # Save decoded image AFTER timing (I/O excluded from measurement)
         if decoded is not None and args.output_dir:
             image = decoded
@@ -318,6 +322,7 @@ if __name__ == "__main__":
         print("[bench] no timed images — nothing to report")
     else:
         arr = np.array(times)
+        mem = np.array(mem_records)
         print()
         print("=" * 55)
         print(f"  images timed      : {len(times)}")
@@ -334,4 +339,8 @@ if __name__ == "__main__":
         print(f"  min  (ms)         : {np.min(arr) * 1000:.1f}")
         print(f"  max  (ms)         : {np.max(arr) * 1000:.1f}")
         print(f"  std  (ms)         : {np.std(arr) * 1000:.1f}")
+        print("-" * 55)
+        print(f"  peak mem avg (MB) : {np.mean(mem):.0f}")
+        print(f"  peak mem p50 (MB) : {np.percentile(mem, 50):.0f}")
+        print(f"  peak mem max (MB) : {np.max(mem):.0f}")
         print("=" * 55)

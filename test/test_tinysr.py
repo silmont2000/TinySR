@@ -14,6 +14,7 @@ from PIL import Image
 import torch
 from torchvision import transforms
 from tqdm import tqdm
+import numpy as np
 from peft import LoraConfig
 from diffusers import (
     StableDiffusion3Pipeline,
@@ -138,6 +139,7 @@ if __name__ == "__main__":
         os.makedirs(args.output_dir)
 
     total_time = 0.0
+    mem_records = []
     for image_name in tqdm(image_names):
         lr = Image.open(image_name).convert('RGB')
         ori_width, ori_height = lr.size
@@ -160,12 +162,18 @@ if __name__ == "__main__":
 
         lr_scale = lr.resize((int(ori_width*args.upscale), int(ori_height*args.upscale)))
         pixel_values = tensor_transforms(lr).unsqueeze(0).to(args.device, dtype=weight_dtype)
+        for i in range(5):
+            image = main(args, pixel_values, (new_height, new_width))
+
         start_time = time.time()
+        torch.cuda.reset_peak_memory_stats()
         image = main(args, pixel_values, (new_height, new_width))
         torch.cuda.synchronize()
         end_time = time.time()
+        peak_mem = torch.cuda.max_memory_allocated() / 1024**2
         image_pil_image = transforms.ToPILImage()(image.cpu() / 2 + 0.5)      
         total_time += (end_time - start_time)
+        mem_records.append(peak_mem)
         if resize_flag:
             image_pil_image = image_pil_image.resize((int(ori_width*args.upscale), int(ori_height*args.upscale)))
 
@@ -179,8 +187,11 @@ if __name__ == "__main__":
         image_pil_image.save(os.path.join(args.output_dir, os.path.basename(image_name)))
         torch.cuda.empty_cache()
     param_cnt = sum(p.numel() for p in transformer.transformer_blocks.parameters() )
+    mem_arr = np.array(mem_records)
     print("#Param.", param_cnt/1e6, "M")
-    print(f"Average time: {total_time / datalen}")
+    print(f"Average time: {total_time / datalen:.4f} sec/image")
+    print(f"Peak mem  avg: {np.mean(mem_arr):.0f} MB")
+    print(f"Peak mem  max: {np.max(mem_arr):.0f} MB")
 
 
 

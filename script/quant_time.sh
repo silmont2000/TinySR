@@ -8,4 +8,5 @@ python test/test_quant_timing.py \
   --rank 64 \
   --warmup 5 \
   --num_images 10 \
+  --int4_cuda \
   --input_dir /data/disk2/xby/TinySR/dataset/test_image

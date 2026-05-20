@@ -61,7 +61,8 @@ class QuantLinearW4A4(nn.Module):
 
         self.weight = nn.Parameter(linear.weight.detach().clone())
         if linear.bias is not None:
-            self.bias = nn.Parameter(linear.bias.detach().clone())
+            self.bias = nn.Parameter(
+                linear.bias.detach().clone())
         else:
             self.bias = None
 
@@ -94,19 +95,19 @@ class QuantLinearW4A4(nn.Module):
 
     def _is_int4_ready(self):
         return getattr(self, "_int4_packed", None) is not None and \
-               getattr(self, "_act_scale", None) is not None and \
                getattr(self, "_int4_wt_scale", None) is not None
 
     def _int4_forward(self, x):
-        from models.quant.int4_cuda import get_int4_linear_op
-        op = get_int4_linear_op()
+        from models.quant.int4_cuda import get_dequant_op
 
         smooth_scale = getattr(self.weight_quantizer, "smooth_scale", None)
         if smooth_scale is not None:
             x = x / smooth_scale.reshape(*([1] * (x.dim() - 1)), -1)
 
-        bias = self.bias if self.bias is not None else torch.empty(0, device=x.device)
-        out = op(x, self._int4_packed, self._act_scale, self._int4_wt_scale, bias)
+        deq = get_dequant_op()
+        w_deq = deq(self._int4_packed, self._int4_wt_scale)
+        bias = self.bias.half() if self.bias is not None and self.bias.dtype != torch.float16 else self.bias
+        out = torch.nn.functional.linear(x, w_deq, bias)
 
         if hasattr(self.weight_quantizer, "branch_forward"):
             branch_out = self.weight_quantizer.branch_forward(x)
