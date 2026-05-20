@@ -17,8 +17,8 @@ from models.quant.layers import (
     replace_linear_with_w4a4_from_config,
     load_smooth_alpha_from_report,
 )
+from models.quant.tiler import gaussian_weights, tile_sample
 from models.quant.calibration import calibrate_and_freeze
-from models.quant.serialization import export_torchao_model, load_torchao_model
 from utils.wavelet_color_fix import adain_color_fix, wavelet_color_fix
 from utils.util import load_lora_state_dict
 from models.vae.autoencoder_tiny import AutoencoderTiny
@@ -63,107 +63,6 @@ def preprocess_one_image(lr, upscale, process_size):
     return resize_flag, new_width, new_height, ori_width, ori_height
 
 
-def gaussian_weights(tile_width, tile_height, nbatches, in_channels, device, dtype):
-    var = 0.01
-    midpoint_x = (tile_width - 1) / 2
-    midpoint_y = tile_height / 2
-
-    x = torch.arange(tile_width, device=device, dtype=torch.float32)
-    y = torch.arange(tile_height, device=device, dtype=torch.float32)
-
-    x_probs = torch.exp(-((x - midpoint_x) ** 2) /
-                        (tile_width * tile_width) / (2 * var))
-    y_probs = torch.exp(-((y - midpoint_y) ** 2) /
-                        (tile_height * tile_height) / (2 * var))
-
-    weights = torch.outer(y_probs, x_probs)
-    weights = weights.to(dtype=dtype)
-    return weights.expand(nbatches, in_channels, tile_height, tile_width)
-
-
-@torch.no_grad()
-def tile_sample(
-    lq_latent,
-    transformer,
-    timesteps,
-    pooled_prompt_embeds,
-    weight_dtype,
-    latent_tiled_size=64,
-    latent_tiled_overlap=8,
-):
-    _, _, height, width = lq_latent.size()
-    tile_size = latent_tiled_size
-    tile_overlap = latent_tiled_overlap
-
-    if height * width <= tile_size * tile_size:
-        model_pred = transformer(
-            hidden_states=lq_latent,
-            timestep=timesteps,
-            pooled_projections=pooled_prompt_embeds,
-            return_dict=False,
-        )[0]
-        return model_pred.to(lq_latent.device, dtype=weight_dtype)
-
-    tile_size = min(tile_size, min(height, width))
-    tile_weights = gaussian_weights(
-        tile_size, tile_size, 1,
-        transformer.config.in_channels,
-        lq_latent.device, weight_dtype,
-    )
-
-    grid_rows = 0
-    cur_x = 0
-    while cur_x < width:
-        cur_x = max(grid_rows * tile_size - tile_overlap * grid_rows, 0) + tile_size
-        grid_rows += 1
-
-    grid_cols = 0
-    cur_y = 0
-    while cur_y < height:
-        cur_y = max(grid_cols * tile_size - tile_overlap * grid_cols, 0) + tile_size
-        grid_cols += 1
-
-    noise_preds = []
-    for row in range(grid_rows):
-        for col in range(grid_cols):
-            if row == grid_rows - 1:
-                ofs_x = width - tile_size
-            else:
-                ofs_x = max(row * tile_size - tile_overlap * row, 0)
-            if col == grid_cols - 1:
-                ofs_y = height - tile_size
-            else:
-                ofs_y = max(col * tile_size - tile_overlap * col, 0)
-            input_tile = lq_latent[:, :, ofs_y: ofs_y + tile_size, ofs_x: ofs_x + tile_size]
-            pred = transformer(
-                hidden_states=input_tile.to(lq_latent.device, dtype=weight_dtype),
-                timestep=timesteps,
-                pooled_projections=pooled_prompt_embeds,
-                return_dict=False,
-            )[0]
-            noise_preds.append(pred)
-
-    noise_pred = torch.zeros(lq_latent.shape, device=lq_latent.device, dtype=weight_dtype)
-    contributors = torch.zeros(lq_latent.shape, device=lq_latent.device, dtype=weight_dtype)
-
-    for row in range(grid_rows):
-        for col in range(grid_cols):
-            if row == grid_rows - 1:
-                ofs_x = width - tile_size
-            else:
-                ofs_x = max(row * tile_size - tile_overlap * row, 0)
-            if col == grid_cols - 1:
-                ofs_y = height - tile_size
-            else:
-                ofs_y = max(col * tile_size - tile_overlap * col, 0)
-            index = row * grid_cols + col
-            noise_pred[:, :, ofs_y: ofs_y + tile_size, ofs_x: ofs_x + tile_size] += noise_preds[index] * tile_weights
-            contributors[:, :, ofs_y: ofs_y + tile_size, ofs_x: ofs_x + tile_size] += tile_weights
-
-    model_pred = noise_pred / contributors.clamp_min(1e-8)
-    return model_pred.to(lq_latent.device, dtype=weight_dtype)
-
-
 def image_to_latent(upscale, process_size, vae, image_path, tensor_transform, device, weight_dtype):
     lr = Image.open(image_path).convert("RGB")
     resize_flag, new_width, new_height, ori_width, ori_height = preprocess_one_image(
@@ -171,7 +70,8 @@ def image_to_latent(upscale, process_size, vae, image_path, tensor_transform, de
 
     lr_scale = lr.resize((int(ori_width * upscale), int(ori_height * upscale)))
 
-    pixel_values = tensor_transform(lr).unsqueeze(0).to(device=device, dtype=weight_dtype)
+    pixel_values = tensor_transform(lr).unsqueeze(
+        0).to(device=device, dtype=weight_dtype)
     pixel_values = torch.nn.functional.interpolate(
         pixel_values, size=(new_height, new_width), mode="bicubic", align_corners=False)
     pixel_values = pixel_values * 2 - 1
@@ -249,7 +149,7 @@ def replace_quant_layers(transformer, quant_scope, quant_config,
     quant_kwargs = build_layer_replacement_kwargs(
         w_bits, a_bits, svdq_rank, svdq_smooth_alpha, svdq_iterations)
 
-    if quant_config:
+    if quant_config is not None:
         replaced = replace_linear_with_w4a4_from_config(
             transformer, quant_config,
             target_suffixes=target_suffixes,
@@ -313,7 +213,8 @@ def calibrate_w4a4(
 
     smooth_alpha_override = None
     if load_smooth_alpha_report:
-        smooth_alpha_override = load_smooth_alpha_from_report(load_smooth_alpha_report)
+        smooth_alpha_override = load_smooth_alpha_from_report(
+            load_smooth_alpha_report)
 
     calibrate_and_freeze(
         transformer, calib_data_list, _forward_fn,
@@ -381,9 +282,11 @@ def run_inference(
             ))
 
         if align_method == "adain":
-            image_pil = adain_color_fix(target=image_pil, source=image_info["lr"])
+            image_pil = adain_color_fix(
+                target=image_pil, source=image_info["lr"])
         elif align_method == "wavelet":
-            image_pil = wavelet_color_fix(target=image_pil, source=image_info["lr_scale"])
+            image_pil = wavelet_color_fix(
+                target=image_pil, source=image_info["lr_scale"])
 
         save_path = os.path.join(output_dir, os.path.basename(image_path))
         image_pil.save(save_path)

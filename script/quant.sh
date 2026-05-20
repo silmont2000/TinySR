@@ -19,7 +19,6 @@ python train/train_quant.py  \
   --save_quant_meta            `# save full quant_meta in w4a4_report.json` \
   --save_quant_state outputs/quant_state.pt
   # --search_smooth_alpha cascade --svdq_alpha_grid 22 \
-  # --save_model_path            `# export torchao model (auto path in output_dir)`
 
 # =============================================================================
 #  smooth_alpha 三级优先方案
@@ -79,10 +78,6 @@ python train/train_quant.py  \
 # ---- 校准缓存 ----
 # --calib_cache <pt_path>           校准缓存路径 (存在则跳过校准直接加载)
 #
-# ---- 模型导出/预加载 ----
-# --save_model_path <path>          导出torchao量化模型 (用=__auto__自动路径)
-# --load_model_path <pt_path>       加载已导出的torchao模型 (跳过校准+LoRA)
-#
 # ---- 推理 ----
 # --device <str>                    设备 (default: cuda)
 # --mixed_precision <str>           精度: fp16 | fp32 (default: fp16)
@@ -138,7 +133,6 @@ python train/train_quant.py  \
 # python train/train_quant.py \
 #   --quant_scope dit_full \
 #   --input_dir dataset/test_image/ \
-#   --load_model_path outputs/torchao_model.pt
 #
 # --- 保存完整量化state_dict + 下次直接加载 (推荐) ---
 # # 第一次：校准并保存

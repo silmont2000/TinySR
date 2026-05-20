@@ -22,7 +22,6 @@ from models.quant.inference import (
     save_report,
 )
 from models.quant.analysis import ActivationErrorAnalyzer
-from models.quant.serialization import export_torchao_model, load_torchao_model
 
 
 def parse_args():
@@ -159,7 +158,7 @@ def main():
 
     # Model preparation
     #   Branch A: load saved state_dict → skip all calibration
-    #   Branch B: load torchao export → TorchAOQuantLinear modules
+    #   Branch B: load torchao export → TorchAOQuantLinear modules（invalid）
     #   Branch C: calibration + freeze
     if args.load_quant_state:
         transformer, vae = load_models(
@@ -173,20 +172,13 @@ def main():
             torch.load(args.load_quant_state, map_location="cpu"), strict=False)
         print(f"[QUANT] quant state loaded <- {args.load_quant_state}")
         if missing:
-            print(f"[QUANT]   missing keys (from backbone, expected): {len(missing)}")
+            print(
+                f"[QUANT]   missing keys (from backbone, expected): {len(missing)}")
         if unexpected:
             print(f"[QUANT]   unexpected keys: {len(unexpected)}")
-        quant_meta = collect_quant_meta(transformer) if args.quant_scope != "none" else []
+        quant_meta = collect_quant_meta(
+            transformer) if args.quant_scope != "none" else []
 
-    elif args.load_model_path:
-        transformer, vae = load_models(
-            args.pretrained_model_name_or_path, args.vae_path, args.lora_dir,
-            args.rank, args.cache_dir, device, weight_dtype, skip_lora=True)
-        if args.lora_dir:
-            print(
-                "[torchao] --lora_dir ignored: LoRA is baked into exported quantized weights")
-        replaced_layers, quant_meta, _ = load_torchao_model(
-            transformer, args.load_model_path, device=device)
     else:
         transformer, vae = load_models(
             args.pretrained_model_name_or_path, args.vae_path, args.lora_dir,
@@ -227,16 +219,12 @@ def main():
                     for k, v in m.state_dict().items():
                         quant_state[f"{name}.{k}"] = v
             torch.save(quant_state, args.save_quant_state)
-            print(f"[QUANT] quant state saved ({len(quant_state)} keys) -> {args.save_quant_state}")
+            print(
+                f"[QUANT] quant state saved ({len(quant_state)} keys) -> {args.save_quant_state}")
 
         quant_meta = collect_quant_meta(
             transformer) if args.quant_scope != "none" else []
         save_path = args.save_model_path
-        if save_path == "__auto__":
-            save_path = os.path.join(args.output_dir, "torchao_model.pt")
-        if save_path:
-            export_torchao_model(transformer, save_path, replaced_layers, quant_meta,
-                                 model_args=vars(args))
 
     # Activation analysis
     analyzer = None

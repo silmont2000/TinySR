@@ -1,3 +1,4 @@
+# fmt:off
 '''
 # --------------------------------------------------------------------------------
 #    script modified from  (https://github.com/Microtreei/TSD-SR)
@@ -19,6 +20,7 @@ from diffusers import (
 )
 from models.tinysr.tinysd3 import TinySD3Transformer2DModel
 from models.vae.autoencoder_tiny  import  AutoencoderTiny
+from models.quant.tiler import tile_sample
 
 from utils.vaehook import _init_tiled_vae
 from utils.wavelet_color_fix import adain_color_fix, wavelet_color_fix
@@ -36,13 +38,13 @@ def parse_args():
 
     parser.add_argument("--rank", type=int, default=64, help='rank for transformer')
     parser.add_argument("--rank_vae", type=int, default=64, help='rank for vae')
-    
+
     parser.add_argument("--is_use_tile", type=bool, default=False, help='whether to use tiled vae')
     parser.add_argument("--vae_decoder_tiled_size", type=int, default=224, help='tiled size for tiled vae decoder') 
     parser.add_argument("--vae_encoder_tiled_size", type=int, default=1024, help='tiled size for tiled vae encoder') 
     parser.add_argument("--latent_tiled_size", type=int, default=64, help='tiled size for transformer latent')
     parser.add_argument("--latent_tiled_overlap", type=int, default=8, help='tiled overlap for transformer latent')
-    
+
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--upscale", type=int, default=4, help='upscale factor')
@@ -51,117 +53,7 @@ def parse_args():
     parser.add_argument("--align_method", type=str, choices=['wavelet', 'adain', 'nofix'], default='adain', help='color alignment method')
     return parser.parse_args()
 
-def _gaussian_weights(tile_width, tile_height, nbatches):
-    """Generates a gaussian mask of weights for tile contributions"""
-    from numpy import pi, exp, sqrt
-    import numpy as np
 
-    latent_width = tile_width
-    latent_height = tile_height
-
-    var = 0.01
-    midpoint = (latent_width - 1) / 2  # -1 because index goes from 0 to latent_width - 1
-    x_probs = [exp(-(x-midpoint)*(x-midpoint)/(latent_width*latent_width)/(2*var)) / sqrt(2*pi*var) for x in range(latent_width)]
-    midpoint = latent_height / 2
-    y_probs = [exp(-(y-midpoint)*(y-midpoint)/(latent_height*latent_height)/(2*var)) / sqrt(2*pi*var) for y in range(latent_height)]
-
-    weights = np.outer(y_probs, x_probs)
-    return torch.tile(torch.tensor(weights, device=args.device), (nbatches, transformer.config.in_channels, 1, 1))
-
-def tile_sample(lq_latent, lq, transformer, timesteps, pooled_prompt_embeds, weight_dtype, args):
-    with torch.no_grad():
-        _, _, h, w = lq_latent.size()
-        tile_size, tile_overlap = (args.latent_tiled_size, args.latent_tiled_overlap)
-        if h * w <= tile_size * tile_size:
-            print(type(transformer))
-            model_pred =  transformer(
-                                hidden_states=lq_latent,
-                                timestep=timesteps,
-                                pooled_projections=pooled_prompt_embeds,
-                                return_dict=False,
-                            )[0]
-        else:
-            print(f"[Tiled Latent]: the input size is {lq.shape[-2]}x{lq.shape[-1]}, need to tiled")
-            tile_weights = _gaussian_weights(tile_size, tile_size, 1)
-            tile_size = min(tile_size, min(h, w))
-            tile_weights = _gaussian_weights(tile_size, tile_size, 1)
-
-            grid_rows = 0
-            cur_x = 0
-            while cur_x < lq_latent.size(-1):
-                cur_x = max(grid_rows * tile_size-tile_overlap * grid_rows, 0)+tile_size
-                grid_rows += 1
-
-            grid_cols = 0
-            cur_y = 0
-            while cur_y < lq_latent.size(-2):
-                cur_y = max(grid_cols * tile_size-tile_overlap * grid_cols, 0)+tile_size
-                grid_cols += 1
-
-            input_list = []
-            noise_preds = []
-            for row in range(grid_rows):
-                noise_preds_row = []
-                for col in range(grid_cols):
-                    if col < grid_cols-1 or row < grid_rows-1:
-                        # Extract tile from input image
-                        ofs_x = max(row * tile_size-tile_overlap * row, 0)
-                        ofs_y = max(col * tile_size-tile_overlap * col, 0)
-                        # Input tile area on total image
-                    if row == grid_rows-1:
-                        ofs_x = w - tile_size
-                    if col == grid_cols-1:
-                        ofs_y = h - tile_size
-
-                    input_start_x = ofs_x
-                    input_end_x = ofs_x + tile_size
-                    input_start_y = ofs_y
-                    input_end_y = ofs_y + tile_size
-
-                    # Input tile dimensions
-                    input_tile = lq_latent[:, :, input_start_y:input_end_y, input_start_x:input_end_x]
-                    input_list.append(input_tile)
-
-                    if len(input_list) == 1 or col == grid_cols-1:
-                        input_list_t = torch.cat(input_list, dim=0).to(args.device, dtype=weight_dtype)
-                        model_out =  transformer(
-                            hidden_states=input_list_t,
-                            timestep=timesteps,
-                            pooled_projections=pooled_prompt_embeds,
-                            return_dict=False,
-                        )[0]
-                        input_list = []
-                        
-                    noise_preds.append(model_out)
-                    
-            # Stitch noise predictions for all tiles
-            noise_pred = torch.zeros(lq_latent.shape, device=args.device)
-            contributors = torch.zeros(lq_latent.shape, device=args.device)
-            # Add each tile contribution to overall latents
-            for row in range(grid_rows):
-                for col in range(grid_cols):
-                    if col < grid_cols-1 or row < grid_rows-1:
-                        # Extract tile from input image
-                        ofs_x = max(row * tile_size-tile_overlap * row, 0)
-                        ofs_y = max(col * tile_size-tile_overlap * col, 0)
-                        # Input tile area on total image
-                    if row == grid_rows-1:
-                        ofs_x = w - tile_size
-                    if col == grid_cols-1:
-                        ofs_y = h - tile_size
-
-                    input_start_x = ofs_x
-                    input_end_x = ofs_x + tile_size
-                    input_start_y = ofs_y
-                    input_end_y = ofs_y + tile_size
-
-                    noise_pred[:, :, input_start_y:input_end_y, input_start_x:input_end_x] += noise_preds[row*grid_cols + col] * tile_weights
-                    contributors[:, :, input_start_y:input_end_y, input_start_x:input_end_x] += tile_weights
-            # Average overlapping areas with more than 1 contributor
-            noise_pred /= contributors
-            model_pred = noise_pred
-            
-    return model_pred.to(args.device, dtype=weight_dtype)
 
 tensor_transforms = transforms.Compose([
                 transforms.ToTensor(),
@@ -173,40 +65,41 @@ def main(args, pixel_values, size):
         pixel_values = torch.nn.functional.interpolate(pixel_values, size=size, mode='bicubic', align_corners=False)
         pixel_values = pixel_values * 2 - 1
         pixel_values = pixel_values.to(args.device, dtype=weight_dtype)
-        
+
         # Encode the input image
         model_input = vae.encode(pixel_values).latents * vae.config.scaling_factor
         model_input = model_input.to(args.device, dtype=weight_dtype)
 
         # Predict
-        model_pred = tile_sample(model_input, pixel_values, transformer, timesteps, pooled_prompt_embeds, weight_dtype, args)
+        model_pred = tile_sample(model_input, transformer, timesteps, pooled_prompt_embeds, weight_dtype,
+                                 latent_tiled_size=args.latent_tiled_size, latent_tiled_overlap=args.latent_tiled_overlap)
 
         latent_stu = model_input - model_pred
-        
+
         # Decode the output
         image = vae.decode(latent_stu / vae.config.scaling_factor, return_dict=False)[0].squeeze(0).clamp(-1,1)
-        
+
         return image
-   
+
 if __name__ == "__main__":
     args = parse_args()
-    
+
     # Set huggingface cache directory
     os.environ['HF_HOME'] = args.cache_dir
     os.environ['HF_HUB_CACHE'] = args.cache_dir
-    
+
     weight_dtype = torch.float32
     if args.mixed_precision == "fp16":
         weight_dtype = torch.float16
-        
+
     # Load the pretrained models
     transformer = TinySD3Transformer2DModel.from_pretrained(args.pretrained_model_name_or_path,subfolder="transformer", 
                                             torch_dtype=weight_dtype, low_cpu_mem_usage=False, ignore_mismatched_sizes=True, cache_dir=args.cache_dir)
     vae = AutoencoderTiny.from_pretrained(args.vae_path, torch_dtype=weight_dtype, cache_dir=args.cache_dir)
-    
+
     if args.is_use_tile:
         _init_tiled_vae(vae, encoder_tile_size=args.vae_encoder_tiled_size, decoder_tile_size=args.vae_decoder_tiled_size)
-    
+
     if args.lora_dir:
         transformer_lora_config = LoraConfig(
             r=args.rank,
@@ -225,7 +118,7 @@ if __name__ == "__main__":
 
     param_cnt = sum(p.numel() for p in transformer.transformer_blocks.parameters() )
     print("#Param.", param_cnt/1e6, "M")
-    
+
     # Sample timestep for each image
     timesteps = torch.tensor([1000.], device=args.device, dtype=weight_dtype)
 
@@ -238,19 +131,19 @@ if __name__ == "__main__":
         image_names = sorted(glob.glob(f'{args.input_dir}/*.png'))
     else:
         image_names = [args.input_dir]
-    
+
     datalen = len(image_names)
     print("image_num", datalen)
     if os.path.exists(args.output_dir) is False:
         os.makedirs(args.output_dir)
-        
+
     total_time = 0.0
     for image_name in tqdm(image_names):
         lr = Image.open(image_name).convert('RGB')
         ori_width, ori_height = lr.size
         upscale = args.upscale
         process_size = args.process_size
-        
+
         # Resize the image if it is not valid
         resize_flag = False
         if ori_width < process_size // upscale or ori_height < process_size // upscale:
@@ -264,7 +157,7 @@ if __name__ == "__main__":
             resize_flag = True
             new_width = new_width - new_width % 8
             new_height = new_height - new_height % 8
-            
+
         lr_scale = lr.resize((int(ori_width*args.upscale), int(ori_height*args.upscale)))
         pixel_values = tensor_transforms(lr).unsqueeze(0).to(args.device, dtype=weight_dtype)
         start_time = time.time()
@@ -275,19 +168,19 @@ if __name__ == "__main__":
         total_time += (end_time - start_time)
         if resize_flag:
             image_pil_image = image_pil_image.resize((int(ori_width*args.upscale), int(ori_height*args.upscale)))
-        
+
         if args.align_method == 'adain':
             image_pil_image = adain_color_fix(target=image_pil_image, source=lr)
         elif args.align_method == 'wavelet':
             image_pil_image = wavelet_color_fix(target=image_pil_image, source=lr_scale)
         else:
             pass
-        
+
         image_pil_image.save(os.path.join(args.output_dir, os.path.basename(image_name)))
         torch.cuda.empty_cache()
     param_cnt = sum(p.numel() for p in transformer.transformer_blocks.parameters() )
     print("#Param.", param_cnt/1e6, "M")
     print(f"Average time: {total_time / datalen}")
-            
+
 
 
