@@ -367,12 +367,12 @@ class JointTransformerBlock(nn.Module):
     ):
         if self.initialized is False:
             norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp, scale_msa, shift_msa = self.norm1(hidden_states, emb=temb)
-            self.gate_msa = gate_msa
-            self.shift_mlp = shift_mlp
-            self.scale_mlp = scale_mlp
-            self.gate_mlp = gate_mlp
-            self.scale_msa = scale_msa
-            self.shift_msa = shift_msa
+            self.gate_msa = gate_msa.detach()
+            self.shift_mlp = shift_mlp.detach()
+            self.scale_mlp = scale_mlp.detach()
+            self.gate_mlp = gate_mlp.detach()
+            self.scale_msa = scale_msa.detach()
+            self.shift_msa = shift_msa.detach()
             self.initialized = True
             del self.norm1
             print("del self.norm1")

@@ -49,6 +49,8 @@ from models.vae.autoencoder_tiny import AutoencoderTiny
 from models.vae.autoencoder_kl import AutoencoderKL
 from models.tinysr.tinysd3 import TinySD3Transformer2DModel
 from models.tinysr.sd3 import SD3Transformer2DModel
+from models.tinysr.pyramid_config import PyramidArchConfig, PStateSpec
+from models.tinysr.pyramid_model import TinyPyramidSD3Transformer2DModel
 from utils.util import load_lora_state_dict_warn
 if is_wandb_available():
     import wandb
@@ -118,6 +120,33 @@ def parse_args(input_args=None):
         default=None,
         required=True,
         help="Path to DINOv2 pretrained model.",
+    )
+    parser.add_argument(
+        "--use_pyramid",
+        action="store_true",
+        default=False,
+        help="Use TinyPyramidSD3Transformer2DModel instead of flat TinySD3Transformer2DModel.",
+    )
+    parser.add_argument(
+        "--pyramid_num_blocks",
+        type=int,
+        nargs="+",
+        default=[4, 4, 4],
+        help="Number of blocks per pyramid state.",
+    )
+    parser.add_argument(
+        "--pyramid_dims",
+        type=int,
+        nargs="+",
+        default=[768, 1152, 1536],
+        help="Hidden dimension per pyramid state.",
+    )
+    parser.add_argument(
+        "--pyramid_grid_hw",
+        type=int,
+        nargs="+",
+        default=[8, 16, 32],
+        help="Token grid HW per pyramid state.",
     )
     parser.add_argument(
         "--revision",
@@ -344,7 +373,7 @@ def main(args):
     logging_dir = Path(args.output_dir, args.logging_dir)
 
     accelerator_project_config = ProjectConfiguration(project_dir=args.output_dir, logging_dir=logging_dir)
-    kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+    kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         mixed_precision=args.mixed_precision,
@@ -384,12 +413,6 @@ def main(args):
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
 
-    # Load scheduler and models
-    transformer = TinySD3Transformer2DModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
-    )
-    transformer.requires_grad_(False)
-    
     # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora transformer) to half-precision
     # as these weights are only used for inference, keeping weights in full precision is not required.
     weight_dtype = torch.float16
@@ -398,6 +421,27 @@ def main(args):
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
+    # Load scheduler and models
+    if args.use_pyramid:
+        pc = PyramidArchConfig(
+            p_states=tuple(
+                PStateSpec(n, d, g)
+                for n, d, g in zip(args.pyramid_num_blocks, args.pyramid_dims, args.pyramid_grid_hw)
+            )
+        )
+        transformer = TinyPyramidSD3Transformer2DModel.from_flat_pretrained(
+            args.pretrained_model_name_or_path, pyramid_config=pc,
+            subfolder="transformer", revision=args.revision, variant=args.variant,
+            torch_dtype=weight_dtype,
+        )
+    else:
+        transformer = TinySD3Transformer2DModel.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
+        )
+    transformer.requires_grad_(False)
+    
+    # For mixed precision training we cast all non-trainable weights (vae, non-lora text_encoder and non-lora transformer) to half-precision
+    # as these weights are only used for inference, keeping weights in full precision is not required.
     transformer_lora_config = LoraConfig(
         r=64,
         lora_alpha=64,
@@ -507,7 +551,7 @@ def main(args):
         log_name = args.log_name
         time = datetime.datetime.now().strftime('%m-%d_%H:%M')
         accelerator.init_trackers(tracker_name, config=vars(args), 
-                                  init_kwargs={"wandb": {"name": f"{log_name}_lr{args.learning_rate}_{time}","mode": 'dryrun'}}
+                                  init_kwargs={"wandb": {"name": f"{log_name}_lr{args.learning_rate}_{time}","mode": 'online'}}
                                   )
         if args.log_code:
             wandb.run.log_code(".", log_name,

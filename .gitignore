@@ -218,3 +218,5 @@ outputs/*
 dataset/*
 data/*
 train/quant_w4a4.py
+wandb/*
+docs/*

@@ -3,15 +3,12 @@ import sys
 sys.path.append(os.getcwd())
 import torch
 from torch.utils.data import Dataset
-from PIL import Image
-from torchvision import transforms
 
-FLICKR2K_PATH = "flicker data path"  
-DIV2K_PATH = "div2k path"     
-LSDIR20K_PATH = "lsdir path"     
-FFHQ10K_PATH = "ffhq path"        
+DIV2K_PATH = "/data/disk1/dlw/datasets/CAD_V100_20260209_backup/datasets/DIV2K/DIV2K_train_LRx4_Real-ESRGAN_Seesr_v2"
+FLICKR2K_PATH = "/data/disk1/dlw/datasets/CAD_V100_20260209_backup/datasets/Flickr2K/Flickr2K_LRx4_Real-ESRGAN_Seesr_v2"
+FFHQ10K_PATH = "/data/disk1/dlw/datasets/CAD_V100_20260209_backup/datasets/FFHQ/FFHQ10K_LRx4_Real-ESRGAN_Seesr_v2"
 
-data_path = [LSDIR20K_PATH, DIV2K_PATH, FFHQ10K_PATH, FLICKR2K_PATH]
+data_path = [DIV2K_PATH, FLICKR2K_PATH, FFHQ10K_PATH]
 lr_dir_name = "sr_bicubic"
 hr_dir_name = "gt"
 prompt_dir_name = "gt_DAPE"
@@ -36,7 +33,7 @@ class Real_ESRGAN_Dataset(Dataset):
         self.prompt_dir_name = prompt_dir_name
         self.prompt_embeds_dir_name = prompt_embeds_dir_name
         self.pool_prompt_embeds_dir_name = pool_prompt_embeds_dir_name
-        self.trans = transforms.ToTensor()
+        # self.trans = transforms.ToTensor()
         
         self.lr_img_name = []
         self.hr_img_name = []
@@ -70,18 +67,18 @@ class Real_ESRGAN_Dataset(Dataset):
         self.img_nums = len(self.lr_img_name)
     
     def __getitem__(self, idx):
-        img_names = self.lr_img_name[idx]
-        lr_img = self.trans(Image.open(self.lr_img_name[idx]).convert("RGB")).squeeze() * 2 - 1 
-        hr_img = self.trans(Image.open(self.hr_img_name[idx]).convert("RGB")).squeeze() * 2 - 1 
+        # img_names = self.lr_img_name[idx]
+        # lr_img = self.trans(Image.open(self.lr_img_name[idx]).convert("RGB")).squeeze() * 2 - 1 
+        # hr_img = self.trans(Image.open(self.hr_img_name[idx]).convert("RGB")).squeeze() * 2 - 1 
         # latent_hr = torch.load(self.hr_latent_name[idx], map_location=self.device).squeeze() 
         latent_stu = torch.load(self.hr_latent_name[idx].replace("latent_hr", "latent_stu"), map_location=self.device).squeeze() 
         vae_stu = torch.load(self.hr_latent_name[idx].replace("latent_hr", "vae_stu"), map_location=self.device).squeeze()
         pooled_prompt_embeds = torch.load(self.pool_prompt_embeds_name[idx], map_location=self.device).squeeze()
             
         return {
-            "img_name": img_names,
-            "lr_img": lr_img,
-            "hr_img": hr_img,
+            # "img_name": img_names,
+            # "lr_img": lr_img,
+            # "hr_img": hr_img,
             # "latent_hr": latent_hr,
             # "prompt_embeds_input": prompt_embeds,
             "latent_stu": latent_stu,

@@ -352,8 +352,8 @@ class TinySD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromO
         
         if self.initialized is False:
             hidden_states, scale, shift  = self.norm_out(hidden_states, self.temb)
-            self.scale = scale
-            self.shift = shift
+            self.scale = scale.detach()
+            self.shift = shift.detach()
             self.initialized = True
             del self.norm_out
             del self.temb
