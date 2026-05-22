@@ -1,44 +1,36 @@
 """
-int4→fp16 dequant CUDA extension for TinySR QuantLinearW4A4.
+int4→fp16 dequant + smooth_scale CUDA extension.
 
 Usage:
-    from models.quant.int4_cuda import get_dequant_op
-    w_fp16 = get_dequant_op()(packed_weights, per_channel_scale)
+    from models.quant.int4_cuda import get_fused_prepare
+    x_prep, w_deq = get_fused_prepare()(x, packed_w, w_scale, inv_smooth)
 """
 
 import os
 import torch
 from torch.utils.cpp_extension import load_inline
 
-
 _source_dir = os.path.dirname(os.path.abspath(__file__))
-_cuda_source_path = os.path.join(_source_dir, "csrc", "int4_linear_kernel.cu")
-_cpp_source_path = os.path.join(_source_dir, "csrc", "int4_linear.cpp")
+_cuda_path = os.path.join(_source_dir, "csrc", "int4_linear_kernel.cu")
+_cpp_path  = os.path.join(_source_dir, "csrc", "int4_linear.cpp")
 
-_int4_linear_module = None
+_mod = None
 
-
-def _build_extension():
-    global _int4_linear_module
-    if _int4_linear_module is not None:
-        return _int4_linear_module
-
-    with open(_cuda_source_path, "r") as f:
-        cuda_source = f.read()
-    with open(_cpp_source_path, "r") as f:
-        cpp_source = f.read()
-
-    _int4_linear_module = load_inline(
+def _build():
+    global _mod
+    if _mod is not None:
+        return _mod
+    with open(_cuda_path) as f: cu = f.read()
+    with open(_cpp_path)  as f: cp = f.read()
+    _mod = load_inline(
         name="int4_dequant_cuda",
-        cpp_sources=[cpp_source],
-        cuda_sources=[cuda_source],
+        cpp_sources=[cp], cuda_sources=[cu],
         extra_cuda_cflags=["-O3", "-arch=sm_80", "--use_fast_math"],
-        extra_cflags=["-O3"],
-        verbose=False,
-    )
-    return _int4_linear_module
+        extra_cflags=["-O3"], verbose=False)
+    return _mod
 
+def get_fused_prepare():
+    return _build().fused_prepare
 
 def get_dequant_op():
-    """返回编译好的 int4→fp16 dequant 算子"""
-    return _build_extension().dequant
+    return _build().dequant

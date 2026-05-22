@@ -26,7 +26,12 @@ from models.tinysr.tinysd3 import TinySD3Transformer2DModel
 
 
 def get_weight_dtype(mixed_precision):
-    return torch.float16 if mixed_precision == "fp16" else torch.float32
+    if mixed_precision == "fp16":
+        return torch.float16
+    elif mixed_precision == "bf16":
+        return torch.bfloat16
+    else:
+        return torch.float32
 
 
 def get_image_names(input_dir):

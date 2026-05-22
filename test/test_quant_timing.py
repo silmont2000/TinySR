@@ -232,6 +232,7 @@ if __name__ == "__main__":
         else:
             print("[bench]   int4 CUDA skipped (no layers packed)")
 
+
     # Release FP16 residuals from CUDA cache so they don't inflate peak mem
     torch.cuda.empty_cache()
     torch.cuda.synchronize()
@@ -271,6 +272,16 @@ if __name__ == "__main__":
         args.output_dir = f"outputs/timing_w{args.w_bits}a{args.a_bits}_r{args.svdq_rank}_{args.quant_scope}_{ts}"
     os.makedirs(args.output_dir, exist_ok=True)
     print(f"[bench] output -> {args.output_dir}")
+    from torchao.quantization import Int4WeightOnlyConfig, quantize_
+    # config = Int4WeightOnlyConfig(
+    #     group_size=32,
+    #     # int4_packing_format="tile_packed_to_4d",
+    #     # int4_choose_qparams_algorithm="hqq",
+    # )
+    # transformer = transformer.eval().to(torch.bfloat16).to("cuda")
+    # transformer = torch.compile(transformer, mode="max-autotune")
+    # quantize_(transformer, config)
+
     # ---- Warmup ----
     if n_warmup > 0:
         print("[bench] warming up ...")
