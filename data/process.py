@@ -22,10 +22,10 @@ from tqdm import tqdm
 import pdb
 import re
 from torchvision import transforms
-FLICKR2K_PATH = "flicker data path"  
-DIV2K_PATH = "div2k path"     
+FLICKR2K_PATH = "/data/disk1/dlw/datasets/CAD_V100_20260209_backup/datasets/Flickr2K/Flickr2K_LRx4_Real-ESRGAN_Seesr_v2"
+DIV2K_PATH = "/data/disk1/dlw/datasets/CAD_V100_20260209_backup/datasets/DIV2K/DIV2K_train_LRx4_Real-ESRGAN_Seesr_v2"
 LSDIR20K_PATH = "lsdir path"     
-FFHQ10K_PATH = "ffhq path"         
+FFHQ10K_PATH = "/data/disk1/dlw/datasets/CAD_V100_20260209_backup/datasets/FFHQ/FFHQ10K_LRx4_Real-ESRGAN_Seesr_v2"       
 
 def merge_data(data_path, hr_name="gt", lr_name="sr_bicubic"):
     hr_data_file_path = []
@@ -276,11 +276,11 @@ def vae_encode(lr_img_paths, hr_img_paths,lr_latent_path="latent_lr",hr_latent_p
             
             print("{} Done !".format(lr_save_path.split("/")[-1]))
 
-def vae_encode_down(lr_img_paths, hr_img_paths,sd3_model_path, weight_dtype=torch.float32):
+def vae_encode_down(lr_img_paths, hr_img_paths, sd3_model_path="checkpoint/tinybackbone/prune-12-merge-tinysr", weight_dtype=torch.float32, target_dir="256_path", scale=0.5):
     vae = AutoencoderKL.from_pretrained(sd3_model_path, subfolder="vae").to("cuda", weight_dtype)
     with torch.no_grad():
         for lr_img_file,hr_img_file in tqdm(zip(lr_img_paths, hr_img_paths), total=len(lr_img_paths)):
-            save_path = lr_img_file.replace(".png",".pt").replace("sr_bicubic", "256_path")
+            save_path = lr_img_file.replace(".png",".pt").replace("sr_bicubic", target_dir)
             print(save_path)
             lr_img = Image.open(lr_img_file).convert("RGB")
             hr_img = Image.open(hr_img_file).convert("RGB")
@@ -289,8 +289,8 @@ def vae_encode_down(lr_img_paths, hr_img_paths,sd3_model_path, weight_dtype=torc
             lq = trans(lr_img).unsqueeze(0).to("cuda",dtype=weight_dtype) * 2 - 1
             hq = trans(hr_img).unsqueeze(0).to("cuda",dtype=weight_dtype) * 2 - 1
             
-            lq = torch.nn.functional.interpolate(lq, scale_factor=0.5, mode="bicubic", align_corners=False)
-            hq = torch.nn.functional.interpolate(hq, scale_factor=0.5, mode="bicubic", align_corners=False)
+            lq = torch.nn.functional.interpolate(lq, scale_factor=scale, mode="bicubic", align_corners=False)
+            hq = torch.nn.functional.interpolate(hq, scale_factor=scale, mode="bicubic", align_corners=False)
             
             lq_latent = vae.encode(lq).latent_dist.sample() * vae.config.scaling_factor
             hq_latent = vae.encode(hq).latent_dist.sample() * vae.config.scaling_factor
@@ -314,19 +314,22 @@ def run_vae_encode():
     
     vae_encode(lr_data_file, hr_data_file)
 
-def run_vae_encode_down():
-    data_dir = [FLICKR2K_PATH, DIV2K_PATH, LSDIR20K_PATH, FFHQ10K_PATH ]
+def run_vae_encode_down(variant="256"):
+    data_dir = [FLICKR2K_PATH, DIV2K_PATH, FFHQ10K_PATH ]
     
     hr_data_file, lr_data_file = merge_data(data_dir)
+    dir_name = f"{variant}_path"
+    scale = 0.25 if variant == "128" else 0.5
     for data_file in data_dir:
-        if not os.path.exists(os.path.join(data_file, "256_path")):
-            os.makedirs(os.path.join(data_file, "256_path"))
+        if not os.path.exists(os.path.join(data_file, dir_name)):
+            os.makedirs(os.path.join(data_file, dir_name))
 
-    
-    vae_encode_down(lr_data_file, hr_data_file)
+
+    vae_encode_down(lr_data_file, hr_data_file, target_dir=dir_name, scale=scale)
 
 if __name__ == '__main__':
-    run_vae_encode_down()
+    target = sys.argv[1] if len(sys.argv) > 1 else "256"
+    run_vae_encode_down(variant=target)
     # run_encode_prompt()
     # run_encode_val_prompt()
     print("Done !")

@@ -16,7 +16,7 @@ from diffusers.utils import USE_PEFT_BACKEND, logging, scale_lora_layers, unscal
 from models.tinysr.tinysd3 import PatchEmbed, AdaLayerNormContinuous
 from models.tinysr.tinysd3block import JointTransformerBlock
 from models.tinysr.pyramid_config import PyramidArchConfig, PStateSpec
-from models.tinysr.pyramid_blocks import DownProj, BilinearUpsample, DimProj, Bridge
+from models.tinysr.pyramid_blocks import DownProj, BilinearUpsample, DimProj, Bridge, ConvUpsample
 
 logger = logging.get_logger(__name__)
 
@@ -58,18 +58,23 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
             embed_dim=self.final_dim,
             pos_embed_max_size=pos_embed_max_size,
         )
+        target_tokens = pc.patch_embed_grid ** 2
+        if self.pos_embed.pos_embed.shape[1] != target_tokens:
+            self.pos_embed.pos_embed = self.pos_embed.pos_embed[:, :target_tokens, :].clone().contiguous()
 
         self.time_text_embed = CombinedTimestepTextProjEmbeddings(
             embedding_dim=self.final_dim, pooled_projection_dim=pooled_projection_dim
         )
 
-        self.down_proj = DownProj(
-            in_dim=self.final_dim,
-            out_dim=pc.p_states[0].dim,
-            pool_factor=pc.initial_pool_factor,
-        )
-
-        first_embed_dim = pc.p_states[0].dim
+        if pc.need_down_proj or pc.need_dim_proj:
+            pool_factor = pc.patch_embed_grid // pc.p_states[0].grid_hw if pc.need_down_proj else 1
+            self.down_proj = DownProj(
+                in_dim=self.final_dim,
+                out_dim=pc.p_states[0].dim,
+                pool_factor=pool_factor,
+            )
+        else:
+            self.down_proj = None
 
         self.p_states = nn.ModuleList()
         for i, spec in enumerate(pc.p_states):
@@ -90,7 +95,10 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
                 upsample = None
                 dim_proj = None
                 if spec.grid_hw != next_spec.grid_hw:
-                    upsample = BilinearUpsample(dim=spec.dim)
+                    if pc.upsample_mode == "conv":
+                        upsample = ConvUpsample(dim=spec.dim)
+                    else:
+                        upsample = BilinearUpsample(dim=spec.dim)
                 if spec.dim != next_spec.dim:
                     dim_proj = DimProj(spec.dim, next_spec.dim)
                 bridge = Bridge(upsample=upsample, dim_proj=dim_proj)
@@ -103,9 +111,20 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
         self.register_buffer("shift", torch.tensor([]))
 
         self.proj_out = nn.Linear(self.final_dim, pc.patch_size * pc.patch_size * self.out_channels, bias=True)
+        self.proj_out_stages = nn.ModuleList([
+            nn.Linear(self.final_dim, pc.patch_size * pc.patch_size * self.out_channels, bias=True)
+            for _ in pc.p_states
+        ])
 
         self.gradient_checkpointing = False
         self.initialized = False
+
+    def _unpatchify(self, h, grid_hw):
+        patch_size = self.pyramid_config.patch_size
+        B = h.shape[0]
+        h = h.reshape(B, grid_hw, grid_hw, patch_size, patch_size, self.out_channels)
+        h = torch.einsum("nhwpqc->nchpwq", h)
+        return h.reshape(B, self.out_channels, grid_hw * patch_size, grid_hw * patch_size)
 
     def enable_forward_chunking(self, chunk_size=None, dim=0):
         if dim not in [0, 1]:
@@ -206,19 +225,32 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
             del self.time_text_embed
             self.temb = full_temb
 
-        h = self.down_proj(h, self.pyramid_config.patch_embed_grid)
+        if self.down_proj is not None:
+            h = self.down_proj(h, self.pyramid_config.patch_embed_grid)
 
+        stage_noises = []
+        stage_inputs = []
         for i, p_state in enumerate(self.p_states):
             spec = self.pyramid_config.p_states[i]
 
             if not self.initialized:
                 temb_i = self.temb[:, :spec.dim]
 
+            if i == 0:
+                stage_inputs.append(None)
+            else:
+                input_latent = self.proj_out_stages[i](h)
+                stage_inputs.append(self._unpatchify(input_latent, spec.grid_hw))
+
             for block in p_state.blocks:
                 if not self.initialized:
                     h = block(hidden_states=h, temb=temb_i)
                 else:
                     h = block.forward_(hidden_states=h)
+
+            stage_noise = self.proj_out_stages[i](h)
+            stage_noise = self._unpatchify(stage_noise, spec.grid_hw)
+            stage_noises.append(stage_noise)
 
             if p_state.bridge is not None:
                 h = p_state.bridge(h, spec.grid_hw)
@@ -234,21 +266,14 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
             h = self.norm(h) * (1 + self.scale[:, None]) + self.shift[:, None]
 
         h = self.proj_out(h)
-
-        patch_size = self.pyramid_config.patch_size
-        height = height // patch_size
-        width = width // patch_size
-
-        h = h.reshape(h.shape[0], height, width, patch_size, patch_size, self.out_channels)
-        h = torch.einsum("nhwpqc->nchpwq", h)
-        output = h.reshape(h.shape[0], self.out_channels, height * patch_size, width * patch_size)
+        output = self._unpatchify(h, self.pyramid_config.p_states[-1].grid_hw)
 
         if USE_PEFT_BACKEND:
             unscale_lora_layers(self, lora_scale)
 
         if not return_dict:
-            return (output,)
-        return Transformer2DModelOutput(sample=output)
+            return (output, stage_noises, stage_inputs)
+        return Transformer2DModelOutput(sample=output), stage_noises, stage_inputs
 
     # ------------------------------------------------------------------
     #   Weight loading from flat (pruned) 12-block checkpoint
@@ -298,6 +323,8 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
         instance.time_text_embed.load_state_dict(flat.time_text_embed.state_dict())
         instance.norm_out.load_state_dict(flat.norm_out.state_dict())
         instance.proj_out.load_state_dict(flat.proj_out.state_dict())
+        for stage_proj in instance.proj_out_stages:
+            stage_proj.load_state_dict(flat.proj_out.state_dict())
 
         return instance
 

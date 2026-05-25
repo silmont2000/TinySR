@@ -138,7 +138,7 @@ def parse_args(input_args=None):
         "--pyramid_dims",
         type=int,
         nargs="+",
-        default=[768, 1152, 1536],
+        default=[1536, 1536, 1536],
         help="Hidden dimension per pyramid state.",
     )
     parser.add_argument(
@@ -147,6 +147,12 @@ def parse_args(input_args=None):
         nargs="+",
         default=[8, 16, 32],
         help="Token grid HW per pyramid state.",
+    )
+    parser.add_argument(
+        "--pyramid_sample_size",
+        type=int,
+        default=64,
+        help="VAE latent spatial size (64 for 512px input, 16 for 128px input).",
     )
     parser.add_argument(
         "--revision",
@@ -172,6 +178,12 @@ def parse_args(input_args=None):
         type=str,
         default="default-log",
         help="log_name",
+    )
+    parser.add_argument(
+        "--wandb_id",
+        type=str,
+        default=None,
+        help="wandb run id to resume (e.g. 9at5m8zu).",
     )
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument("--log_code",action="store_true",help="log code",)
@@ -361,6 +373,10 @@ def collate_fn(examples, weight_dtype=torch.float16):
         "latent_stu": latent_stu.to(dtype=weight_dtype, device="cuda"),
         "vae_stu": vae_stu.to(dtype=weight_dtype, device="cuda"),
              }
+    if "target_8" in examples[0]:
+        batch["target_8"] = torch.stack([e["target_8"] for e in examples]).to(dtype=weight_dtype, device="cuda")
+        batch["target_16"] = torch.stack([e["target_16"] for e in examples]).to(dtype=weight_dtype, device="cuda")
+        batch["target_32"] = torch.stack([e["target_32"] for e in examples]).to(dtype=weight_dtype, device="cuda")
     return batch
 
 def main(args):
@@ -427,7 +443,8 @@ def main(args):
             p_states=tuple(
                 PStateSpec(n, d, g)
                 for n, d, g in zip(args.pyramid_num_blocks, args.pyramid_dims, args.pyramid_grid_hw)
-            )
+            ),
+            sample_size=args.pyramid_sample_size,
         )
         transformer = TinyPyramidSD3Transformer2DModel.from_flat_pretrained(
             args.pretrained_model_name_or_path, pyramid_config=pc,
@@ -447,6 +464,11 @@ def main(args):
         lora_alpha=64,
         init_lora_weights="gaussian",
         target_modules=["to_k", "to_q", "to_v", "to_out.0","proj","linear", "linear_1", "linear_2", "net.2"],
+        rank_pattern={
+            "p_states.0": 16,
+            "p_states.1": 64,
+            "p_states.2": 256,
+        },
     )
     transformer.add_adapter(transformer_lora_config, adapter_name="default")
     transformer.enable_adapters()
@@ -509,7 +531,7 @@ def main(args):
     )
 
     # Dataset and DataLoaders creation:
-    train_dataset = Real_ESRGAN_Dataset(device=accelerator.device)
+    train_dataset = Real_ESRGAN_Dataset(device=accelerator.device, multi_stage=args.use_pyramid)
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
@@ -550,9 +572,23 @@ def main(args):
         tracker_name = "tinysr"
         log_name = args.log_name
         time = datetime.datetime.now().strftime('%m-%d_%H:%M')
-        accelerator.init_trackers(tracker_name, config=vars(args), 
-                                  init_kwargs={"wandb": {"name": f"{log_name}_lr{args.learning_rate}_{time}","mode": 'online'}}
-                                  )
+        wandb_kwargs = {"name": f"{log_name}_lr{args.learning_rate}_{time}", "mode": "online"}
+        if args.wandb_id:
+            wandb_kwargs["id"] = args.wandb_id
+            wandb_kwargs["resume"] = "allow"
+        wandb_config = vars(args).copy()
+        if args.use_pyramid:
+            wandb_config["pyramid_config"] = {
+                "num_blocks": args.pyramid_num_blocks,
+                "dims": args.pyramid_dims,
+                "grid_hw": args.pyramid_grid_hw,
+                "sample_size": args.pyramid_sample_size,
+            }
+            wandb_config["lora_rank_pattern"] = {
+                "p_states.0": 16, "p_states.1": 64, "p_states.2": 256,
+            }
+        accelerator.init_trackers(tracker_name, config=wandb_config,
+                                  init_kwargs={"wandb": wandb_kwargs})
         if args.log_code:
             wandb.run.log_code(".", log_name,
                            include_fn=lambda path: path.endswith(".py") or path.endswith(".sh"),
@@ -630,17 +666,30 @@ def main(args):
                     model_input = batch["vae_stu"]
                     timesteps = torch.tensor([1000.], device=accelerator.device)
                     
-                    # Sample noise that we'll add to the latents
-                    model_pred = transformer(
-                        hidden_states=model_input,
-                        timestep=timesteps,
-                        pooled_projections=pooled_prompt_embeds_default,
-                        return_dict=False,
-                    )[0]
-                    latent_stu =  model_input - model_pred 
-                    
-                    l1_loss =  F.l1_loss(latent_stu.float(), latent_teacher.detach().float(), reduction='mean')
-                    loss_g = 1 * l1_loss
+                    if args.use_pyramid:
+                        output, stage_noises, stage_inputs = transformer(
+                            hidden_states=model_input,
+                            timestep=timesteps,
+                            pooled_projections=pooled_prompt_embeds_default,
+                            return_dict=False,
+                        )
+                        mi_f = model_input.to(output.dtype)
+                        loss0 = F.l1_loss((mi_f - stage_noises[0]).float(),
+                                          batch["target_8"].float().detach(), reduction='mean')
+                        loss1 = F.l1_loss((stage_inputs[1] - stage_noises[1]).float(),
+                                          batch["target_16"].float().detach(), reduction='mean')
+                        loss2 = F.l1_loss((stage_inputs[2] - out).float(),
+                                          batch["target_32"].float().detach(), reduction='mean')
+                        loss_g = 0.1 * loss0 + 0.3 * loss1 + 1.0 * loss2
+                    else:
+                        model_pred = transformer(
+                            hidden_states=model_input,
+                            timestep=timesteps,
+                            pooled_projections=pooled_prompt_embeds_default,
+                            return_dict=False,
+                        )[0]
+                        latent_stu =  model_input - model_pred 
+                        loss_g = 1 * F.l1_loss(latent_stu.float(), latent_teacher.detach().float(), reduction='mean')
                     
                 # backward
                 accelerator.backward(loss_g)

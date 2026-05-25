@@ -10,21 +10,22 @@ nohup accelerate launch --config_file config/config.yaml \
   train/train_stage1.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --teacher_model_name_or_path="dummy" \
-  --train_batch_size=4 \
-  --num_train_epochs=200 \
+  --train_batch_size=16 \
+  --num_train_epochs=400 \
   --checkpointing_steps=5000 \
   --learning_rate=1e-04 \
   --lr_scheduler="cosine_with_restarts" \
   --lr_warmup_steps=3000 \
   --seed=80 \
   --output_dir=$OUTPUT_DIR \
-  --max_train_steps=150000 \
+  --max_train_steps=1500000 \
   --gradient_accumulation_steps=1 \
   --report_to="wandb" \
   --resume_from_checkpoint="latest" \
   --log_name=$LOG_NAME \
   --use_pyramid \
   --pyramid_num_blocks 4 4 4 \
-  --pyramid_dims 768 1152 1536 \
+  --pyramid_dims 1536 1536 1536 \
   --pyramid_grid_hw 8 16 32 \
+  --pyramid_sample_size 64 \
   > $OUTPUT_LOG 2>&1 &

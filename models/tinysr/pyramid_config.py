@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Tuple
 
 
@@ -12,17 +12,17 @@ class PStateSpec:
 @dataclass
 class PyramidArchConfig:
     p_states: Tuple[PStateSpec, ...] = (
-        PStateSpec(num_blocks=4, dim=768,  grid_hw=8),
-        PStateSpec(num_blocks=4, dim=1152, grid_hw=16),
+        PStateSpec(num_blocks=4, dim=768,  grid_hw=32),
+        PStateSpec(num_blocks=4, dim=1152, grid_hw=32),
         PStateSpec(num_blocks=4, dim=1536, grid_hw=32),
     )
     patch_size: int = 2
     in_channels: int = 16
     sample_size: int = 64
-    initial_pool_factor: int = 4
     out_channels: int = 16
     pooled_projection_dim: int = 2048
     pos_embed_max_size: int = 96
+    upsample_mode: str = "bilinear"  # "bilinear" | "conv"
 
     @property
     def num_total_blocks(self) -> int:
@@ -34,7 +34,15 @@ class PyramidArchConfig:
 
     @property
     def patch_embed_dim(self) -> int:
-        return self.p_states[0].dim * (self.initial_pool_factor // 2) or 1536
+        return self.p_states[-1].dim
+
+    @property
+    def need_down_proj(self) -> bool:
+        return self.patch_embed_grid != self.p_states[0].grid_hw
+
+    @property
+    def need_dim_proj(self) -> bool:
+        return self.patch_embed_dim != self.p_states[0].dim
 
     def get_block_dim(self, global_idx: int) -> int:
         offset = 0
@@ -53,10 +61,10 @@ class PyramidArchConfig:
             "patch_size": self.patch_size,
             "in_channels": self.in_channels,
             "sample_size": self.sample_size,
-            "initial_pool_factor": self.initial_pool_factor,
             "out_channels": self.out_channels,
             "pooled_projection_dim": self.pooled_projection_dim,
             "pos_embed_max_size": self.pos_embed_max_size,
+            "upsample_mode": self.upsample_mode,
         }
 
     @classmethod
@@ -66,8 +74,8 @@ class PyramidArchConfig:
             patch_size=d.get("patch_size", 2),
             in_channels=d.get("in_channels", 16),
             sample_size=d.get("sample_size", 64),
-            initial_pool_factor=d.get("initial_pool_factor", 4),
             out_channels=d.get("out_channels", 16),
             pooled_projection_dim=d.get("pooled_projection_dim", 2048),
             pos_embed_max_size=d.get("pos_embed_max_size", 96),
+            upsample_mode=d.get("upsample_mode", "bilinear"),
         )

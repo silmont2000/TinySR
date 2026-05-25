@@ -1,6 +1,7 @@
-import sys, os, argparse
+import sys, os, argparse, json
 sys.path.append(".")
 import torch
+import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
 
@@ -46,13 +47,22 @@ def main():
 
     # Load pyramid model
     print("Loading pyramid model...")
-    pc = PyramidArchConfig(
-        p_states=(
-            PStateSpec(num_blocks=4, dim=768, grid_hw=8),
-            PStateSpec(num_blocks=4, dim=1152, grid_hw=16),
-            PStateSpec(num_blocks=4, dim=1536, grid_hw=32),
+    cfg_path = os.path.join(args.lora_dir, "pyramid_config.json")
+    if os.path.exists(cfg_path):
+        with open(cfg_path) as f:
+            cfg_dict = json.load(f)
+        pc = PyramidArchConfig.from_dict(cfg_dict)
+        print(f"  Loaded config from {cfg_path}: sample_size={pc.sample_size}, {[(s.num_blocks,s.dim,s.grid_hw) for s in pc.p_states]}")
+    else:
+        pc = PyramidArchConfig(
+            p_states=(
+                PStateSpec(num_blocks=4, dim=1536, grid_hw=8),
+                PStateSpec(num_blocks=4, dim=1536, grid_hw=16),
+                PStateSpec(num_blocks=4, dim=1536, grid_hw=32),
+            )
         )
-    )
+        print(f"  Using default config (sample_size={pc.sample_size})")
+
     model = TinyPyramidSD3Transformer2DModel.from_flat_pretrained(
         "checkpoint/tinybackbone/prune-12-merge-tinysr",
         pyramid_config=pc,
@@ -68,6 +78,11 @@ def main():
         lora_cfg = LoraConfig(
             r=64, lora_alpha=64, init_lora_weights="gaussian",
             target_modules=["to_k","to_q","to_v","to_out.0","proj","linear","linear_1","linear_2","net.2"],
+            rank_pattern={
+                "p_states.0": 16,
+                "p_states.1": 64,
+                "p_states.2": 256,
+            },
         )
         model.add_adapter(lora_cfg, adapter_name="default")
         model.enable_adapters()
@@ -92,8 +107,9 @@ def main():
     print(f"Loading image: {args.input_image}")
     img = Image.open(args.input_image).convert("RGB")
     w, h = img.size
-    # Resize to 512×512 for model input (keep aspect ratio for saving)
-    img_resized = img.resize((512, 512), Image.BICUBIC)
+
+    process_size = pc.sample_size * 8  # VAE reduces 8×, so image size = sample_size * 8
+    img_resized = img.resize((process_size, process_size), Image.BICUBIC)
 
     img_tensor = transforms.ToTensor()(img_resized).unsqueeze(0).to(device, dtype=dtype)
     img_tensor = img_tensor * 2 - 1  # normalize to [-1, 1]
@@ -107,21 +123,21 @@ def main():
     pooled = torch.load("dataset/default/pool_embeds.pt", map_location=device).to(dtype)
 
     with torch.no_grad():
-        pred = model(
+        output, stage_noises, stage_inputs = model(
             hidden_states=latent,
             timestep=timestep,
             pooled_projections=pooled,
             return_dict=False,
-        )[0]
-        refined = latent - pred
+        )
+        refined = stage_inputs[2] - output
 
         # VAE decode
-        output = vae.decode(refined / vae.config.scaling_factor, return_dict=False)[0]
-        output = output.clamp(-1, 1).squeeze(0)
+        output_img = vae.decode(refined / vae.config.scaling_factor, return_dict=False)[0]
+        output_img = output_img.clamp(-1, 1).squeeze(0)
 
     # Convert to PIL
-    output = (output * 0.5 + 0.5).clamp(0, 1)  # [-1,1] → [0,1]
-    output_img = transforms.ToPILImage()(output.float().cpu())
+    output_img = (output_img * 0.5 + 0.5).clamp(0, 1)  # [-1,1] → [0,1]
+    output_pil = transforms.ToPILImage()(output_img.float().cpu())
 
     # Save side by side
     os.makedirs(args.output_dir, exist_ok=True)
@@ -132,7 +148,7 @@ def main():
     # Side by side: input(left) | output(right)
     side_by_side = Image.new("RGB", (1024, 512))
     side_by_side.paste(img_resized, (0, 0))
-    side_by_side.paste(output_img, (512, 0))
+    side_by_side.paste(output_pil, (512, 0))
     side_by_side.save(out_path)
     print(f"Saved: {out_path}")
     print(f"  Left: input  |  Right: model output")
