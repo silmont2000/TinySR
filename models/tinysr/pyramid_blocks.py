@@ -25,7 +25,7 @@ class DownProj(nn.Module):
 class BilinearUpsample(nn.Module):
     def __init__(self, dim: int):
         super().__init__()
-        self.norm = nn.LayerNorm(dim)
+        # self.norm = nn.LayerNorm(dim)
         self.proj = nn.Linear(dim, dim)
         with torch.no_grad():
             self.proj.weight.copy_(torch.eye(dim))
@@ -33,10 +33,11 @@ class BilinearUpsample(nn.Module):
 
     def forward(self, x: torch.Tensor, grid_hw: int) -> torch.Tensor:
         B, N, D = x.shape
-        x = self.proj(self.norm(x))
+        # x = self.proj(self.norm(x))
+        x = self.proj(x)
         x = x.reshape(B, grid_hw, grid_hw, D).permute(0, 3, 1, 2)
         x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
-        x = x.permute(0, 2, 3, 1).flatten(1, 2)
+        x = x.permute(0, 2, 3, 1).flatten(1, 2) # x = torch.einsum('b d h w -> b h w d', x)
         return x
 
 
@@ -120,4 +121,29 @@ class ConvUpsample(nn.Module):
         x = x.reshape(B, grid_hw, grid_hw, D).permute(0, 3, 1, 2)
         x = self.up(x)
         x = x.permute(0, 2, 3, 1).flatten(1, 2)
+        return x
+
+
+class LatentUpsample(nn.Module):
+    """Latent-space upsampling: 16-channel, supports bilinear or conv.
+    
+    (B, 16, H, W) → LayerNorm → upsample(2x) → (B, 16, 2H, 2W)
+    """
+    def __init__(self, channels: int = 16, mode: str = "bilinear"):
+        super().__init__()
+        self.mode = mode
+        self.norm = nn.LayerNorm(channels)
+        if mode == "conv":
+            self.conv = nn.ConvTranspose2d(channels, channels, kernel_size=4,
+                                            stride=2, padding=1)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, C, H, W = x.shape
+        x = x.permute(0, 2, 3, 1)              # (B, H, W, C)
+        x = self.norm(x)
+        x = x.permute(0, 3, 1, 2)              # (B, C, H, W)
+        if self.mode == "conv":
+            x = self.conv(x)
+        else:
+            x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
         return x

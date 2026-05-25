@@ -2,6 +2,7 @@ import sys
 sys.path.append(".")
 
 from typing import Any, Dict, List, Optional, Tuple, Union
+import torch.nn.functional as F
 
 import torch
 import torch.nn as nn
@@ -58,9 +59,6 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
             embed_dim=self.final_dim,
             pos_embed_max_size=pos_embed_max_size,
         )
-        target_tokens = pc.patch_embed_grid ** 2
-        if self.pos_embed.pos_embed.shape[1] != target_tokens:
-            self.pos_embed.pos_embed = self.pos_embed.pos_embed[:, :target_tokens, :].clone().contiguous()
 
         self.time_text_embed = CombinedTimestepTextProjEmbeddings(
             embedding_dim=self.final_dim, pooled_projection_dim=pooled_projection_dim
@@ -111,10 +109,6 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
         self.register_buffer("shift", torch.tensor([]))
 
         self.proj_out = nn.Linear(self.final_dim, pc.patch_size * pc.patch_size * self.out_channels, bias=True)
-        self.proj_out_stages = nn.ModuleList([
-            nn.Linear(self.final_dim, pc.patch_size * pc.patch_size * self.out_channels, bias=True)
-            for _ in pc.p_states
-        ])
 
         self.gradient_checkpointing = False
         self.initialized = False
@@ -125,6 +119,13 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
         h = h.reshape(B, grid_hw, grid_hw, patch_size, patch_size, self.out_channels)
         h = torch.einsum("nhwpqc->nchpwq", h)
         return h.reshape(B, self.out_channels, grid_hw * patch_size, grid_hw * patch_size)
+
+    def _patchify(self, latent, grid_hw):
+        B, C, H, W = latent.shape
+        h = self.pos_embed.proj(latent)
+        h = h.flatten(2).transpose(1, 2)
+        pe = self.pos_embed.pos_embed[:, :h.shape[1], :]
+        return h + pe
 
     def enable_forward_chunking(self, chunk_size=None, dim=0):
         if dim not in [0, 1]:
@@ -216,31 +217,22 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
                     "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
                 )
 
-        height, width = hidden_states.shape[-2:]
-
-        h = self.pos_embed(hidden_states)
-
         if not self.initialized:
             full_temb = self.time_text_embed(timestep, pooled_projections)
             del self.time_text_embed
             self.temb = full_temb
 
-        if self.down_proj is not None:
-            h = self.down_proj(h, self.pyramid_config.patch_embed_grid)
+        pc = self.pyramid_config
+        h = self._patchify(hidden_states, pc.p_states[0].grid_hw)
 
-        stage_noises = []
-        stage_inputs = []
+        if self.down_proj is not None:
+            h = self.down_proj(h, pc.patch_embed_grid)
+
         for i, p_state in enumerate(self.p_states):
-            spec = self.pyramid_config.p_states[i]
+            spec = pc.p_states[i]
 
             if not self.initialized:
                 temb_i = self.temb[:, :spec.dim]
-
-            if i == 0:
-                stage_inputs.append(None)
-            else:
-                input_latent = self.proj_out_stages[i](h)
-                stage_inputs.append(self._unpatchify(input_latent, spec.grid_hw))
 
             for block in p_state.blocks:
                 if not self.initialized:
@@ -248,12 +240,10 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
                 else:
                     h = block.forward_(hidden_states=h)
 
-            stage_noise = self.proj_out_stages[i](h)
-            stage_noise = self._unpatchify(stage_noise, spec.grid_hw)
-            stage_noises.append(stage_noise)
-
-            if p_state.bridge is not None:
-                h = p_state.bridge(h, spec.grid_hw)
+            if i < len(self.p_states) - 1:
+                bridge = p_state.bridge
+                if bridge is not None:
+                    h = bridge(h, spec.grid_hw)
 
         if not self.initialized:
             h, scale, shift = self.norm_out(h, self.temb[:, :self.final_dim])
@@ -266,14 +256,14 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
             h = self.norm(h) * (1 + self.scale[:, None]) + self.shift[:, None]
 
         h = self.proj_out(h)
-        output = self._unpatchify(h, self.pyramid_config.p_states[-1].grid_hw)
+        output = self._unpatchify(h, pc.p_states[-1].grid_hw)
 
         if USE_PEFT_BACKEND:
             unscale_lora_layers(self, lora_scale)
 
         if not return_dict:
-            return (output, stage_noises, stage_inputs)
-        return Transformer2DModelOutput(sample=output), stage_noises, stage_inputs
+            return (output,)
+        return Transformer2DModelOutput(sample=output)
 
     # ------------------------------------------------------------------
     #   Weight loading from flat (pruned) 12-block checkpoint
@@ -323,8 +313,7 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
         instance.time_text_embed.load_state_dict(flat.time_text_embed.state_dict())
         instance.norm_out.load_state_dict(flat.norm_out.state_dict())
         instance.proj_out.load_state_dict(flat.proj_out.state_dict())
-        for stage_proj in instance.proj_out_stages:
-            stage_proj.load_state_dict(flat.proj_out.state_dict())
+
 
         return instance
 

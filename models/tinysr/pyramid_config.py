@@ -1,6 +1,15 @@
 from dataclasses import dataclass
 from typing import Tuple
 
+import functools
+
+def print_property(func):
+    @functools.wraps(func)
+    def getter(self):
+        result = func(self)
+        print(f"{func.__name__}: {result}")
+        return result
+    return property(getter)
 
 @dataclass
 class PStateSpec:
@@ -36,10 +45,12 @@ class PyramidArchConfig:
     def patch_embed_dim(self) -> int:
         return self.p_states[-1].dim
 
+    @print_property 
     @property
     def need_down_proj(self) -> bool:
         return self.patch_embed_grid != self.p_states[0].grid_hw
 
+    @print_property 
     @property
     def need_dim_proj(self) -> bool:
         return self.patch_embed_dim != self.p_states[0].dim
