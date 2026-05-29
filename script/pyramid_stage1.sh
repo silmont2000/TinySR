@@ -5,27 +5,28 @@ export OUTPUT_LOG="logs/pyramid-stage1.log";
 export LOG_NAME="pyramid-stage1";
 
 nohup accelerate launch --config_file config/config.yaml \
-  --num_processes 5 \
   --main_process_port 52150 \
   train/train_stage1.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
-  --teacher_model_name_or_path="dummy" \
-  --train_batch_size=16 \
-  --num_train_epochs=400 \
-  --checkpointing_steps=5000 \
-  --learning_rate=1e-04 \
+  --train_batch_size=128 \
+  --num_train_epochs=50000 \
+  --checkpointing_steps=2000 \
+  --learning_rate=3e-04 \
+  --checkpoints_total_limit=5 \
   --lr_scheduler="cosine_with_restarts" \
-  --lr_warmup_steps=3000 \
-  --seed=80 \
+  --lr_warmup_steps=2500 \
+  --seed=40 \
   --output_dir=$OUTPUT_DIR \
-  --max_train_steps=1500000 \
   --gradient_accumulation_steps=1 \
   --report_to="wandb" \
   --resume_from_checkpoint="latest" \
   --log_name=$LOG_NAME \
-  --use_pyramid \
-  --pyramid_num_blocks 4 4 4 \
-  --pyramid_dims 1536 1536 1536 \
-  --pyramid_grid_hw 8 16 32 \
-  --pyramid_sample_size 64 \
   > $OUTPUT_LOG 2>&1 &
+  # --wandb_id 6z36l6ei \
+  # 2>&1 | python -u script/ringlog.py $OUTPUT_LOG 30 &
+
+# 正式跑：去掉 --smoke，使用全量 Real_ESRGAN_Dataset
+# 正式跑数据是三个数据集（DIV2K/Flickr2K/FFHQ），vae_stu_lr 也是 16x16 latent，形状和 smoke 完全一致
+# 唯一区别：样本数 13450 vs 5
+
+# pkill -f "train_stage1.py" 2>&1 || kill $(pgrep -f "train_stage1.py") 2>&1; echo "done"

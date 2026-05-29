@@ -14,12 +14,23 @@ def load_lora_state_dict(state_dict, model, adapter_name="default"):
 def load_lora_state_dict_warn(state_dict, model, adapter_name="default"):
     for n, p in model.named_parameters():
         if adapter_name in n:
-            name = "transformer." + n.replace(f".{adapter_name}", "") 
-            if name not in state_dict:
-                print(f"Warning: {name} not found in state_dict")
+            base_name = n.replace(f".{adapter_name}", "")
+            candidates = [
+                "transformer." + base_name,
+                "transformer." + n,
+                n,
+                base_name,
+            ]
+            found_key = None
+            for key in candidates:
+                if key in state_dict:
+                    found_key = key
+                    break
+            if found_key is None:
+                print(f"Warning: {n} not found in state_dict (tried {candidates[:2]})")
                 continue
-            p.data.copy_(state_dict[name])
-            state_dict.pop(name)
+            p.data.copy_(state_dict[found_key])
+            state_dict.pop(found_key)
     if len(state_dict) > 0:
         print(f"Warning: {len(state_dict)} keys not loaded")
         print(state_dict.keys())

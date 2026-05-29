@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
 from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 from peft.utils import get_peft_model_state_dict
 from diffusers import StableDiffusion3Pipeline
 from models.tinysr.stage1_defaults import (
@@ -14,7 +15,7 @@ from models.tinysr.stage1_defaults import (
 from models.tinysr.pyramid_model import TinyPyramidSD3Transformer2DModel
 from datetime import datetime
 
-STEPS = 25000
+STEPS = 2000
 LR = 1e-4
 
 # Usage:
@@ -53,8 +54,39 @@ class SmokeDataset(Dataset):
         return {"vae_stu": vae, "latent_stu": stu, "tg4": stu4, "tg2": stu2, "pool": pool}
 
 
+def save_ckpt(accelerator, model, args, step=None):
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
+        suffix = f"_{step}" if step is not None else ""
+        ckpt_dir = f"outputs/smoke_checkpoint_s{args.scheme}_{current_time}{suffix}"
+        os.makedirs(ckpt_dir, exist_ok=True)
+        unwrapped = accelerator.unwrap_model(model)
+        with open(os.path.join(ckpt_dir, "pyramid_config.json"), "w") as f:
+            json.dump(unwrapped.pyramid_config.to_dict(), f, indent=2)
+        with open(os.path.join(ckpt_dir, "rank_pattern.json"), "w") as f:
+            json.dump(SMOKE_RANK_PATTERN, f, indent=2)
+        with open(os.path.join(ckpt_dir, "train_config.json"), "w") as f:
+            json.dump({"loss_type": args.loss_type}, f, indent=2)
+        # for n, p in unwrapped.named_parameters():
+        #     if "norm1" in n:
+        #         print(n, p.requires_grad, p.shape)
+        lora_state = get_peft_model_state_dict(unwrapped, adapter_name="default")
+
+        # print("LoRA keys count:", len(lora_state))
+        # for k in lora_state:
+        #     if 'norm1' in k:
+        #         print("Found:", k)
+                
+        StableDiffusion3Pipeline.save_lora_weights(
+            ckpt_dir, transformer_lora_layers=lora_state,
+            weight_name="transformer.safetensors")
+        print(f"Saved: {ckpt_dir}")
+
+
 def main(args):
-    accelerator = Accelerator(mixed_precision="fp16")
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator = Accelerator(mixed_precision="fp16",kwargs_handlers=[ddp_kwargs])
     device = accelerator.device
     dtype = torch.float16
     pc = DEFAULT_PYRAMID_CONFIG
@@ -88,7 +120,7 @@ def main(args):
     trainable = [p for p in model.parameters() if p.requires_grad]
     opt = torch.optim.AdamW(trainable, lr=LR)
     ds = SmokeDataset(args.scheme)
-    loader = DataLoader(ds, batch_size=1, shuffle=True)
+    loader = DataLoader(ds, batch_size=8, shuffle=True)
 
     model, opt, loader = accelerator.prepare(model, opt, loader)
     model.train()
@@ -132,25 +164,13 @@ def main(args):
             wandb.log({"l1_loss": loss.item()}, step=step)
         if step % 500 == 0 and accelerator.is_main_process:
             print(f"  step {step:5d} | L1={loss.item():.6f}")
+        if step % 2000 == 2:
+            save_ckpt(accelerator, model, args, step)
+            accelerator.wait_for_everyone()
 
-    # ── Save checkpoint ──
-    accelerator.wait_for_everyone()
+    # ── Save final checkpoint ──
+    save_ckpt(accelerator, model, args)
     if accelerator.is_main_process:
-        current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-        ckpt_dir = f"outputs/smoke_checkpoint_s{args.scheme}_{current_time}"
-        os.makedirs(ckpt_dir, exist_ok=True)
-        unwrapped = accelerator.unwrap_model(model)
-        with open(os.path.join(ckpt_dir, "pyramid_config.json"), "w") as f:
-            json.dump(unwrapped.pyramid_config.to_dict(), f, indent=2)
-        with open(os.path.join(ckpt_dir, "rank_pattern.json"), "w") as f:
-            json.dump(SMOKE_RANK_PATTERN, f, indent=2)
-        with open(os.path.join(ckpt_dir, "train_config.json"), "w") as f:
-            json.dump({"loss_type": args.loss_type}, f, indent=2)
-        lora_state = get_peft_model_state_dict(unwrapped, adapter_name="default")
-        StableDiffusion3Pipeline.save_lora_weights(
-            ckpt_dir, transformer_lora_layers=lora_state,
-            weight_name="transformer.safetensors")
-        print(f"Saved: {ckpt_dir}")
         wandb.finish()
 
 

@@ -4,7 +4,7 @@ python test/test_tinysr.py  \
 --lora_dir="checkpoint/tinysr" \
 --embedding_dir="dataset/default/" \
 --output_dir="outputs/tinysr_test/" \
---input_dir="/data/disk2/xby/TinySR/dataset/test_image" \
+--input_dir="/data/disk2/xby/TinySR/dataset/StableSR_testsets/DrealSRVal_crop128/test_LR" \
 --rank=64 \
 --rank_vae=64 \
 --is_use_tile=False \

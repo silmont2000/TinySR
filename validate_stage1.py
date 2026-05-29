@@ -21,6 +21,10 @@ from peft import LoraConfig
 from diffusers import (
     StableDiffusion3Pipeline,
 )
+from models.tinysr.stage1_defaults import (
+    CKPT, DEFAULT_PYRAMID_CONFIG, LORA_R, SMOKE_RANK_PATTERN, make_lora_config,
+    DEFAULT_TIMESTEP,
+)
 from models.tinysr.tinysd3 import TinySD3Transformer2DModel
 from models.tinysr.pyramid_config import PyramidArchConfig
 from models.tinysr.pyramid_model import TinyPyramidSD3Transformer2DModel
@@ -30,6 +34,21 @@ from models.quant.tiler import tile_sample
 from utils.vaehook import _init_tiled_vae
 from utils.wavelet_color_fix import adain_color_fix, wavelet_color_fix
 from utils.util import load_lora_state_dict_warn
+
+from torchinfo import summary
+
+is_print=True
+
+def print_module_details(module, file, indent=0, name="model"):
+    # print(module, file=file)
+    prefix = "  " * indent
+    print(f"{prefix}{name}: {module.__class__.__name__}", file=file)
+    for param_name, param in module.named_parameters(recurse=False):
+        print(f"{prefix}  [P] {param_name}: {param.shape}", file=file)
+    for buffer_name, buffer in module.named_buffers(recurse=False):
+        print(f"{prefix}  [B] {buffer_name}: {buffer.shape}", file=file)
+    for child_name, child in module.named_children():
+        print_module_details(child, file, indent + 1, child_name)
 
 def parse_args():
     parser = argparse.ArgumentParser()
@@ -87,14 +106,14 @@ def main(args, pixel_values):
         last_grid_hw = transformer.pyramid_config.p_states[-1].grid_hw
         if pyramid_loss_type == "a":
             scale_factor = last_grid_hw // transformer.pyramid_config.p_states[0].grid_hw
-            input_up = tfF.interpolate(model_input.float(), scale_factor=scale_factor,
+            input_up = tfF.interpolate(model_input, scale_factor=scale_factor,
                                         mode='bilinear', align_corners=False)
-            denoised = input_up - output.float()
+            denoised = input_up - output
         else:
-            latent_before = transformer._tokens_to_latent(pre_last.float(), last_grid_hw)
-            denoised = latent_before.float() - output.float()
+            latent_before = transformer._tokens_to_latent(pre_last, last_grid_hw)
+            denoised = latent_before - output
         
-        denoised = denoised.to(args.device, dtype=weight_dtype)
+        # denoised = denoised.to(args.device, dtype=weight_dtype)
 
         # Decode the output
         image = vae.decode(denoised / vae.config.scaling_factor, return_dict=False)[0].squeeze(0).clamp(-1,1)
@@ -135,19 +154,14 @@ if __name__ == "__main__":
                 rank_pattern = _json.load(f)
         else:
             rank_pattern = None
-        transformer_lora_config = LoraConfig(
-            r=args.rank,
-            lora_alpha=args.rank,
-            init_lora_weights="gaussian",
-            target_modules=["to_k", "to_q", "to_v", "to_out.0","proj","linear", "linear_1", "linear_2", "net.2"],
-            rank_pattern=rank_pattern,
-        )
+        transformer_lora_config = make_lora_config(rank_pattern=rank_pattern)
         
         transformer.add_adapter(transformer_lora_config)
         transformer.enable_adapters()
 
-        transformer_lora_state_dict = StableDiffusion3Pipeline.lora_state_dict(args.lora_dir, weight_name="transformer.safetensors", cache_dir=args.cache_dir)
+        transformer_lora_state_dict = StableDiffusion3Pipeline.lora_state_dict(args.lora_dir, weight_name="model.safetensors", cache_dir=args.cache_dir)
         transformer_lora_state_dict = dict(transformer_lora_state_dict)
+        # transformer_lora_state_dict = {k.removeprefix("transformer."): v for k, v in transformer_lora_state_dict.items()}
         load_lora_state_dict_warn(transformer_lora_state_dict, transformer)
         if transformer_lora_state_dict:
             print(f"  Warning: {len(transformer_lora_state_dict)} LoRA keys not loaded:")
@@ -193,13 +207,32 @@ if __name__ == "__main__":
     tqdm_files = tqdm(image_names, desc="Eval")
     total_loss = 0.0
     total_count = 0
+
+    structure_file = os.path.join(args.output_dir, "parimaid_model_structure.txt")
+    with open(structure_file, "w") as f:
+        print("========== VAE detailed ==========", file=f)
+        print_module_details(vae, file=f, name="vae")
+        print("\n========== Transformer detailed ==========", file=f)
+        print_module_details(transformer, file=f, name="transformer")
+        print(f"\n========== saved module detail to{structure_file} ==========")
+
+
+    # Warmup: 5 forward passes on first image for GPU warmup
+    torch.cuda.empty_cache()
+    if image_names:
+        first_lr = Image.open(image_names[0]).convert('RGB')
+        first_lr = first_lr.resize((args.eval_size, args.eval_size), Image.BICUBIC)
+        warmup_pixels = tensor_transforms(first_lr).unsqueeze(0).to(args.device, dtype=weight_dtype)
+        transformer.eval()
+        for _ in range(5):
+            main(args, warmup_pixels)
+        print("Warmup done (5 iters).")
+
+
     for image_name in tqdm_files:
         stem = os.path.splitext(os.path.basename(image_name))[0]
         latent_path = os.path.join(args.eval_latent_dir, f"{stem}.pt")
-        if not os.path.exists(latent_path):
-            continue
-
-
+        has_latent = os.path.exists(latent_path)
 
         lr = Image.open(image_name).convert('RGB')
         lr = lr.resize((args.eval_size, args.eval_size), Image.BICUBIC)
@@ -207,25 +240,10 @@ if __name__ == "__main__":
         upscale = args.upscale
         process_size = args.process_size
 
-        # # Resize the image if it is not valid
         resize_flag = False
-        # if ori_width < process_size // upscale or ori_height < process_size // upscale:
-        #     scale = (process_size // upscale) / min(ori_width, ori_height)
-        #     new_width, new_height = int(scale*ori_width), int(scale*ori_height)
-        #     resize_flag = True
-        # else:
-        #     new_width, new_height = ori_width, ori_height
-        # new_width, new_height = upscale*new_width, upscale*new_height
-        # if new_width % 8 or new_height % 8:
-        #     resize_flag = True
-        #     new_width = new_width - new_width % 8
-        #     new_height = new_height - new_height % 8
 
         lr_scale = lr.resize((int(ori_width*args.upscale), int(ori_height*args.upscale)))
         pixel_values = tensor_transforms(lr).unsqueeze(0).to(args.device, dtype=weight_dtype)
-        for i in range(5):
-            main(args, pixel_values)
-
         start_time = time.time()
         torch.cuda.reset_peak_memory_stats()
         image,denoised = main(args, pixel_values)
@@ -233,19 +251,19 @@ if __name__ == "__main__":
         end_time = time.time()
         peak_mem = torch.cuda.max_memory_allocated() / 1024**2
 
-        tg = torch.load(latent_path, map_location='cpu')
-        if tg.dim() == 3:
-            tg = tg.unsqueeze(0)
-        loss = tfF.l1_loss(denoised.float().cpu(), tg.float())
-        total_loss += loss.item()
-        total_count += 1
-        tqdm_files.set_postfix(loss=f"{total_loss/total_count:.6f}" if total_count > 0 else "?")
-        
-        image_pil_image = transforms.ToPILImage()(image.cpu() / 2 + 0.5)      
         total_time += (end_time - start_time)
         mem_records.append(peak_mem)
-        if resize_flag:
-            image_pil_image = image_pil_image.resize((int(ori_width*args.upscale), int(ori_height*args.upscale)))
+
+        if has_latent:
+            tg = torch.load(latent_path, map_location='cpu')
+            if tg.dim() == 3:
+                tg = tg.unsqueeze(0)
+            loss = tfF.l1_loss(denoised.float().cpu(), tg.float())
+            total_loss += loss.item()
+            total_count += 1
+            tqdm_files.set_postfix(loss=f"{total_loss/total_count:.6f}")
+        
+        image_pil_image = transforms.ToPILImage()(image.cpu() / 2 + 0.5)
 
         if args.align_method == 'adain':
             image_pil_image = adain_color_fix(target=image_pil_image, source=lr)
@@ -260,8 +278,9 @@ if __name__ == "__main__":
     mem_arr = np.array(mem_records)
     print("#Param.", param_cnt/1e6, "M")
     print(f"Average time: {total_time / datalen:.4f} sec/image")
-    print(f"Peak mem  avg: {np.mean(mem_arr):.0f} MB")
-    print(f"Peak mem  max: {np.max(mem_arr):.0f} MB")
+    if len(mem_arr) > 0:
+        print(f"Peak mem  avg: {np.mean(mem_arr):.0f} MB")
+        print(f"Peak mem  max: {np.max(mem_arr):.0f} MB")
 
 
 

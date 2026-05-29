@@ -127,6 +127,11 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
         pe = self.pos_embed.pos_embed[:, :h.shape[1], :]
         return h + pe
 
+    def _tokens_to_latent(self, h: torch.Tensor, grid_hw: int) -> torch.Tensor:
+        h = self.norm(h) * (1 + self.scale[:, None]) + self.shift[:, None]
+        h = self.proj_out(h)
+        return self._unpatchify(h, grid_hw)
+
     def enable_forward_chunking(self, chunk_size=None, dim=0):
         if dim not in [0, 1]:
             raise ValueError(f"Make sure to set `dim` to either 0 or 1, not {dim}")
@@ -223,16 +228,22 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
             self.temb = full_temb
 
         pc = self.pyramid_config
+        # h是贯穿始终的
         h = self._patchify(hidden_states, pc.p_states[0].grid_hw)
 
         if self.down_proj is not None:
             h = self.down_proj(h, pc.patch_embed_grid)
+
+        pre_last_tokens = None
 
         for i, p_state in enumerate(self.p_states):
             spec = pc.p_states[i]
 
             if not self.initialized:
                 temb_i = self.temb[:, :spec.dim]
+
+            if i == len(self.p_states) - 1:
+                pre_last_tokens = h
 
             for block in p_state.blocks:
                 if not self.initialized:
@@ -262,8 +273,8 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
             unscale_lora_layers(self, lora_scale)
 
         if not return_dict:
-            return (output,)
-        return Transformer2DModelOutput(sample=output)
+            return (output, pre_last_tokens)
+        return Transformer2DModelOutput(sample=output), pre_last_tokens
 
     # ------------------------------------------------------------------
     #   Weight loading from flat (pruned) 12-block checkpoint

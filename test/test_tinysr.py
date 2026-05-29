@@ -27,6 +27,9 @@ from utils.vaehook import _init_tiled_vae
 from utils.wavelet_color_fix import adain_color_fix, wavelet_color_fix
 from utils.util import load_lora_state_dict
 
+from torchinfo import summary
+
+
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pretrained_model_name_or_path", type=str, default="path/to/your/model", help='path to the pretrained sd3')
@@ -138,6 +141,32 @@ if __name__ == "__main__":
     if os.path.exists(args.output_dir) is False:
         os.makedirs(args.output_dir)
 
+    torch.cuda.empty_cache()
+    if (image_names):
+        lr = Image.open(image_names[0]).convert('RGB')
+        ori_width, ori_height = lr.size
+        upscale = args.upscale
+        process_size = args.process_size
+
+        # Resize the image if it is not valid
+        resize_flag = False
+        if ori_width < process_size // upscale or ori_height < process_size // upscale:
+            scale = (process_size // upscale) / min(ori_width, ori_height)
+            new_width, new_height = int(scale*ori_width), int(scale*ori_height)
+            resize_flag = True
+        else:
+            new_width, new_height = ori_width, ori_height
+        new_width, new_height = upscale*new_width, upscale*new_height
+        if new_width % 8 or new_height % 8:
+            resize_flag = True
+            new_width = new_width - new_width % 8
+            new_height = new_height - new_height % 8
+
+        lr_scale = lr.resize((int(ori_width*args.upscale), int(ori_height*args.upscale)))
+        pixel_values = tensor_transforms(lr).unsqueeze(0).to(args.device, dtype=weight_dtype)
+        for i in range(5):
+            main(args, pixel_values, (new_height, new_width))
+
     total_time = 0.0
     mem_records = []
     for image_name in tqdm(image_names):
@@ -162,9 +191,7 @@ if __name__ == "__main__":
 
         lr_scale = lr.resize((int(ori_width*args.upscale), int(ori_height*args.upscale)))
         pixel_values = tensor_transforms(lr).unsqueeze(0).to(args.device, dtype=weight_dtype)
-        for i in range(5):
-            image = main(args, pixel_values, (new_height, new_width))
-
+        
         start_time = time.time()
         torch.cuda.reset_peak_memory_stats()
         image = main(args, pixel_values, (new_height, new_width))
@@ -185,7 +212,7 @@ if __name__ == "__main__":
             pass
 
         image_pil_image.save(os.path.join(args.output_dir, os.path.basename(image_name)))
-        torch.cuda.empty_cache()
+    torch.cuda.empty_cache()
     param_cnt = sum(p.numel() for p in transformer.transformer_blocks.parameters() )
     mem_arr = np.array(mem_records)
     print("#Param.", param_cnt/1e6, "M")

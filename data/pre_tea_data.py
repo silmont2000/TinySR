@@ -97,14 +97,14 @@ def main2(args, batch):
 
 def run_encode():
     # data_dir = [FLICKR2K_PATH ]
-    dataset = Real_ESRGAN_Dataset(device="cpu")
+    dataset = Real_ESRGAN_Dataset(device="cpu",process_size=512)
     for data in tqdm(dataset):
         main(args, data)
 
 
 def run_vae():
     # data_dir = [FLICKR2K_PATH ]
-    dataset = Real_ESRGAN_Dataset(device="cpu")
+    dataset = Real_ESRGAN_Dataset(device="cpu",process_size=512)
     for data in tqdm(dataset):
         main2(args, data)
 
