@@ -8,14 +8,15 @@ nohup accelerate launch --config_file config/config.yaml \
   --main_process_port 52150 \
   train/train_stage1.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
-  --train_batch_size=128 \
-  --num_train_epochs=50000 \
+  --train_batch_size=16 \
+  --num_train_epochs=30000 \
   --checkpointing_steps=2000 \
-  --learning_rate=3e-04 \
-  --checkpoints_total_limit=5 \
+  --learning_rate=2e-04 \
+  --checkpoints_total_limit=20 \
   --lr_scheduler="cosine_with_restarts" \
-  --lr_warmup_steps=2500 \
-  --seed=40 \
+  --max_grad_norm=0.5 \
+  --lr_warmup_steps=2000 \
+  --seed=88 \
   --output_dir=$OUTPUT_DIR \
   --gradient_accumulation_steps=1 \
   --report_to="wandb" \

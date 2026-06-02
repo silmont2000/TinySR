@@ -104,14 +104,9 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
             self.p_states.append(PStateGroup(blocks=blocks, bridge=bridge))
 
         self.norm_out = AdaLayerNormContinuous(self.final_dim, self.final_dim, elementwise_affine=False, eps=1e-6)
-        self.norm = self.norm_out.norm
-        self.register_buffer("scale", torch.tensor([]))
-        self.register_buffer("shift", torch.tensor([]))
+        self.norm = nn.LayerNorm(self.final_dim, eps=1e-6)
 
         self.proj_out = nn.Linear(self.final_dim, pc.patch_size * pc.patch_size * self.out_channels, bias=True)
-
-        self.gradient_checkpointing = False
-        self.initialized = False
 
     def _unpatchify(self, h, grid_hw):
         patch_size = self.pyramid_config.patch_size
@@ -128,7 +123,7 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
         return h + pe
 
     def _tokens_to_latent(self, h: torch.Tensor, grid_hw: int) -> torch.Tensor:
-        h = self.norm(h) * (1 + self.scale[:, None]) + self.shift[:, None]
+        h = self.norm(h)
         h = self.proj_out(h)
         return self._unpatchify(h, grid_hw)
 
@@ -222,10 +217,8 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
                     "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
                 )
 
-        if not self.initialized:
-            full_temb = self.time_text_embed(timestep, pooled_projections)
-            del self.time_text_embed
-            self.temb = full_temb
+        full_temb = self.time_text_embed(timestep, pooled_projections)
+        self.temb = full_temb
 
         pc = self.pyramid_config
         # h是贯穿始终的
@@ -238,33 +231,21 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
 
         for i, p_state in enumerate(self.p_states):
             spec = pc.p_states[i]
-
-            if not self.initialized:
-                temb_i = self.temb[:, :spec.dim]
+            temb_i = self.temb[:, :spec.dim]
 
             if i == len(self.p_states) - 1:
                 pre_last_tokens = h
 
             for block in p_state.blocks:
-                if not self.initialized:
-                    h = block(hidden_states=h, temb=temb_i)
-                else:
-                    h = block.forward_(hidden_states=h)
+                h = block(hidden_states=h, temb=temb_i)
 
             if i < len(self.p_states) - 1:
                 bridge = p_state.bridge
                 if bridge is not None:
                     h = bridge(h, spec.grid_hw)
 
-        if not self.initialized:
-            h, scale, shift = self.norm_out(h, self.temb[:, :self.final_dim])
-            self.scale = scale.detach()
-            self.shift = shift.detach()
-            self.initialized = True
-            del self.norm_out
-            del self.temb
-        else:
-            h = self.norm(h) * (1 + self.scale[:, None]) + self.shift[:, None]
+        h, scale, shift = self.norm_out(h, self.temb[:, :self.final_dim])
+
 
         h = self.proj_out(h)
         output = self._unpatchify(h, pc.p_states[-1].grid_hw)

@@ -186,7 +186,7 @@ if __name__ == "__main__":
     pooled_prompt_embeds = pooled_prompt_embeds.expand(args.batch_size, -1)
 
     if args.model=='p':
-        H, W = 128, 128
+        H, W = 256, 256
     elif args.model=='t':
         H, W = 512, 512
     total_time = 0.0

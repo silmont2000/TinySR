@@ -1,7 +1,7 @@
 python test/test_tinysr.py  \
 --pretrained_model_name_or_path="checkpoint/tinybackbone/prune-12-merge-tinysr" \
 --vae_path="checkpoint/vae/separable" \
---lora_dir="checkpoint/tinysr" \
+--lora_dir="/data/disk3/xby/tinysr/checkpoint/train-tinysr/v1/checkpoint-140500" \
 --embedding_dir="dataset/default/" \
 --output_dir="outputs/tinysr_test/" \
 --input_dir="/data/disk2/xby/TinySR/dataset/StableSR_testsets/DrealSRVal_crop128/test_LR" \

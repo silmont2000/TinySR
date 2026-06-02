@@ -599,13 +599,15 @@ def main(args):
         train_dataset = SmokeDataset()
     else:
         train_dataset = Real_ESRGAN_Dataset(
-            device=accelerator.device, multi_stage=True)
+            device=accelerator.device, first_stage=True)
 
     # note: collate_fn 需要访问 accelerator.device，这里用嵌套函数捕获
     def collate_fn(examples):
         latent_stu = torch.stack([e["latent_stu"] for e in examples])
         vae_stu = torch.stack([e["vae_stu"] for e in examples])
+        latent_hr = torch.stack([e["latent_hr"] for e in examples])
         batch = {
+            "latent_hr": latent_hr.to(dtype=weight_dtype, device=accelerator.device),
             "latent_stu": latent_stu.to(dtype=weight_dtype, device=accelerator.device),
             "vae_stu": vae_stu.to(dtype=weight_dtype, device=accelerator.device),
         }
@@ -648,6 +650,31 @@ def main(args):
 
     # 在 prepare 之后才加载 checkpoint 状态（model/optimizer/scheduler/dataloader 均已注册）
     if checkpoint_path is not None:
+        # with torch.no_grad():
+        #     unwrapped_model = accelerator.unwrap_model(transformer)
+        #     pc = unwrapped_model.pyramid_config
+
+        #     dummy_latent = torch.zeros(
+        #         1, pc.in_channels, pc.sample_size, pc.sample_size,
+        #         dtype=weight_dtype, device=accelerator.device,
+        #     )
+        #     dummy_timestep = torch.tensor([DEFAULT_TIMESTEP], device=accelerator.device)
+        #     dummy_pool = torch.zeros(
+        #         1, pc.pooled_projection_dim,
+        #         dtype=weight_dtype, device=accelerator.device,
+        #     )
+
+        #     try:
+        #         _ = unwrapped_model(
+        #             hidden_states=dummy_latent,
+        #             timestep=dummy_timestep,
+        #             pooled_projections=dummy_pool,
+        #             return_dict=False,
+        #         )
+        #         accelerator.print("🚀 已通过 Dummy Forward 成功激活所有隐式层 Shape！")
+        #     except Exception as e:
+        #         accelerator.print(f"⚠️ Dummy Forward 失败（如果是缺少某些必填参数请补齐）: {e}")
+                
         def load_weight():
             from safetensors.torch import load_file
             weight_path = os.path.join(checkpoint_path,"model.safetensors")
@@ -670,7 +697,7 @@ def main(args):
                 else:
                     fixed_state_dict[k] = v
             unwrapped_model.load_state_dict(fixed_state_dict, strict=False)
-            accelerator.print("✅ 冲突权重清洗完毕，已成功以 strict=False 强行加载剩余权重！")
+            accelerator.print("冲突权重清洗完毕，已成功以 strict=False 强行加载剩余权重！")
 
         saved_models = accelerator._models
         accelerator._models = []
@@ -678,6 +705,15 @@ def main(args):
         accelerator._models = saved_models
         load_weight()
 
+        # 断点续跑时，checkpoint 中保存的 optimizer/scheduler 状态使用的是旧 LR。
+        # 必须用新的 --learning_rate 覆盖。注意 scheduler 被 AcceleratedScheduler 包裹，
+        # 需通过 .scheduler 访问内部 scheduler 才能修改 base_lrs。
+        for pg in optimizer_g.param_groups:
+            pg["lr"] = args.learning_rate
+        inner_sched = lr_scheduler_g.scheduler if hasattr(lr_scheduler_g, "scheduler") else lr_scheduler_g
+        if hasattr(inner_sched, "base_lrs"):
+            inner_sched.base_lrs = [args.learning_rate] * len(inner_sched.base_lrs)
+            accelerator.print(f"🔧 已用新 LR={args.learning_rate} 覆盖 optimizer 和 scheduler base_lrs")
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(
@@ -766,6 +802,7 @@ def main(args):
     if not args.smoke:
         pooled_prompt_embeds_default = torch.load(
             "dataset/default/pool_embeds.pt", map_location=accelerator.device)
+            
     # ================================================================
     # 📊 多卡安全版：验证 [optimizer_g] 与 [lr_scheduler_g] 状态审计
     # ================================================================
@@ -815,18 +852,11 @@ def main(args):
         if accelerator.is_main_process:
             accelerator.print(f"❌ 多卡强制唤醒调度器失败: {e}")
 
-    # 兜底保障：如果依然为 0，所有卡强行同步赋予合理的基准学习率
-    if optimizer_g.param_groups[0]["lr"] == 0.0:
-        if accelerator.is_main_process:
-            accelerator.print("⚠️ 调度器固执不醒，多卡实施同步手动 LR 注入...")
-        for param_group in optimizer_g.param_groups:
-            param_group["lr"] = 1e-04  # 注入一个你断点处应有的退火 LR
-            
     # 最后由主进程打印最终确认结果
     if accelerator.is_main_process:
-        accelerator.print(f"🔥 [多卡唤醒完成] 重新校准后的实际运行 LR 已变为: {optimizer_g.param_groups[0]['lr']}\n")
+        accelerator.print(f"重新校准后的实际运行 LR 已变为: {optimizer_g.param_groups[0]['lr']}\n")
     
-    # 💡 关键分布式防死锁卡顿：让所有卡在这里集合，对齐步调再进正式训练
+
     accelerator.wait_for_everyone()
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()
@@ -840,7 +870,8 @@ def main(args):
                     pool_emb = pooled_prompt_embeds_default.repeat(current_bs, 1)
 
                 with autocast_ctx:
-                    latent_teacher = batch["latent_stu"]
+                    # latent_teacher = batch["latent_stu"]
+                    latent_teacher = batch["latent_hr"]
                     model_input = batch["vae_stu"]
                     timesteps = torch.tensor(
                         [DEFAULT_TIMESTEP], device=accelerator.device)
@@ -886,7 +917,7 @@ def main(args):
                     print("save_ckpt")
                     save_ckpt(step=global_step)
 
-                logs = {"l1_loss": loss_g.detach().item()}
+                logs = {"l1_loss": loss_g.detach().item(), "lr": optimizer_g.param_groups[0]["lr"]}
                 progress_bar.set_postfix(**logs)
                 if accelerator.is_main_process:
                     accelerator.log(logs, step=global_step)

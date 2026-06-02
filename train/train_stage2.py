@@ -40,6 +40,12 @@ from diffusers import (
 )
 from models.tinysr.tinysd3 import TinySD3Transformer2DModel
 from models.tinysr.sd3 import SD3Transformer2DModel
+from models.tinysr.pyramid_config import PyramidArchConfig
+from models.tinysr.pyramid_model import TinyPyramidSD3Transformer2DModel
+from models.tinysr.stage1_defaults import (
+    CKPT, SMOKE_RANK_PATTERN, make_lora_config,
+    DEFAULT_PYRAMID_CONFIG, LORA_R, DEFAULT_TIMESTEP, VAE_CKPT,
+)
 
 from diffusers.image_processor import  VaeImageProcessor
 from diffusers.optimization import get_scheduler
@@ -111,13 +117,13 @@ def log_validation(
 
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
-    parser.add_argument(
-        "--pretrained_model_name_or_path",
-        type=str,
-        default=None,
-        required=True,
-        help="Path to pretrained model or model identifier from huggingface.co/models.",
-    )
+    # parser.add_argument(
+    #     "--pretrained_model_name_or_path",
+    #     type=str,
+    #     default=None,
+    #     required=True,
+    #     help="Path to pretrained model or model identifier from huggingface.co/models.",
+    # )
     parser.add_argument(
         "--lora_dir",
         type=str,
@@ -132,13 +138,13 @@ def parse_args(input_args=None):
         required=True,
         help="Path to DINOv2 pretrained model.",
     )
-    parser.add_argument(
-        "--teacher_model_name_or_path",
-        type=str,
-        default=None,
-        required=True,
-        help="Path to DINOv2 pretrained model.",
-    )
+    # parser.add_argument(
+    #     "--teacher_model_name_or_path",
+    #     type=str,
+    #     default=None,
+    #     required=True,
+    #     help="Path to DINOv2 pretrained model.",
+    # )
     parser.add_argument(
         "--revision",
         type=str,
@@ -328,6 +334,8 @@ def parse_args(input_args=None):
         "--set_grads_to_none",
         action="store_true",
     )
+    parser.add_argument("--loss_type", type=str, default="a", choices=["a", "b"],
+                        help="Pyramid loss type (a=simple, b=multi-scale)")
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -344,6 +352,7 @@ def collate_fn(examples, weight_dtype=torch.float16):
     lr_img = [example["lr_img"] for example in examples]
     hr_img = [example["hr_img"] for example in examples]
     # latent_hr = [example["latent_hr"] for example in examples]
+    vae_stu = torch.stack([e["vae_stu"] for e in examples])
     
     # prompts = [example["prompt_text"] for example in examples]
     # prompt_embeds = torch.stack([example["prompt_embeds_input"] for example in examples])
@@ -361,8 +370,11 @@ def collate_fn(examples, weight_dtype=torch.float16):
         "hr_img": hr_img.to(dtype=weight_dtype),
         # "latent_hr": latent_hr.to(dtype=weight_dtype),
         "latent_stu": latent_stu.to(dtype=weight_dtype),
+        "vae_stu": vae_stu.to(dtype=weight_dtype),
+
         # "prompts": prompts,
         # "prompt_embeds": prompt_embeds.to(dtype=weight_dtype),
+        
         "pooled_prompt_embeds": pooled_prompt_embeds.to(dtype=weight_dtype),
              }
     return batch
@@ -416,33 +428,47 @@ def main(args):
     if accelerator.is_main_process:
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
-
-    transformer = TinySD3Transformer2DModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
-    )
-    vae = AutoencoderTiny.from_pretrained("your vae path")
-
-    vae.requires_grad_(False)
-    transformer.requires_grad_(False)
+    
     weight_dtype = torch.float16
     if accelerator.mixed_precision == "no":
         weight_dtype = torch.float32
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
+
+    # transformer = TinySD3Transformer2DModel.from_pretrained(
+    #     args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
+    # )
+    pc = DEFAULT_PYRAMID_CONFIG
+    transformer = TinyPyramidSD3Transformer2DModel.from_flat_pretrained(
+        CKPT, pyramid_config=pc,
+        subfolder="transformer",
+        revision=args.revision, variant=args.variant,
+        torch_dtype=weight_dtype,
+        ignore_mismatched_sizes=True,
+    )
+    vae = AutoencoderTiny.from_pretrained("checkpoint/vae/separable")
+    vae_decode = AutoencoderKL.from_pretrained("/data/disk2/xby/sd3-medium", subfolder="vae").to("cuda", weight_dtype)
+
+
+    vae.requires_grad_(False)
+    transformer.requires_grad_(False)
+
     if args.gradient_checkpointing:
         transformer.enable_gradient_checkpointing()
 
-    transformer_lora_config = LoraConfig(
-        r=64,
-        lora_alpha=64,
-        init_lora_weights="gaussian",
-        target_modules=["to_k", "to_q", "to_v", "to_out.0","proj","linear", "linear_1", "linear_2", "net.2"],
-    )
+    # transformer_lora_config = LoraConfig(
+    #     r=64,
+    #     lora_alpha=64,
+    #     init_lora_weights="gaussian",
+    #     target_modules=["to_k", "to_q", "to_v", "to_out.0","proj","linear", "linear_1", "linear_2", "net.2"],
+    # )
+    transformer_lora_config = make_lora_config(rank_pattern=SMOKE_RANK_PATTERN)
     transformer.add_adapter(transformer_lora_config, adapter_name="default")
     transformer.enable_adapters()
-    transformer_lora_state_dict = StableDiffusion3Pipeline.lora_state_dict(args.lora_dir, weight_name="transformer.safetensors")
+    transformer_lora_state_dict = StableDiffusion3Pipeline.lora_state_dict(args.lora_dir, weight_name="model.safetensors")
     load_lora_state_dict_warn(transformer_lora_state_dict, transformer)
+
     
     vae.to(accelerator.device, dtype=weight_dtype)
     transformer.to(accelerator.device, dtype=weight_dtype)
@@ -459,7 +485,7 @@ def main(args):
                 if isinstance(model, type(unwrap_model(transformer))):
                     transformer_lora_layers_to_save = get_peft_model_state_dict(model, adapter_name="default")
                     StableDiffusion3Pipeline.save_lora_weights(
-                output_dir, transformer_lora_layers=transformer_lora_layers_to_save,weight_name=f"transformer.safetensors"
+                output_dir, transformer_lora_layers=transformer_lora_layers_to_save,weight_name=f"model.safetensors"
             ) 
                 elif isinstance(model, type(unwrap_model(model_dis))) :
                     torch.save(model.state_dict(), os.path.join(output_dir, f"model_dis.safetensors"))
@@ -470,7 +496,7 @@ def main(args):
     def load_model_hook(models, input_dir):
         model_dis = models.pop()
         transformer = models.pop()
-        transformer_lora_state_dict = StableDiffusion3Pipeline.lora_state_dict(input_dir,weight_name="transformer.safetensors")
+        transformer_lora_state_dict = StableDiffusion3Pipeline.lora_state_dict(input_dir,weight_name="model.safetensors")
         load_lora_state_dict(transformer_lora_state_dict, transformer)
         model_dis.load_state_dict(torch.load(os.path.join(input_dir, "model_dis.safetensors")))
 
@@ -505,7 +531,7 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
-    model_fea = vit_large(patch_size=14, img_size=518, block_chunks=0, init_values=1.0)
+    model_fea = vit_large(patch_size=14, img_size=518, block_chunks=0, init_values=1.0,num_register_tokens=4)
     util_net.reload_model(model_fea, torch.load(args.DINO_v2_pretrained_model_path))
     patch_resolution = 16 * (512 // 256)
     model_fea.pos_embed.data = timm.layers.pos_embed.resample_abs_pos_embed(
@@ -514,7 +540,7 @@ def main(args):
     model_fea.requires_grad_(False)
     model_fea.to(accelerator.device, dtype=weight_dtype)
 
-    model_dis = ProjectedDiscriminator(c_dim=768).train()
+    model_dis = ProjectedDiscriminator(c_dim=1024).train()
     optimizer_Dis = torch.optim.AdamW(
         model_dis.parameters(),
         lr=args.learning_rate_discrimitor,
@@ -649,22 +675,28 @@ def main(args):
                 log_dict["lq"] = lr_values.float().cpu()
                 log_dict["hq"] = hr_values.float().cpu()
                 with autocast_ctx:
-                    with torch.no_grad():
-                        model_input = vae.encode(lr_values).latents * vae.config.scaling_factor
-                        timesteps = torch.tensor([1000.], device=accelerator.device)
-                        latent_tea = batch["latent_stu"]
-                        
-                    model_pred = transformer(
+                    # with torch.no_grad():
+                    #     model_input = vae.encode(lr_values).latents * vae.config.scaling_factor
+                    #     timesteps = torch.tensor([1000.], device=accelerator.device)
+                    #     latent_tea = batch["latent_stu"]
+                    timesteps = torch.tensor([DEFAULT_TIMESTEP], device=accelerator.device)
+                    model_input = batch["vae_stu"]
+                    latent_tea = batch["latent_stu"]
+                       
+                    model_pred,_ = transformer(
                         hidden_states=model_input,
                         timestep=timesteps,
                         pooled_projections=pooled_prompt_embeds,
                         return_dict=False,
-                    )[0]
-                    latent_stu =  model_input - model_pred 
-                    
+                    )
+                    scale_factor = DEFAULT_PYRAMID_CONFIG.p_states[-1].grid_hw // DEFAULT_PYRAMID_CONFIG.p_states[0].grid_hw
+                    input_up = F.interpolate(model_input.float(
+                    ), scale_factor=scale_factor, mode='bilinear', align_corners=False)
+                    latent_stu = input_up - model_pred.float()
+
                     l1_loss =  F.l1_loss(latent_stu.float(), latent_tea.float().detach(), reduction='mean') 
                     
-                    image_stu = vae.decode(latent_stu / vae.config.scaling_factor, return_dict=False)[0].clamp(-1, 1)
+                    image_stu = vae_decode.decode(latent_stu / vae.config.scaling_factor, return_dict=False)[0].clamp(-1, 1)
                     if accelerator.is_main_process and step % args.validation_steps == 49:
                         log_dict["image_stu"] = image_stu.cpu()
 

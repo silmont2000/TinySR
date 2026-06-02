@@ -3,10 +3,14 @@ import sys
 sys.path.append(os.getcwd())
 import torch
 from torch.utils.data import Dataset
+from torchvision import transforms
+from PIL import Image
 
-DIV2K_PATH = "/data/disk1/dlw/datasets/CAD_V100_20260209_backup/datasets/DIV2K/DIV2K_train_LRx4_Real-ESRGAN_Seesr_v2"
-FLICKR2K_PATH = "/data/disk1/dlw/datasets/CAD_V100_20260209_backup/datasets/Flickr2K/Flickr2K_LRx4_Real-ESRGAN_Seesr_v2"
-FFHQ10K_PATH = "/data/disk1/dlw/datasets/CAD_V100_20260209_backup/datasets/FFHQ/FFHQ10K_LRx4_Real-ESRGAN_Seesr_v2"
+
+DIV2K_PATH = "/data/disk3/xby/tinysr/datasets/CAD_V100_20260209_backup/datasets/DIV2K/DIV2K_train_LRx4_Real-ESRGAN_Seesr_v2"
+FLICKR2K_PATH =  "/data/disk3/xby/tinysr/datasets/CAD_V100_20260209_backup/datasets/Flickr2K/Flickr2K_LRx4_Real-ESRGAN_Seesr_v2"
+FFHQ10K_PATH =  "/data/disk3/xby/tinysr/datasets/CAD_V100_20260209_backup/datasets/FFHQ/FFHQ10K_LRx4_Real-ESRGAN_Seesr_v2"
+
 
 data_path = [DIV2K_PATH, FLICKR2K_PATH, FFHQ10K_PATH]
 lr_dir_name = "sr_bicubic"
@@ -20,7 +24,7 @@ class SmokeDataset(Dataset):
     """5-image smoke test dataset, same format as smoke_overfit.py."""
     def __init__(self, base="dataset/smoke"):
         self.files = sorted(os.listdir(os.path.join(base, "latent_stu")))
-        self.vae_dir = os.path.join(base, "vae_stu_lr")
+        self.vae_dir = os.path.join(base, "vae_stu_lr_256")
         self.stu_dir = os.path.join(base, "latent_stu")
         self.pool_dir = os.path.join(base, "pool_embeds")
 
@@ -42,10 +46,10 @@ class Real_ESRGAN_Dataset(Dataset):
                 process_size=512,
                 max_sample=None,
                 device="cpu",
-                multi_stage=False,
+                first_stage=False,
                 ):
         self.root_path=data_path
-        self.multi_stage = multi_stage
+        self.first_stage = first_stage
         self.device = device
         self.max_sample = max_sample
         self.process_size=process_size
@@ -55,7 +59,7 @@ class Real_ESRGAN_Dataset(Dataset):
         self.prompt_dir_name = prompt_dir_name
         self.prompt_embeds_dir_name = prompt_embeds_dir_name
         self.pool_prompt_embeds_dir_name = pool_prompt_embeds_dir_name
-        # self.trans = transforms.ToTensor()
+        self.trans = transforms.ToTensor()
         
         self.lr_img_name = []
         self.hr_img_name = []
@@ -89,28 +93,40 @@ class Real_ESRGAN_Dataset(Dataset):
         self.img_nums = len(self.lr_img_name)
     
     def __getitem__(self, idx):
-        # img_names = self.lr_img_name[idx]
-        # lr_img = self.trans(Image.open(self.lr_img_name[idx]).convert("RGB")).squeeze() * 2 - 1 
-        # hr_img = self.trans(Image.open(self.hr_img_name[idx]).convert("RGB")).squeeze() * 2 - 1 
-        # latent_hr = torch.load(self.hr_latent_name[idx], map_location=self.device).squeeze() 
+
         latent_stu = torch.load(self.hr_latent_name[idx].replace("latent_hr", "latent_stu"), map_location=self.device).squeeze() 
-        vae_stu = torch.load(self.hr_latent_name[idx].replace("latent_hr", "vae_stu_lr"), map_location=self.device).squeeze()
+        vae_stu = torch.load(self.hr_latent_name[idx].replace("latent_hr", "vae_stu_lr_256"), map_location=self.device).squeeze()
         pooled_prompt_embeds = torch.load(self.pool_prompt_embeds_name[idx], map_location=self.device).squeeze()
+
+        if self.first_stage == True:
+            result = {
+                # "img_name": img_names,
+                # "lr_img": lr_img,
+                # "hr_img": hr_img,
+                # "latent_hr": latent_hr,
+                # "prompt_embeds_input": prompt_embeds,
+                "latent_stu": latent_stu,
+                "vae_stu": vae_stu,
+                "pooled_prompt_embeds_input": pooled_prompt_embeds,
+            }
+
+        else:
+            latent_hr = torch.load(self.hr_latent_name[idx], map_location=self.device).squeeze() 
+            img_names = self.lr_img_name[idx]
+            lr_img = self.trans(Image.open(self.lr_img_name[idx]).convert("RGB")).squeeze() * 2 - 1 
+            hr_img = self.trans(Image.open(self.hr_img_name[idx]).convert("RGB")).squeeze() * 2 - 1 
         
-        result = {
-            # "img_name": img_names,
-            # "lr_img": lr_img,
-            # "hr_img": hr_img,
-            # "latent_hr": latent_hr,
-            # "prompt_embeds_input": prompt_embeds,
-            "latent_stu": latent_stu,
-            "vae_stu": vae_stu,
-            "pooled_prompt_embeds_input": pooled_prompt_embeds,
-        }
-        # if self.multi_stage:
-        #     result["target_8"] = torch.load(self.hr_latent_name[idx].replace("latent_hr", "target_8"), map_location=self.device).squeeze()
-        #     result["target_16"] = torch.load(self.hr_latent_name[idx].replace("latent_hr", "target_16"), map_location=self.device).squeeze()
-        #     result["target_32"] = torch.load(self.hr_latent_name[idx].replace("latent_hr", "target_32"), map_location=self.device).squeeze()
+            result = {
+                "img_name": img_names,
+                "lr_img": lr_img,
+                "hr_img": hr_img,
+                "latent_hr": latent_hr,
+                # "prompt_embeds_input": prompt_embeds,
+                "latent_stu": latent_stu,
+                "vae_stu": vae_stu,
+                "pooled_prompt_embeds_input": pooled_prompt_embeds,
+            }
+            
         return result
 
     

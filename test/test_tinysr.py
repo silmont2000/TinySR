@@ -21,6 +21,9 @@ from diffusers import (
 )
 from models.tinysr.tinysd3 import TinySD3Transformer2DModel
 from models.vae.autoencoder_tiny  import  AutoencoderTiny
+from models.vae.autoencoder_kl  import  AutoencoderKL
+# from diffusers import AutoencoderKL
+
 from models.quant.tiler import tile_sample
 
 from utils.vaehook import _init_tiled_vae
@@ -34,7 +37,7 @@ def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--pretrained_model_name_or_path", type=str, default="path/to/your/model", help='path to the pretrained sd3')
     parser.add_argument("--vae_path", type=str, default="path/to/your/vae", help='path to tsd-sr lora weights')
-    parser.add_argument("--lora_dir", type=str, default="path/to/your/lora", help='path to tsd-sr lora weights')
+    parser.add_argument("--lora_dir", type=str, default=None, help='path to tsd-sr lora weights (omit for no-LoRA baseline)')
     parser.add_argument("--cache_dir", type=str, default="/data/disk2/xby/models", help='cache directory for downloading models')
     parser.add_argument("--embedding_dir", type=str, default="dataset/default/", help='path to prompt embeddings')
     parser.add_argument("--output_dir", '-o', type=str, default="outputs/tinysr/", help='path to save results')
@@ -72,6 +75,7 @@ def main(args, pixel_values, size):
 
         # Encode the input image
         model_input = vae.encode(pixel_values).latents * vae.config.scaling_factor
+        # model_input = vae_decode.encode(pixel_values).latents_dist.sample() * vae.config.scaling_factor
         model_input = model_input.to(args.device, dtype=weight_dtype)
 
         # Predict
@@ -81,7 +85,7 @@ def main(args, pixel_values, size):
         latent_stu = model_input - model_pred
 
         # Decode the output
-        image = vae.decode(latent_stu / vae.config.scaling_factor, return_dict=False)[0].squeeze(0).clamp(-1,1)
+        image = vae_decode.decode(latent_stu / vae.config.scaling_factor, return_dict=False)[0].squeeze(0).clamp(-1,1)
 
         return image
 
@@ -100,6 +104,8 @@ if __name__ == "__main__":
     transformer = TinySD3Transformer2DModel.from_pretrained(args.pretrained_model_name_or_path,subfolder="transformer", 
                                             torch_dtype=weight_dtype, low_cpu_mem_usage=False, ignore_mismatched_sizes=True, cache_dir=args.cache_dir)
     vae = AutoencoderTiny.from_pretrained(args.vae_path, torch_dtype=weight_dtype, cache_dir=args.cache_dir)
+    # vae = AutoencoderKL.from_pretrained(args.vae_path, torch_dtype=weight_dtype, cache_dir=args.cache_dir)
+    vae_decode = AutoencoderKL.from_pretrained("/data/disk2/xby/sd3-medium", subfolder="vae").to("cuda", weight_dtype)
 
     if args.is_use_tile:
         _init_tiled_vae(vae, encoder_tile_size=args.vae_encoder_tiled_size, decoder_tile_size=args.vae_decoder_tiled_size)
@@ -167,7 +173,11 @@ if __name__ == "__main__":
         for i in range(5):
             main(args, pixel_values, (new_height, new_width))
 
-    total_time = 0.0
+    start_ev = torch.cuda.Event(enable_timing=True)
+    end_ev = torch.cuda.Event(enable_timing=True)
+
+    total_wall_time = 0.0
+    total_gpu_time = 0.0
     mem_records = []
     for image_name in tqdm(image_names):
         lr = Image.open(image_name).convert('RGB')
@@ -191,15 +201,21 @@ if __name__ == "__main__":
 
         lr_scale = lr.resize((int(ori_width*args.upscale), int(ori_height*args.upscale)))
         pixel_values = tensor_transforms(lr).unsqueeze(0).to(args.device, dtype=weight_dtype)
-        
-        start_time = time.time()
+
         torch.cuda.reset_peak_memory_stats()
+        wall_start = time.time()
+        start_ev.record()
         image = main(args, pixel_values, (new_height, new_width))
+        end_ev.record()
         torch.cuda.synchronize()
-        end_time = time.time()
+        wall_end = time.time()
+
+        gpu_time = start_ev.elapsed_time(end_ev) / 1000
+        wall_time = wall_end - wall_start
         peak_mem = torch.cuda.max_memory_allocated() / 1024**2
-        image_pil_image = transforms.ToPILImage()(image.cpu() / 2 + 0.5)      
-        total_time += (end_time - start_time)
+        image_pil_image = transforms.ToPILImage()(image.cpu() / 2 + 0.5)
+        total_gpu_time += gpu_time
+        total_wall_time += wall_time
         mem_records.append(peak_mem)
         if resize_flag:
             image_pil_image = image_pil_image.resize((int(ori_width*args.upscale), int(ori_height*args.upscale)))
@@ -216,7 +232,8 @@ if __name__ == "__main__":
     param_cnt = sum(p.numel() for p in transformer.transformer_blocks.parameters() )
     mem_arr = np.array(mem_records)
     print("#Param.", param_cnt/1e6, "M")
-    print(f"Average time: {total_time / datalen:.4f} sec/image")
+    print(f"Average GPU  time: {total_gpu_time / datalen:.4f} sec/image")
+    print(f"Average Wall time: {total_wall_time / datalen:.4f} sec/image")
     print(f"Peak mem  avg: {np.mean(mem_arr):.0f} MB")
     print(f"Peak mem  max: {np.max(mem_arr):.0f} MB")
 

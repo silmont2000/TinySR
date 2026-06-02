@@ -10,16 +10,24 @@ DEFAULT_TIMESTEP = 1000
 # Pyramid architecture (shared by training & validation)
 DEFAULT_PYRAMID_CONFIG = PyramidArchConfig(
     p_states=(
-        PStateSpec(3, 1536, 8),
+        PStateSpec(3, 1536, 16),
         PStateSpec(4, 1536, 16),
         PStateSpec(5, 1536, 32),
         # PStateSpec(num_blocks=4, dim=768,  grid_hw=8),
         # PStateSpec(num_blocks=4, dim=1152, grid_hw=16),
         # PStateSpec(num_blocks=4, dim=1536, grid_hw=32),
     ),
-    sample_size=16,
+    sample_size=32,
     upsample_mode="bilinear",
 )
+# DEFAULT_PYRAMID_CONFIG = PyramidArchConfig(
+#     p_states=(
+#         PStateSpec(7, 1536, 16),   # 5 blocks, 计算在 256px 等效分辨率
+#         PStateSpec(5, 1536, 32),   # 0 block, 仅用于 unpatchify 出 512px
+#     ),
+#     sample_size=32,      #64*8=512
+#     upsample_mode="bilinear",
+# )
 
 # LoRA
 LORA_R = 64
@@ -28,7 +36,7 @@ LORA_TARGET_MODULES = [
     "proj", "linear", "linear_1", "linear_2", "net.2",
 ]
 
-SMOKE_RANK_PATTERN = {"p_states.0": 16, "p_states.1": 32, "p_states.2": 64}
+SMOKE_RANK_PATTERN = {"p_states.0": 64, "p_states.1": 64, "p_states.2": 64}
 VALIDATE_RANK_PATTERN = SMOKE_RANK_PATTERN
 
 
