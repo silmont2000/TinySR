@@ -166,51 +166,6 @@ def _chunked_feed_forward(ff: nn.Module, hidden_states: torch.Tensor, chunk_dim:
     )
     return ff_output
 
-# Efficient implementation equivalent to the following:
-def scaled_dot_product_attention(Q, K, V, attn_mask=None, dropout_p=0.0, is_causal=False):
-    """
-    优化的多头注意力实现，性能接近F.scaled_dot_product_attention
-    
-    参数:
-        Q: 查询张量 [batch_size, num_heads, seq_len, head_dim]
-        K: 键张量 [batch_size, num_heads, seq_len, head_dim]
-        V: 值张量 [batch_size, num_heads, seq_len, head_dim]
-        attn_mask: 可选掩码 [batch_size, num_heads, seq_len, seq_len]
-        dropout_p: dropout概率
-        
-    返回:
-        注意力输出张量 [batch_size, num_heads, seq_len, head_dim]
-    """
-    # 确保内存布局连续
-    Q, K, V = Q.contiguous(), K.contiguous(), V.contiguous()
-    
-    # 缩放因子
-    scale = 1.0 / (Q.size(-1) ** 0.5)
-    
-    # 计算注意力分数 (更高效的矩阵乘法顺序)
-    # QK^T: [b, h, q_len, k_len]
-    attn = torch.bmm(Q.view(-1, *Q.shape[-2:]),  # [b*h, q_len, d]
-                K.view(-1, *K.shape[-2:]).transpose(-2, -1)  # [b*h, d, k_len]
-            ) * scale
-    
-    # 应用注意力掩码
-    if attn_mask is not None:
-        attn += attn_mask.view(-1, *attn_mask.shape[-2:])
-    
-    # 计算注意力权重
-    attn_weights = F.softmax(attn, dim=-1)
-    
-    # 应用dropout
-    if dropout_p > 0.0:
-        attn_weights = F.dropout(attn_weights, p=dropout_p)
-    
-    # 加权求和
-    output = torch.bmm(attn_weights,  # [b*h, q_len, k_len]
-                      V.view(-1, *V.shape[-2:]))  # [b*h, k_len, d]
-    
-    # 恢复原始形状
-    return output.view(*Q.shape)
-
 class JointAttnProcessor2_0:
     """Attention processor used typically in processing the SD3-like self-attention projections."""
 
@@ -362,8 +317,59 @@ class JointTransformerBlock(nn.Module):
         self._chunk_size = chunk_size
         self._chunk_dim = dim
 
+    def _forward_body(
+        self, hidden_states: torch.FloatTensor,
+        norm_hidden_states: torch.FloatTensor,
+        return_qkv: bool = False,
+    ):
+        _q = _k = _v = None
+        if  return_qkv:
+            batch_size = norm_hidden_states.shape[0]
+            query = self.attn.to_q(norm_hidden_states)
+            key = self.attn.to_k(norm_hidden_states)
+            value = self.attn.to_v(norm_hidden_states)
+            inner_dim = key.shape[-1]
+            head_dim = inner_dim // self.attn.heads
+
+            q = query.view(batch_size, -1, self.attn.heads, head_dim).transpose(1, 2)
+            k = key.view(batch_size, -1, self.attn.heads, head_dim).transpose(1, 2)
+            v = value.view(batch_size, -1, self.attn.heads, head_dim).transpose(1, 2)
+
+            attn_output = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=0.0, is_causal=False)
+
+
+            _q, _k, _v = q, k, v
+            attn_output = attn_output.transpose(1, 2).reshape(
+                batch_size, -1, self.attn.heads * head_dim)
+            attn_output = attn_output.to(query.dtype)
+            attn_output = self.attn.to_out[0](attn_output)
+            attn_output = self.attn.to_out[1](attn_output)
+        else:
+            attn_output = self.attn(
+                hidden_states=norm_hidden_states
+            )
+
+        attn_output = self.gate_msa.unsqueeze(1) * attn_output
+        hidden_states = hidden_states + attn_output
+
+        norm_hidden_states = self.norm2(hidden_states)
+        norm_hidden_states = norm_hidden_states * (1 + self.scale_mlp[:, None]) + self.shift_mlp[:, None]
+
+        if self._chunk_size is not None:
+            ff_output = _chunked_feed_forward(self.ff, norm_hidden_states, self._chunk_dim, self._chunk_size)
+        else:
+            ff_output = self.ff(norm_hidden_states)
+        ff_output = self.gate_mlp.unsqueeze(1) * ff_output
+        hidden_states = hidden_states + ff_output
+
+        if return_qkv:
+            return hidden_states, _q, _k, _v
+        return hidden_states
+
     def forward(
-        self, hidden_states: torch.FloatTensor, temb: torch.FloatTensor
+        self, hidden_states: torch.FloatTensor, temb: torch.FloatTensor,
+        return_qkv: bool = False,
     ):
         if self.training:
             norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp, scale_msa, shift_msa = self.norm1(hidden_states, emb=temb)
@@ -386,53 +392,17 @@ class JointTransformerBlock(nn.Module):
             print("del self.norm1")
         else:
             norm_hidden_states = self.norm(hidden_states) * (1 + self.scale_msa[:, None]) + self.shift_msa[:, None]
-        
-        # Attention.
-        attn_output = self.attn(
-            hidden_states=norm_hidden_states
-        )
-        # Process attention outputs for the `hidden_states`.
-        attn_output = self.gate_msa.unsqueeze(1) * attn_output
-        hidden_states = hidden_states + attn_output
 
-        norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = norm_hidden_states * (1 + self.scale_mlp[:, None]) + self.shift_mlp[:, None]
-
-        if self._chunk_size is not None:
-            # "feed_forward_chunk_size" can be used to save memory
-            ff_output = _chunked_feed_forward(self.ff, norm_hidden_states, self._chunk_dim, self._chunk_size)
-        else:
-            ff_output = self.ff(norm_hidden_states)
-        ff_output = self.gate_mlp.unsqueeze(1) * ff_output
-        hidden_states = hidden_states + ff_output
-
-        return hidden_states
+        return self._forward_body(hidden_states, norm_hidden_states,
+                                  return_qkv)
 
     def forward_(
-        self, hidden_states: torch.FloatTensor
+        self, hidden_states: torch.FloatTensor,
+        return_qkv: bool = False,
     ):
         norm_hidden_states = self.norm(hidden_states) * (1 + self.scale_msa[:, None]) + self.shift_msa[:, None]
-        
-        # Attention.
-        attn_output = self.attn(
-            hidden_states=norm_hidden_states
-        )
-        # Process attention outputs for the `hidden_states`.
-        attn_output = self.gate_msa.unsqueeze(1) * attn_output
-        hidden_states = hidden_states + attn_output
-
-        norm_hidden_states = self.norm2(hidden_states)
-        norm_hidden_states = norm_hidden_states * (1 + self.scale_mlp[:, None]) + self.shift_mlp[:, None]
-
-        if self._chunk_size is not None:
-            # "feed_forward_chunk_size" can be used to save memory
-            ff_output = _chunked_feed_forward(self.ff, norm_hidden_states, self._chunk_dim, self._chunk_size)
-        else:
-            ff_output = self.ff(norm_hidden_states)
-        ff_output = self.gate_mlp.unsqueeze(1) * ff_output
-        hidden_states = hidden_states + ff_output
-
-        return hidden_states
+        return self._forward_body(hidden_states, norm_hidden_states,
+                                   return_qkv)
 
 class FeedForward(nn.Module):
     r"""

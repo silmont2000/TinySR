@@ -24,20 +24,29 @@ class SmokeDataset(Dataset):
     """5-image smoke test dataset, same format as smoke_overfit.py."""
     def __init__(self, base="dataset/smoke"):
         self.files = sorted(os.listdir(os.path.join(base, "latent_stu")))
-        self.vae_dir = os.path.join(base, "vae_stu_lr_256")
+        self.vae_dir = os.path.join(base, "vae_stu")
         self.stu_dir = os.path.join(base, "latent_stu")
         self.pool_dir = os.path.join(base, "pool_embeds")
+        self.teacher_32_dir = os.path.join(base, "latent_stu_teacher_32")
+        self.teacher_32_qkv_dir = os.path.join(base, "latent_stu_teacher_32_qkv_12")
 
     def __len__(self):
         return len(self.files)
 
     def __getitem__(self, idx):
         f = self.files[idx]
-        return {
+        result = {
             "vae_stu": torch.load(os.path.join(self.vae_dir, f), map_location="cpu").squeeze(0),
             "latent_stu": torch.load(os.path.join(self.stu_dir, f), map_location="cpu").squeeze(0),
             "pooled_prompt_embeds_input": torch.load(os.path.join(self.pool_dir, f), map_location="cpu").squeeze(0),
         }
+        teacher_32_path = os.path.join(self.teacher_32_dir, f)
+        if os.path.exists(teacher_32_path):
+            result["latent_stu_teacher_32"] = torch.load(teacher_32_path, map_location="cpu")
+        qkv_path = os.path.join(self.teacher_32_qkv_dir, f)
+        if os.path.exists(qkv_path):
+            result["latent_stu_teacher_32_qkv"] = torch.load(qkv_path, map_location="cpu")
+        return result
 
 
 class Real_ESRGAN_Dataset(Dataset):
@@ -95,16 +104,12 @@ class Real_ESRGAN_Dataset(Dataset):
     def __getitem__(self, idx):
 
         latent_stu = torch.load(self.hr_latent_name[idx].replace("latent_hr", "latent_stu"), map_location=self.device).squeeze() 
-        vae_stu = torch.load(self.hr_latent_name[idx].replace("latent_hr", "vae_stu_lr_256"), map_location=self.device).squeeze()
+        # vae_stu = torch.load(self.hr_latent_name[idx].replace("latent_hr", "vae_stu_lr_256"), map_location=self.device).squeeze()
+        vae_stu = torch.load(self.hr_latent_name[idx].replace("latent_hr", "vae_stu"), map_location=self.device).squeeze()
         pooled_prompt_embeds = torch.load(self.pool_prompt_embeds_name[idx], map_location=self.device).squeeze()
 
         if self.first_stage == True:
             result = {
-                # "img_name": img_names,
-                # "lr_img": lr_img,
-                # "hr_img": hr_img,
-                # "latent_hr": latent_hr,
-                # "prompt_embeds_input": prompt_embeds,
                 "latent_stu": latent_stu,
                 "vae_stu": vae_stu,
                 "pooled_prompt_embeds_input": pooled_prompt_embeds,
@@ -121,12 +126,18 @@ class Real_ESRGAN_Dataset(Dataset):
                 "lr_img": lr_img,
                 "hr_img": hr_img,
                 "latent_hr": latent_hr,
-                # "prompt_embeds_input": prompt_embeds,
                 "latent_stu": latent_stu,
                 "vae_stu": vae_stu,
                 "pooled_prompt_embeds_input": pooled_prompt_embeds,
             }
-            
+
+        teacher_32_path = self.hr_latent_name[idx].replace("latent_hr", "latent_stu_teacher_32")
+        if os.path.exists(teacher_32_path):
+            result["latent_stu_teacher_32"] = torch.load(teacher_32_path, map_location=self.device)
+        qkv_path = self.hr_latent_name[idx].replace("latent_hr", "latent_stu_teacher_32_qkv_12")
+        if os.path.exists(qkv_path):
+            result["latent_stu_teacher_32_qkv"] = torch.load(qkv_path, map_location=self.device)
+
         return result
 
     

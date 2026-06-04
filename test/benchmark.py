@@ -69,7 +69,7 @@ def main(args, pixel_values):
         model_input = model_input.to(args.device, dtype=weight_dtype)
 
         if args.model=='p':
-            output, pre_last = transformer(
+            output, pre_last, _ = transformer(
                 hidden_states=model_input, timestep=timesteps,
                 pooled_projections=pooled_prompt_embeds, return_dict=False,
             )

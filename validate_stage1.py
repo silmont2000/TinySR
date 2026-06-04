@@ -99,13 +99,14 @@ def main(args, pixel_values):
         model_input = model_input.to(args.device, dtype=weight_dtype)
 
         # Predict
-        output, pre_last = transformer(
+        output, pre_last, _ = transformer(
             hidden_states=model_input, timestep=timesteps,
             pooled_projections=pooled_prompt_embeds, return_dict=False,
         )
         last_grid_hw = transformer.pyramid_config.p_states[-1].grid_hw
         if pyramid_loss_type == "a":
-            scale_factor = last_grid_hw // transformer.pyramid_config.p_states[0].grid_hw
+            scale_factor = 64 // pc.sample_size
+            # scale_factor = last_grid_hw // transformer.pyramid_config.p_states[0].grid_hw
             input_up = tfF.interpolate(model_input, scale_factor=scale_factor,
                                         mode='bilinear', align_corners=False)
             denoised = input_up - output

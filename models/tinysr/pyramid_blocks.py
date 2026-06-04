@@ -123,7 +123,23 @@ class ConvUpsample(nn.Module):
         x = x.permute(0, 2, 3, 1).flatten(1, 2)
         return x
 
+class BilinearResidualUpsample(nn.Module):
+    def __init__(self, dim: int):
+        super().__init__()
+        self.conv = nn.Conv2d(dim, dim, kernel_size=3, padding=1)
+        # 初始化 conv.weight ≈ 0，使初始状态 ≈ 纯双线性插值
+        nn.init.zeros_(self.conv.weight)
+        nn.init.zeros_(self.conv.bias)
 
+    def forward(self, x: torch.Tensor, grid_hw: int) -> torch.Tensor:
+        B, N, D = x.shape
+        assert N == grid_hw * grid_hw, f"{N} != {grid_hw}^2"
+        x = x.reshape(B, grid_hw, grid_hw, D).permute(0, 3, 1, 2)  # BDHW
+        x_up = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+        x_res = F.gelu(self.conv(x_up))
+        x = x_up + x_res
+        return x.permute(0, 2, 3, 1).flatten(1, 2)
+        
 class LatentUpsample(nn.Module):
     """Latent-space upsampling: 16-channel, supports bilinear or conv.
     

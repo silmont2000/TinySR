@@ -683,7 +683,7 @@ def main(args):
                     model_input = batch["vae_stu"]
                     latent_tea = batch["latent_stu"]
                        
-                    model_pred,_ = transformer(
+                    model_pred, _,_ = transformer(
                         hidden_states=model_input,
                         timestep=timesteps,
                         pooled_projections=pooled_prompt_embeds,

@@ -13,11 +13,13 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.embeddings import CombinedTimestepTextProjEmbeddings
 from diffusers.models.transformers.transformer_2d import Transformer2DModelOutput
 from diffusers.utils import USE_PEFT_BACKEND, logging, scale_lora_layers, unscale_lora_layers
+from diffusers.models.embeddings import PatchEmbed
 
-from models.tinysr.tinysd3 import PatchEmbed, AdaLayerNormContinuous
+# from models.tinysr.tinysd3 import PatchEmbed
+from models.tinysr.tinysd3 import AdaLayerNormContinuous
 from models.tinysr.tinysd3block import JointTransformerBlock
 from models.tinysr.pyramid_config import PyramidArchConfig, PStateSpec
-from models.tinysr.pyramid_blocks import DownProj, BilinearUpsample, DimProj, Bridge, ConvUpsample
+from models.tinysr.pyramid_blocks import DownProj, BilinearUpsample, DimProj, Bridge, ConvUpsample,BilinearResidualUpsample
 
 logger = logging.get_logger(__name__)
 
@@ -94,7 +96,8 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
                 dim_proj = None
                 if spec.grid_hw != next_spec.grid_hw:
                     if pc.upsample_mode == "conv":
-                        upsample = ConvUpsample(dim=spec.dim)
+                        # upsample = ConvUpsample(dim=spec.dim)
+                        upsample = BilinearResidualUpsample(dim=spec.dim)
                     else:
                         upsample = BilinearUpsample(dim=spec.dim)
                 if spec.dim != next_spec.dim:
@@ -228,6 +231,11 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
             h = self.down_proj(h, pc.patch_embed_grid)
 
         pre_last_tokens = None
+        h_after_bridge = None
+        self._distill_q = None
+        self._distill_k = None
+        self._distill_v = None
+        self._distill_h = None
 
         for i, p_state in enumerate(self.p_states):
             spec = pc.p_states[i]
@@ -236,13 +244,24 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
             if i == len(self.p_states) - 1:
                 pre_last_tokens = h
 
-            for block in p_state.blocks:
-                h = block(hidden_states=h, temb=temb_i)
+            for j, block in enumerate(p_state.blocks):
+                # return_qkv = (self.training and i == 1 and j == len(p_state.blocks) - 1)
+                return_qkv = (self.training and i == 1 and j == 0)
+                if return_qkv:
+                    h, q, k, v = block(
+                        hidden_states=h, temb=temb_i, return_qkv=True)
+                    self._distill_q = q
+                    self._distill_k = k
+                    self._distill_v = v
+                    self._distill_h = h
+                else:
+                    h = block(hidden_states=h, temb=temb_i)
 
             if i < len(self.p_states) - 1:
                 bridge = p_state.bridge
                 if bridge is not None:
                     h = bridge(h, spec.grid_hw)
+                h_after_bridge = h
 
         h, scale, shift = self.norm_out(h, self.temb[:, :self.final_dim])
 
@@ -254,8 +273,8 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
             unscale_lora_layers(self, lora_scale)
 
         if not return_dict:
-            return (output, pre_last_tokens)
-        return Transformer2DModelOutput(sample=output), pre_last_tokens
+            return (output, pre_last_tokens, h_after_bridge)
+        return Transformer2DModelOutput(sample=output), pre_last_tokens, h_after_bridge
 
     # ------------------------------------------------------------------
     #   Weight loading from flat (pruned) 12-block checkpoint

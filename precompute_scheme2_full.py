@@ -9,14 +9,19 @@ from tqdm import tqdm
 from models.tinysr.tinysd3 import TinySD3Transformer2DModel
 
 CKPT = "checkpoint/tinybackbone/prune-12-merge-tinysr"
-GRIDS = [8, 16]
+BLOCK_TO_GRID = {
+    5: 32,
+}
+GRIDS = list(BLOCK_TO_GRID.values())
 BLOCKS_PER_SNAPSHOT = 4
-OUT_SUBDIRS = {8: "latent_stu_teacher_8", 16: "latent_stu_teacher_16"}
+OUT_SUBDIRS = {8: "latent_stu_teacher_8", 16: "latent_stu_teacher_16", 32: "latent_stu_teacher_32"}
+ATTN_SUBDIR = "latent_stu_teacher_32_attn"
+VR_SUBDIR = "latent_stu_teacher_32_vr"
 
 DATASETS = [
-    "/data/disk1/dlw/datasets/CAD_V100_20260209_backup/datasets/DIV2K/DIV2K_train_LRx4_Real-ESRGAN_Seesr_v2",
-    "/data/disk1/dlw/datasets/CAD_V100_20260209_backup/datasets/Flickr2K/Flickr2K_LRx4_Real-ESRGAN_Seesr_v2",
-    "/data/disk1/dlw/datasets/CAD_V100_20260209_backup/datasets/FFHQ/FFHQ10K_LRx4_Real-ESRGAN_Seesr_v2",
+ "/data/disk3/xby/tinysr/datasets/CAD_V100_20260209_backup/datasets/DIV2K/DIV2K_train_LRx4_Real-ESRGAN_Seesr_v2",
+  "/data/disk3/xby/tinysr/datasets/CAD_V100_20260209_backup/datasets/Flickr2K/Flickr2K_LRx4_Real-ESRGAN_Seesr_v2",
+  "/data/disk3/xby/tinysr/datasets/CAD_V100_20260209_backup/datasets/FFHQ/FFHQ10K_LRx4_Real-ESRGAN_Seesr_v2",
 ]
 
 
@@ -36,6 +41,7 @@ def unpatchify(noise, grid_hw, patch_size, out_channels):
 
 
 def worker(gpu_id, jobs):
+    torch.cuda.set_device(gpu_id)
     device = f"cuda:{gpu_id}"
     dtype = torch.float16
 
@@ -52,7 +58,9 @@ def worker(gpu_id, jobs):
             continue
 
         all_exist = all(os.path.exists(os.path.join(base_path, OUT_SUBDIRS[hw], fname)) for hw in GRIDS)
-        if all_exist:
+        attn_exist = os.path.exists(os.path.join(base_path, ATTN_SUBDIR, fname))
+        vr_exist = os.path.exists(os.path.join(base_path, VR_SUBDIR, fname))
+        if all_exist and attn_exist and vr_exist:
             continue
 
         vae = torch.load(vae_path, map_location=device).to(dtype)
@@ -73,39 +81,66 @@ def worker(gpu_id, jobs):
             out_channels = teacher.proj_out.out_features // (patch_size * patch_size)
 
             targets = {}
+            target_attn = {}
+            target_vr = {}
             for block_idx, block in enumerate(teacher.transformer_blocks):
+                need_qkv = block_idx in BLOCK_TO_GRID
                 if block.initialized:
-                    h = block.forward_(hidden_states=h)
+                    if need_qkv:
+                        h, attn_w, vr_w = block.forward_(hidden_states=h, return_attn_qkv=True)
+                    else:
+                        h = block.forward_(hidden_states=h)
                 else:
-                    h = block(hidden_states=h, temb=temb)
+                    if need_qkv:
+                        h, attn_w, vr_w = block(hidden_states=h, temb=temb, return_attn_qkv=True)
+                    else:
+                        h = block(hidden_states=h, temb=temb)
 
-                if (block_idx + 1) % BLOCKS_PER_SNAPSHOT == 0:
-                    stage_idx = block_idx // BLOCKS_PER_SNAPSHOT
-                    if stage_idx >= len(GRIDS):
-                        continue
-                    target_hw = GRIDS[stage_idx]
-                    tokens_pooled = pool_tokens(h, source_grid, target_hw)
-                    noise = teacher.proj_out(tokens_pooled)
-                    noise_latent = unpatchify(noise, target_hw, patch_size, out_channels)
-                    input_pooled = F.avg_pool2d(vae, kernel_size=source_grid // target_hw)
-                    refined = input_pooled - noise_latent
-                    targets[target_hw] = refined.squeeze(0).cpu().half()
+                if block_idx in BLOCK_TO_GRID:
+                    target_hw = BLOCK_TO_GRID[block_idx]
+                    # targets[target_hw] = h.squeeze(0).cpu().half()
+                    target_attn[target_hw] = attn_w.squeeze(0).cpu().half()
+                    target_vr[target_hw] = vr_w.squeeze(0).cpu().half()
+                    if len(BLOCK_TO_GRID)==len(target_attn):
+                        break
 
-            for hw, tgt in targets.items():
-                torch.save(tgt, os.path.join(base_path, OUT_SUBDIRS[hw], fname))
+
+                # if block_idx in BLOCK_TO_GRID:
+                #     target_hw = BLOCK_TO_GRID[block_idx]
+                #     stage_idx = block_idx // BLOCKS_PER_SNAPSHOT
+                #     if stage_idx >= len(GRIDS):
+                #         continue
+                #     # target_hw = GRIDS[stage_idx]
+                #     tokens_pooled = pool_tokens(h, source_grid, target_hw)
+                #     noise = teacher.proj_out(tokens_pooled)
+                #     noise_latent = unpatchify(noise, target_hw, patch_size, out_channels)
+                #     input_pooled = F.avg_pool2d(vae, kernel_size=source_grid // target_hw)
+                #     refined = input_pooled - noise_latent
+                #     targets[target_hw] = refined.squeeze(0).cpu().half()
+
+            # for hw, tgt in targets.items():
+            #     torch.save(tgt, os.path.join(base_path, OUT_SUBDIRS[hw], fname))
+            for hw, attn in target_attn.items():
+                torch.save(attn, os.path.join(base_path, ATTN_SUBDIR, fname))
+            for hw, vr in target_vr.items():
+                torch.save(vr, os.path.join(base_path, VR_SUBDIR, fname))
 
     del teacher
     torch.cuda.empty_cache()
 
 
 def main():
-    gpu_ids = [1, 2, 3, 5, 6]
+    gpu_ids = [2,7]
     print(f"Using GPUs: {gpu_ids}")
 
     # Create target directories
     for base_path in DATASETS:
         for hw in GRIDS:
             d = os.path.join(base_path, OUT_SUBDIRS[hw])
+            os.makedirs(d, exist_ok=True)
+            print(f"  mkdir {d}")
+        for subdir in [ATTN_SUBDIR, VR_SUBDIR]:
+            d = os.path.join(base_path, subdir)
             os.makedirs(d, exist_ok=True)
             print(f"  mkdir {d}")
     print()
@@ -118,7 +153,9 @@ def main():
             continue
         for fname in sorted(os.listdir(vae_dir)):
             # Check if any target is missing
-            need = any(not os.path.exists(os.path.join(base_path, OUT_SUBDIRS[hw], fname)) for hw in GRIDS)
+            need = any(not os.path.exists(os.path.join(base_path, OUT_SUBDIRS[hw], fname)) for hw in GRIDS) \
+                or not os.path.exists(os.path.join(base_path, ATTN_SUBDIR, fname)) \
+                or not os.path.exists(os.path.join(base_path, VR_SUBDIR, fname))
             if need:
                 all_jobs.append((base_path, fname))
 

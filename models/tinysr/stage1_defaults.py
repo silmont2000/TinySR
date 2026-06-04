@@ -7,25 +7,24 @@ VAE_CKPT = "checkpoint/vae/separable"
 POOL_EMBED_PATH = "dataset/default/pool_embeds.pt"
 DEFAULT_TIMESTEP = 1000
 
-# Pyramid architecture (shared by training & validation)
-DEFAULT_PYRAMID_CONFIG = PyramidArchConfig(
-    p_states=(
-        PStateSpec(3, 1536, 16),
-        PStateSpec(4, 1536, 16),
-        PStateSpec(5, 1536, 32),
         # PStateSpec(num_blocks=4, dim=768,  grid_hw=8),
         # PStateSpec(num_blocks=4, dim=1152, grid_hw=16),
         # PStateSpec(num_blocks=4, dim=1536, grid_hw=32),
+# Pyramid architecture (shared by training & validation)
+DEFAULT_PYRAMID_CONFIG = PyramidArchConfig(
+    p_states=(
+        PStateSpec(7, 1536, 16),
+        PStateSpec(5, 1536, 32),
     ),
-    sample_size=32,
-    upsample_mode="bilinear",
+    sample_size=64,
+    upsample_mode="conv",
 )
 # DEFAULT_PYRAMID_CONFIG = PyramidArchConfig(
 #     p_states=(
 #         PStateSpec(7, 1536, 16),   # 5 blocks, 计算在 256px 等效分辨率
 #         PStateSpec(5, 1536, 32),   # 0 block, 仅用于 unpatchify 出 512px
 #     ),
-#     sample_size=32,      #64*8=512
+#     sample_size=32,      #64*8=512， 32*8=256
 #     upsample_mode="bilinear",
 # )
 

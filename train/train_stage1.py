@@ -268,6 +268,26 @@ def parse_args(input_args=None):
         help="a: upsample input, subtract noise | b: proj_out(pre_last_tokens) - noise",
     )
     parser.add_argument(
+        "--cos_loss_weight", type=float, default=0.0,
+        help="Weight for cosine similarity loss between student bridge output and teacher layer-5 output. 0 = disabled.",
+    )
+    parser.add_argument(
+        "--attn_loss_weight", type=float, default=0.0,
+        help="Weight for attention-distribution KL loss (L_AT). Requires precomputed latent_stu_teacher_32_attn/.",
+    )
+    parser.add_argument(
+        "--vr_loss_weight", type=float, default=0.0,
+        help="Weight for value-relation KL loss (L_VR). Requires precomputed latent_stu_teacher_32_vr/.",
+    )
+    parser.add_argument(
+        "--attn_temperature", type=float, default=1.0,
+        help="Temperature for softmax in attention/VR KL loss. >1 softens distribution, stabilizes gradients.",
+    )
+    parser.add_argument(
+        "--cos_qkv_loss_weight", type=float, default=0.0,
+        help="Weight for cosine-similarity loss on Q/K/V projections (alternative to attn/vr KL). More stable.",
+    )
+    parser.add_argument(
         "--weighting_scheme", type=str, default="logit_normal", choices=["sigma_sqrt", "logit_normal", "mode"]
     )
     parser.add_argument("--logit_mean", type=float, default=0.0)
@@ -605,22 +625,34 @@ def main(args):
     def collate_fn(examples):
         latent_stu = torch.stack([e["latent_stu"] for e in examples])
         vae_stu = torch.stack([e["vae_stu"] for e in examples])
-        latent_hr = torch.stack([e["latent_hr"] for e in examples])
         batch = {
-            "latent_hr": latent_hr.to(dtype=weight_dtype, device=accelerator.device),
             "latent_stu": latent_stu.to(dtype=weight_dtype, device=accelerator.device),
             "vae_stu": vae_stu.to(dtype=weight_dtype, device=accelerator.device),
         }
         if "pooled_prompt_embeds_input" in examples[0]:
             pool = torch.stack([e["pooled_prompt_embeds_input"] for e in examples])
             batch["pool"] = pool.to(dtype=weight_dtype, device=accelerator.device)
+        if "latent_stu_teacher_32" in examples[0]:
+            teacher_32 = torch.stack([e["latent_stu_teacher_32"] for e in examples])
+            batch["latent_stu_teacher_32"] = teacher_32.to(dtype=weight_dtype, device=accelerator.device)
+        if "latent_stu_teacher_32_qkv" in examples[0]:
+            qkv_batch = [e["latent_stu_teacher_32_qkv"] for e in examples]
+            try:
+                batch["teacher_q"] = torch.stack([d["q"] for d in qkv_batch]).to(dtype=weight_dtype, device=accelerator.device)
+                batch["teacher_k"] = torch.stack([d["k"] for d in qkv_batch]).to(dtype=weight_dtype, device=accelerator.device)
+                batch["teacher_v"] = torch.stack([d["v"] for d in qkv_batch]).to(dtype=weight_dtype, device=accelerator.device)
+            except KeyError as e:
+                logger.warning(f"QKV dict missing key {e}, skipping attn/vr loss for this batch")
+                batch.pop("teacher_q", None)
+                batch.pop("teacher_k", None)
+                batch.pop("teacher_v", None)
         return batch
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
         shuffle=True,
-        drop_last=True,
+        drop_last=not args.smoke,
         collate_fn=collate_fn,
         num_workers=args.dataloader_num_workers,
     )
@@ -759,12 +791,11 @@ def main(args):
         wandb_config["pyramid_config"] = {
             "pyramid_config": pc.to_dict(),
             "lora_r": LORA_R,
-            "rank_pattern": SMOKE_RANK_PATTERN,
+            "lora_rank_pattern": SMOKE_RANK_PATTERN,
             "scheme": 2,
             "loss_type": pyramid_loss_type,
             "num_processes": accelerator.num_processes,
         }
-        wandb_config["lora_rank_pattern"] = SMOKE_RANK_PATTERN
         accelerator.init_trackers(tracker_name, config=wandb_config,
                                   init_kwargs={"wandb": wandb_kwargs})
         if args.log_code:
@@ -870,20 +901,21 @@ def main(args):
                     pool_emb = pooled_prompt_embeds_default.repeat(current_bs, 1)
 
                 with autocast_ctx:
-                    # latent_teacher = batch["latent_stu"]
-                    latent_teacher = batch["latent_hr"]
+                    latent_teacher = batch["latent_stu"]
+                    # latent_teacher = batch["latent_hr"]
                     model_input = batch["vae_stu"]
                     timesteps = torch.tensor(
                         [DEFAULT_TIMESTEP], device=accelerator.device)
 
-                    out, pre_last = transformer(
+                    out, pre_last, h_after_bridge = transformer(
                         hidden_states=model_input,
                         timestep=timesteps,
                         pooled_projections=pool_emb,
                         return_dict=False,
                     )
                     if pyramid_loss_type == "a":
-                        scale_factor = pc.p_states[-1].grid_hw // pc.p_states[0].grid_hw
+                        scale_factor = 64 // pc.sample_size
+                        # scale_factor = pc.p_states[-1].grid_hw // pc.p_states[0].grid_hw
                         input_up = F.interpolate(model_input.float(
                         ), scale_factor=scale_factor, mode='bilinear', align_corners=False)
                         denoised = input_up - out.float()
@@ -896,6 +928,103 @@ def main(args):
                         denoised = latent_before.float() - out.float()
                         loss_g = F.l1_loss(
                             denoised, latent_teacher.float().detach())
+                    loss_l1 = loss_g.detach().item()
+
+
+                    # hidden cosine_similarity
+                    cos_loss = 0.0
+                    if args.cos_loss_weight > 0 and "latent_stu_teacher_32" in batch:
+                        unwrapped_for_cos = accelerator.unwrap_model(transformer)
+                        if hasattr(unwrapped_for_cos, '_distill_h') and unwrapped_for_cos._distill_h is not None:
+                            teacher_32 = batch["latent_stu_teacher_32"].float()
+                            student_h = unwrapped_for_cos._distill_h.float()
+                            cos_sim = F.cosine_similarity(student_h, teacher_32, dim=-1)
+
+                            loss_cos = args.cos_loss_weight * (1.0 - cos_sim.mean())
+                            # loss_g = loss_g + loss_cos
+                            cos_loss = loss_cos.detach().item()
+
+
+                    attn_loss = 0.0
+                    vr_loss = 0.0
+                    need_distill = (args.attn_loss_weight > 0 and "teacher_q" in batch) \
+                        or (args.vr_loss_weight > 0 and "teacher_v" in batch) \
+                        or (args.cos_qkv_loss_weight > 0 and "teacher_q" in batch)
+                    if need_distill:
+                        unwrapped = accelerator.unwrap_model(transformer)
+                    else:
+                        unwrapped = None
+
+                    if need_distill and args.attn_loss_weight > 0 \
+                            and hasattr(unwrapped, '_distill_q') and unwrapped._distill_q is not None:
+                        teacher_q = batch["teacher_q"].float()
+                        teacher_k = batch["teacher_k"].float()
+                        student_q = unwrapped._distill_q.float()
+                        student_k = unwrapped._distill_k.float()
+                        head_dim = teacher_q.shape[-1]
+                        scale = 1.0 / (head_dim ** 0.5)
+                        tau = args.attn_temperature
+                        num_heads = teacher_q.shape[1]
+                        chunk = min(4, num_heads)
+                        loss_at = 0.0
+                        for h in range(0, num_heads, chunk):
+                            h_end = min(h + chunk, num_heads)
+                            t_q = teacher_q[:, h:h_end]
+                            t_k = teacher_k[:, h:h_end]
+                            s_q = student_q[:, h:h_end]
+                            s_k = student_k[:, h:h_end]
+                            t_log = F.log_softmax(
+                                torch.matmul(t_q, t_k.transpose(-1, -2)) * scale / tau, dim=-1)
+                            s_log = F.log_softmax(
+                                torch.matmul(s_q, s_k.transpose(-1, -2)) * scale / tau, dim=-1)
+                            kl = F.kl_div(s_log, t_log, reduction='none', log_target=True)
+                            loss_at += kl.sum(dim=-1).mean() \
+                                * (h_end - h) / num_heads
+                        loss_at = args.attn_loss_weight * loss_at
+                        # loss_g = loss_g + loss_at
+                        attn_loss = loss_at.detach().item()
+
+                    if need_distill and args.vr_loss_weight > 0 \
+                            and hasattr(unwrapped, '_distill_v') and unwrapped._distill_v is not None:
+                        teacher_v = batch["teacher_v"].float()
+                        student_v = unwrapped._distill_v.float()
+                        head_dim = teacher_v.shape[-1]
+                        scale = 1.0 / (head_dim ** 0.5)
+                        tau = args.attn_temperature
+                        num_heads = teacher_v.shape[1]
+                        chunk = min(4, num_heads)
+                        loss_vr = 0.0
+                        for h in range(0, num_heads, chunk):
+                            h_end = min(h + chunk, num_heads)
+                            t_v = teacher_v[:, h:h_end]
+                            s_v = student_v[:, h:h_end]
+                            t_log = F.log_softmax(
+                                torch.matmul(t_v, t_v.transpose(-1, -2)) * scale / tau, dim=-1)
+                            s_log = F.log_softmax(
+                                torch.matmul(s_v, s_v.transpose(-1, -2)) * scale / tau, dim=-1)
+                            kl = F.kl_div(s_log, t_log, reduction='none', log_target=True)
+                            loss_vr += kl.sum(dim=-1).mean() \
+                                * (h_end - h) / num_heads
+                        loss_vr = args.vr_loss_weight * loss_vr
+                        # loss_g = loss_g + loss_vr
+                        vr_loss = loss_vr.detach().item()
+
+                    cos_qkv_loss = 0.0
+                    if args.cos_qkv_loss_weight > 0 \
+                            and hasattr(unwrapped, '_distill_q') and unwrapped._distill_q is not None \
+                            and 'teacher_q' in batch:
+                        teacher_q = batch["teacher_q"].float()
+                        teacher_k = batch["teacher_k"].float()
+                        teacher_v = batch["teacher_v"].float()
+                        student_q = unwrapped._distill_q.float()
+                        student_k = unwrapped._distill_k.float()
+                        student_v = unwrapped._distill_v.float()
+                        loss_q = (1.0 - F.cosine_similarity(student_q, teacher_q, dim=-1)).mean()
+                        loss_k = (1.0 - F.cosine_similarity(student_k, teacher_k, dim=-1)).mean()
+                        loss_v = (1.0 - F.cosine_similarity(student_v, teacher_v, dim=-1)).mean()
+                        loss_cos_qkv = args.cos_qkv_loss_weight * (loss_q + loss_k + loss_v) / 3.0
+                        # loss_g = loss_g + loss_cos_qkv
+                        cos_qkv_loss = loss_cos_qkv.detach().item()
 
                 # backward
                 accelerator.backward(loss_g)
@@ -917,7 +1046,11 @@ def main(args):
                     print("save_ckpt")
                     save_ckpt(step=global_step)
 
-                logs = {"l1_loss": loss_g.detach().item(), "lr": optimizer_g.param_groups[0]["lr"]}
+                logs = {"l1_loss": loss_l1, "loss_total": loss_g.detach().item(), "lr": optimizer_g.param_groups[0]["lr"],
+                        "cos_loss": cos_loss/(args.cos_loss_weight or 1.0),
+                        "attn_loss": attn_loss/(args.attn_loss_weight or 1.0),
+                        "vr_loss": vr_loss/(args.vr_loss_weight or 1.0),
+                        "cos_qkv_loss": cos_qkv_loss/(args.cos_qkv_loss_weight or 1.0)}
                 progress_bar.set_postfix(**logs)
                 if accelerator.is_main_process:
                     accelerator.log(logs, step=global_step)
