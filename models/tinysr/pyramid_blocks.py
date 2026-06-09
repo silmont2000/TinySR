@@ -7,37 +7,61 @@ class DownProj(nn.Module):
     def __init__(self, in_dim: int, out_dim: int, pool_factor: int):
         super().__init__()
         self.pool = nn.AvgPool2d(pool_factor, stride=pool_factor)
+        # self.conv = nn.Conv2d(in_dim, in_dim, kernel_size=3, padding=1)
         self.proj = nn.Linear(in_dim, out_dim)
         with torch.no_grad():
             self.proj.weight[:out_dim, :out_dim] = torch.eye(out_dim)
             self.proj.bias.zero_()
+            # nn.init.zeros_(self.conv.weight)
+            # nn.init.zeros_(self.conv.bias)
 
     def forward(self, x: torch.Tensor, grid_hw: int) -> torch.Tensor:
         B, N, D = x.shape
         H = W = grid_hw
         x = x.reshape(B, H, W, D).permute(0, 3, 1, 2)
         x = self.pool(x)
+        # x = F.gelu(self.conv(x))
+        # x = x + self.conv(x)
         x = x.permute(0, 2, 3, 1).flatten(1, 2)
         x = self.proj(x)
         return x
 
 
 class BilinearUpsample(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, scale_factor: float = 2.0):
         super().__init__()
-        # self.norm = nn.LayerNorm(dim)
         self.proj = nn.Linear(dim, dim)
+        self.scale_factor = scale_factor
         with torch.no_grad():
             self.proj.weight.copy_(torch.eye(dim))
             self.proj.bias.zero_()
 
     def forward(self, x: torch.Tensor, grid_hw: int) -> torch.Tensor:
         B, N, D = x.shape
-        # x = self.proj(self.norm(x))
         x = self.proj(x)
         x = x.reshape(B, grid_hw, grid_hw, D).permute(0, 3, 1, 2)
-        x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
-        x = x.permute(0, 2, 3, 1).flatten(1, 2) # x = torch.einsum('b d h w -> b h w d', x)
+        x = F.interpolate(x, scale_factor=self.scale_factor, mode='bilinear', align_corners=False)
+        x = x.permute(0, 2, 3, 1).flatten(1, 2)
+        return x
+
+
+class BilinearDownsample(nn.Module):
+    def __init__(self, dim: int, scale_factor: float = 0.5):
+        super().__init__()
+        self.norm = nn.LayerNorm(dim)
+        self.proj = nn.Linear(dim, dim)
+        self.scale_factor = scale_factor
+        with torch.no_grad():
+            self.proj.weight.copy_(torch.eye(dim))
+            self.proj.bias.zero_()
+
+    def forward(self, x: torch.Tensor, grid_hw: int) -> torch.Tensor:
+        B, N, D = x.shape
+        x = self.proj(self.norm(x))
+        x = F.gelu(x)
+        x = x.reshape(B, grid_hw, grid_hw, D).permute(0, 3, 1, 2)
+        x = F.interpolate(x, scale_factor=self.scale_factor, mode='bilinear', align_corners=False)
+        x = x.permute(0, 2, 3, 1).flatten(1, 2)
         return x
 
 
@@ -58,14 +82,17 @@ class DimProj(nn.Module):
 
 
 class Bridge(nn.Module):
-    def __init__(self, upsample: nn.Module = None, dim_proj: nn.Module = None):
+    def __init__(self, upsample: nn.Module = None, downsample: nn.Module = None, dim_proj: nn.Module = None):
         super().__init__()
         self.upsample = upsample
+        self.downsample = downsample
         self.dim_proj = dim_proj
 
     def forward(self, x: torch.Tensor, grid_hw: int) -> torch.Tensor:
         if self.upsample is not None:
             x = self.upsample(x, grid_hw)
+        if self.downsample is not None:
+            x = self.downsample(x, grid_hw)
         if self.dim_proj is not None:
             x = self.dim_proj(x)
         return x
@@ -100,10 +127,11 @@ class ConvBlock(nn.Module):
 class ConvUpsample(nn.Module):
     """Convolution-based upsampling, replaces bilinear with ConvTranspose2d.
     Same interface as BilinearUpsample.
-    
-    LayerNorm → Linear(d,d) → reshape 2D → ConvTranspose2d(k, s=2) → flatten."""
-    def __init__(self, dim: int, kernel_size: int = 4, stride: int = 2):
+
+    LayerNorm → Linear(d,d) → reshape 2D → ConvTranspose2d(k, s=scale) → flatten."""
+    def __init__(self, dim: int, scale_factor: int = 2, kernel_size: int = 4):
         super().__init__()
+        stride = scale_factor
         padding = max(0, (kernel_size - stride) // 2)
         output_padding = max(0, stride - kernel_size)
         self.norm = nn.LayerNorm(dim)
@@ -124,18 +152,18 @@ class ConvUpsample(nn.Module):
         return x
 
 class BilinearResidualUpsample(nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, scale_factor: float = 2.0):
         super().__init__()
         self.conv = nn.Conv2d(dim, dim, kernel_size=3, padding=1)
-        # 初始化 conv.weight ≈ 0，使初始状态 ≈ 纯双线性插值
+        self.scale_factor = scale_factor
         nn.init.zeros_(self.conv.weight)
         nn.init.zeros_(self.conv.bias)
 
     def forward(self, x: torch.Tensor, grid_hw: int) -> torch.Tensor:
         B, N, D = x.shape
         assert N == grid_hw * grid_hw, f"{N} != {grid_hw}^2"
-        x = x.reshape(B, grid_hw, grid_hw, D).permute(0, 3, 1, 2)  # BDHW
-        x_up = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+        x = x.reshape(B, grid_hw, grid_hw, D).permute(0, 3, 1, 2)
+        x_up = F.interpolate(x, scale_factor=self.scale_factor, mode='bilinear', align_corners=False)
         x_res = F.gelu(self.conv(x_up))
         x = x_up + x_res
         return x.permute(0, 2, 3, 1).flatten(1, 2)

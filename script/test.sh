@@ -1,7 +1,7 @@
 python test/test_tinysr.py  \
 --pretrained_model_name_or_path="checkpoint/tinybackbone/prune-12-merge-tinysr" \
 --vae_path="checkpoint/vae/separable" \
---lora_dir="/data/disk3/xby/tinysr/checkpoint/train-tinysr/v1/checkpoint-140500" \
+--lora_dir="/data/disk2/xby/TinySR/checkpoint/tinysr" \
 --embedding_dir="dataset/default/" \
 --output_dir="outputs/tinysr_test/" \
 --input_dir="/data/disk2/xby/TinySR/dataset/StableSR_testsets/DrealSRVal_crop128/test_LR" \
@@ -18,3 +18,11 @@ python test/test_tinysr.py  \
 --process_size=512 \
 --mixed_precision=fp16 \
 --align_method=adain
+
+
+# python test/test_tsdsr.py \
+# --pretrained_model_name_or_path="/data/disk2/xby/sd3-medium" \
+# -i /data/disk2/xby/TinySR/dataset/smoke/sr_bicubic_128 \
+# -o outputs/mytest \
+# --lora_dir checkpoint/tsdsr \
+# --embedding_dir dataset/default/ 

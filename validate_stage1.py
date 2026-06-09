@@ -29,6 +29,8 @@ from models.tinysr.tinysd3 import TinySD3Transformer2DModel
 from models.tinysr.pyramid_config import PyramidArchConfig
 from models.tinysr.pyramid_model import TinyPyramidSD3Transformer2DModel
 from models.vae.autoencoder_tiny  import  AutoencoderTiny
+from models.vae.autoencoder_kl  import  AutoencoderKL
+
 from models.quant.tiler import tile_sample
 
 from utils.vaehook import _init_tiled_vae
@@ -96,6 +98,7 @@ def main(args, pixel_values):
 
         # Encode the input image
         model_input = vae.encode(pixel_values).latents * vae.config.scaling_factor
+        # model_input = vae.encode(pixel_values).latent_dist.sample() * vae.config.scaling_factor
         model_input = model_input.to(args.device, dtype=weight_dtype)
 
         # Predict
@@ -132,23 +135,30 @@ if __name__ == "__main__":
     if args.mixed_precision == "fp16":
         weight_dtype = torch.float16
 
-    # Load the pretrained models
-    pc_path = os.path.join(args.lora_dir, "pyramid_config.json")
-    if not os.path.exists(pc_path):
-        raise FileNotFoundError(f"pyramid_config.json not found in {args.lora_dir}")
-    with open(pc_path) as f:
-        pc = PyramidArchConfig.from_dict(_json.load(f))
+    # ── Pyramid config ──
+    has_lora = args.lora_dir and os.path.isdir(args.lora_dir)
+    if has_lora:
+        pc_path = os.path.join(args.lora_dir, "pyramid_config.json")
+        if os.path.exists(pc_path):
+            with open(pc_path) as f:
+                pc = PyramidArchConfig.from_dict(_json.load(f))
+        else:
+            pc = DEFAULT_PYRAMID_CONFIG
+    else:
+        pc = DEFAULT_PYRAMID_CONFIG
     print(f"  pyramid: sample_size={pc.sample_size}, {[(s.num_blocks,s.dim,s.grid_hw) for s in pc.p_states]}")
     transformer = TinyPyramidSD3Transformer2DModel.from_flat_pretrained(
         args.pretrained_model_name_or_path, pyramid_config=pc,
         subfolder="transformer", torch_dtype=weight_dtype,
     )
     vae = AutoencoderTiny.from_pretrained(args.vae_path, torch_dtype=weight_dtype, cache_dir=args.cache_dir)
+    vae_decode = AutoencoderKL.from_pretrained("/data/disk2/xby/sd3-medium", subfolder="vae").to("cuda", weight_dtype)
+    # vae = AutoencoderKL.from_pretrained("/data/disk2/xby/sd3-medium", subfolder="vae").to("cuda", weight_dtype)
 
     if args.is_use_tile:
         _init_tiled_vae(vae, encoder_tile_size=args.vae_encoder_tiled_size, decoder_tile_size=args.vae_decoder_tiled_size)
 
-    if args.lora_dir:
+    if has_lora:
         rp_path = os.path.join(args.lora_dir, "rank_pattern.json")
         if os.path.exists(rp_path):
             with open(rp_path) as f:
@@ -162,7 +172,6 @@ if __name__ == "__main__":
 
         transformer_lora_state_dict = StableDiffusion3Pipeline.lora_state_dict(args.lora_dir, weight_name="model.safetensors", cache_dir=args.cache_dir)
         transformer_lora_state_dict = dict(transformer_lora_state_dict)
-        # transformer_lora_state_dict = {k.removeprefix("transformer."): v for k, v in transformer_lora_state_dict.items()}
         load_lora_state_dict_warn(transformer_lora_state_dict, transformer)
         if transformer_lora_state_dict:
             print(f"  Warning: {len(transformer_lora_state_dict)} LoRA keys not loaded:")
@@ -172,10 +181,11 @@ if __name__ == "__main__":
 
     # ── Pyramid: load loss_type for denoising ──
     pyramid_loss_type = "a"
-    tc_path = os.path.join(args.lora_dir, "train_config.json")
-    if os.path.exists(tc_path):
-        with open(tc_path) as f:
-            pyramid_loss_type = _json.load(f).get("loss_type", "a")
+    if has_lora:
+        tc_path = os.path.join(args.lora_dir, "train_config.json")
+        if os.path.exists(tc_path):
+            with open(tc_path) as f:
+                pyramid_loss_type = _json.load(f).get("loss_type", "a")
     print(f"  pyramid loss_type={pyramid_loss_type}")
     
     vae = vae.to(args.device, dtype=weight_dtype)

@@ -13,13 +13,13 @@ from diffusers.models.modeling_utils import ModelMixin
 from diffusers.models.embeddings import CombinedTimestepTextProjEmbeddings
 from diffusers.models.transformers.transformer_2d import Transformer2DModelOutput
 from diffusers.utils import USE_PEFT_BACKEND, logging, scale_lora_layers, unscale_lora_layers
-from diffusers.models.embeddings import PatchEmbed
+# from diffusers.models.embeddings import PatchEmbed
 
-# from models.tinysr.tinysd3 import PatchEmbed
+from models.tinysr.tinysd3 import PatchEmbed
 from models.tinysr.tinysd3 import AdaLayerNormContinuous
 from models.tinysr.tinysd3block import JointTransformerBlock
 from models.tinysr.pyramid_config import PyramidArchConfig, PStateSpec
-from models.tinysr.pyramid_blocks import DownProj, BilinearUpsample, DimProj, Bridge, ConvUpsample,BilinearResidualUpsample
+from models.tinysr.pyramid_blocks import DownProj, BilinearUpsample, BilinearDownsample, DimProj, Bridge, ConvUpsample, BilinearResidualUpsample
 
 logger = logging.get_logger(__name__)
 
@@ -93,23 +93,33 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
             else:
                 next_spec = pc.p_states[i + 1]
                 upsample = None
+                downsample = None
                 dim_proj = None
-                if spec.grid_hw != next_spec.grid_hw:
+
+                if spec.grid_hw < next_spec.grid_hw:
+                    scale = next_spec.grid_hw / spec.grid_hw
                     if pc.upsample_mode == "conv":
-                        # upsample = ConvUpsample(dim=spec.dim)
-                        upsample = BilinearResidualUpsample(dim=spec.dim)
+                        upsample = BilinearResidualUpsample(dim=spec.dim, scale_factor=scale)
                     else:
-                        upsample = BilinearUpsample(dim=spec.dim)
+                        upsample = BilinearUpsample(dim=spec.dim, scale_factor=scale)
+                elif spec.grid_hw > next_spec.grid_hw:
+                    scale = spec.grid_hw / next_spec.grid_hw
+                    downsample = BilinearDownsample(dim=spec.dim, scale_factor=1.0 / scale)
+
                 if spec.dim != next_spec.dim:
                     dim_proj = DimProj(spec.dim, next_spec.dim)
-                bridge = Bridge(upsample=upsample, dim_proj=dim_proj)
+                bridge = Bridge(upsample=upsample, downsample=downsample, dim_proj=dim_proj)
 
             self.p_states.append(PStateGroup(blocks=blocks, bridge=bridge))
 
         self.norm_out = AdaLayerNormContinuous(self.final_dim, self.final_dim, elementwise_affine=False, eps=1e-6)
+        self.norm_out_norm = self.norm_out.norm
         self.norm = nn.LayerNorm(self.final_dim, eps=1e-6)
+        self.register_buffer("scale", torch.tensor([]))
+        self.register_buffer("shift", torch.tensor([]))
 
         self.proj_out = nn.Linear(self.final_dim, pc.patch_size * pc.patch_size * self.out_channels, bias=True)
+        self.initialized = False
 
     def _unpatchify(self, h, grid_hw):
         patch_size = self.pyramid_config.patch_size
@@ -220,8 +230,13 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
                     "Passing `scale` via `joint_attention_kwargs` when not using the PEFT backend is ineffective."
                 )
 
-        full_temb = self.time_text_embed(timestep, pooled_projections)
-        self.temb = full_temb
+        if self.training:
+            self.temb = self.time_text_embed(timestep, pooled_projections)
+        elif self.initialized is False:
+            temb = self.time_text_embed(timestep, pooled_projections)
+            del self.time_text_embed
+            self.temb = temb
+            print("del self.time_text_embed")
 
         pc = self.pyramid_config
         # h是贯穿始终的
@@ -239,23 +254,34 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
 
         for i, p_state in enumerate(self.p_states):
             spec = pc.p_states[i]
-            temb_i = self.temb[:, :spec.dim]
 
             if i == len(self.p_states) - 1:
                 pre_last_tokens = h
 
             for j, block in enumerate(p_state.blocks):
-                # return_qkv = (self.training and i == 1 and j == len(p_state.blocks) - 1)
-                return_qkv = (self.training and i == 1 and j == 0)
-                if return_qkv:
-                    h, q, k, v = block(
-                        hidden_states=h, temb=temb_i, return_qkv=True)
-                    self._distill_q = q
-                    self._distill_k = k
-                    self._distill_v = v
-                    self._distill_h = h
+                # return_qkv = (self.training and i == 1 and j == 0)
+                return_qkv = (self.training and i == len(self.p_states)-1 and j == len(p_state.blocks)-1)
+                if self.training or self.initialized is False:
+                    temb_i = self.temb[:, :spec.dim]
+                    if return_qkv:
+                        h, q, k, v = block(
+                            hidden_states=h, temb=temb_i, return_qkv=True)
+                        self._distill_q = q
+                        self._distill_k = k
+                        self._distill_v = v
+                        self._distill_h = h
+                    else:
+                        h = block(hidden_states=h, temb=temb_i)
                 else:
-                    h = block(hidden_states=h, temb=temb_i)
+                    if return_qkv:
+                        h, q, k, v = block.forward_(
+                            hidden_states=h, return_qkv=True)
+                        self._distill_q = q
+                        self._distill_k = k
+                        self._distill_v = v
+                        self._distill_h = h
+                    else:
+                        h = block.forward_(hidden_states=h)
 
             if i < len(self.p_states) - 1:
                 bridge = p_state.bridge
@@ -263,9 +289,19 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
                     h = bridge(h, spec.grid_hw)
                 h_after_bridge = h
 
-        h, scale, shift = self.norm_out(h, self.temb[:, :self.final_dim])
-
-
+        if self.training:
+            h, scale, shift = self.norm_out(h, self.temb[:, :self.final_dim])
+        elif self.initialized is False:
+            h, scale, shift = self.norm_out(h, self.temb[:, :self.final_dim])
+            self.scale = scale.detach()
+            self.shift = shift.detach()
+            self.initialized = True
+            del self.norm_out
+            del self.temb
+            print("del self.norm_out")
+            print("del self.temb")
+        else:
+            h = self.norm_out_norm(h) * (1 + self.scale)[:, None, :] + self.shift[:, None, :]
         h = self.proj_out(h)
         output = self._unpatchify(h, pc.p_states[-1].grid_hw)
 

@@ -435,22 +435,37 @@ def main(args):
         if not args.resume_from_checkpoint:
             return 0, None, None, args.loss_type, None
 
+        # ===== DEBUG: 断点续训路径解析日志 =====
+        accelerator.print(f"[RESUME DEBUG] args.resume_from_checkpoint = '{args.resume_from_checkpoint}'")
+        accelerator.print(f"[RESUME DEBUG] args.output_dir = '{args.output_dir}'")
+        accelerator.print(f"[RESUME DEBUG]         abs = '{os.path.abspath(args.output_dir)}'")
+        # ======================================
+
         if args.resume_from_checkpoint != "latest":
             path = os.path.basename(args.resume_from_checkpoint)
+            accelerator.print(f"[RESUME DEBUG] 非 latest 模式: basename('{args.resume_from_checkpoint}') = '{path}'")
         else:
+            accelerator.print(f"[RESUME DEBUG] latest 模式: 在 output_dir 下查找 checkpoint-*")
             dirs = [d for d in os.listdir(
                 args.output_dir) if d.startswith("checkpoint-")]
             if not dirs:
                 accelerator.print(
                     "No checkpoint found. Starting a new training run.")
+                accelerator.print(f"[RESUME DEBUG] output_dir 下无 checkpoint-* 目录")
                 return 0, None, None, args.loss_type, None
             dirs = sorted(dirs, key=lambda x: int(x.split("-")[1]))
             path = dirs[-1]
+            accelerator.print(f"[RESUME DEBUG] 找到的 checkpoint 目录: {dirs}")
+            accelerator.print(f"[RESUME DEBUG] 选用最新: '{path}'")
 
         checkpoint_path = os.path.join(args.output_dir, path)
+        accelerator.print(f"[RESUME DEBUG] 拼接结果 checkpoint_path = '{checkpoint_path}'")
+        accelerator.print(f"[RESUME DEBUG]                         abs = '{os.path.abspath(checkpoint_path)}'")
+        accelerator.print(f"[RESUME DEBUG] 路径是否存在: {os.path.exists(checkpoint_path)}")
         if not os.path.exists(checkpoint_path):
             accelerator.print(
                 f"Checkpoint '{checkpoint_path}' does not exist. Starting a new training run.")
+            accelerator.print(f"[RESUME DEBUG] !!! 将从头开始训练，不会续训 checkpoint-35601 !!!")
             return 0, None, None, args.loss_type, None
 
         accelerator.print(f"Resuming from checkpoint {path}")
@@ -462,7 +477,7 @@ def main(args):
         with open(pc_path) as f:
             pc = PyramidArchConfig.from_dict(json.load(f))
         print(
-            f"  pyramid: sample_size={pc.sample_size}, {[(s.num_blocks,s.dim,s.grid_hw) for s in pc.p_states]}")
+            f"  pyramid: sample_size={pc.sample_size}, upsample={pc.upsample_mode}, {[(s.num_blocks,s.dim,s.grid_hw) for s in pc.p_states]}")
 
         rp_path = os.path.join(checkpoint_path, "rank_pattern.json")
         if os.path.exists(rp_path):
@@ -521,8 +536,17 @@ def main(args):
                 json.dump({"loss_type": args.loss_type}, f, indent=2)
 
             # 保存完整训练状态（模型、优化器、调度器等）
-            accelerator.save_state(save_path)
-            logger.info(f"Saved checkpoint to {save_path}")
+            try:
+                accelerator.save_state(save_path)
+                logger.info(f"Saved checkpoint to {save_path}")
+            except torch.cuda.OutOfMemoryError:
+                logger.warning(f"OOM when saving checkpoint to {save_path}, skipping")
+                try:
+                    shutil.rmtree(save_path)
+                except Exception:
+                    pass
+            except Exception as e:
+                logger.warning(f"Failed to save checkpoint to {save_path}: {e}, skipping")
     # def save_ckpt(step=None):
     #     accelerator.wait_for_everyone()
     #     if accelerator.is_main_process:
@@ -941,7 +965,7 @@ def main(args):
                             cos_sim = F.cosine_similarity(student_h, teacher_32, dim=-1)
 
                             loss_cos = args.cos_loss_weight * (1.0 - cos_sim.mean())
-                            # loss_g = loss_g + loss_cos
+                            loss_g = loss_g + loss_cos
                             cos_loss = loss_cos.detach().item()
 
 
@@ -981,7 +1005,7 @@ def main(args):
                             loss_at += kl.sum(dim=-1).mean() \
                                 * (h_end - h) / num_heads
                         loss_at = args.attn_loss_weight * loss_at
-                        # loss_g = loss_g + loss_at
+                        loss_g = loss_g + loss_at
                         attn_loss = loss_at.detach().item()
 
                     if need_distill and args.vr_loss_weight > 0 \
@@ -1006,7 +1030,7 @@ def main(args):
                             loss_vr += kl.sum(dim=-1).mean() \
                                 * (h_end - h) / num_heads
                         loss_vr = args.vr_loss_weight * loss_vr
-                        # loss_g = loss_g + loss_vr
+                        loss_g = loss_g + loss_vr
                         vr_loss = loss_vr.detach().item()
 
                     cos_qkv_loss = 0.0
@@ -1023,8 +1047,24 @@ def main(args):
                         loss_k = (1.0 - F.cosine_similarity(student_k, teacher_k, dim=-1)).mean()
                         loss_v = (1.0 - F.cosine_similarity(student_v, teacher_v, dim=-1)).mean()
                         loss_cos_qkv = args.cos_qkv_loss_weight * (loss_q + loss_k + loss_v) / 3.0
-                        # loss_g = loss_g + loss_cos_qkv
+                        loss_g = loss_g + loss_cos_qkv
                         cos_qkv_loss = loss_cos_qkv.detach().item()
+
+                if global_step % 10 == 0 or global_step == initial_global_step:
+                    accelerator.print(
+                        f"[LOSS DEBUG] step={global_step} "
+                        f"l1={loss_l1:.6f} "
+                        f"cos={cos_loss:.6f}(w={args.cos_loss_weight}) "
+                        f"attn={attn_loss:.6f}(w={args.attn_loss_weight}) "
+                        f"vr_raw={(vr_loss/(args.vr_loss_weight or 1.0)):.6f} vr_weighted={vr_loss:.6f}(w={args.vr_loss_weight}) "
+                        f"cos_qkv={cos_qkv_loss:.6f}(w={args.cos_qkv_loss_weight}) "
+                        f"total_recorded={loss_g.detach().item():.6f} "
+                        f"total_expected={loss_l1 + (cos_loss if args.cos_loss_weight > 0 else 0) + (attn_loss if args.attn_loss_weight > 0 else 0) + vr_loss + (cos_qkv_loss if args.cos_qkv_loss_weight > 0 else 0):.6f} "
+                        f"need_distill={need_distill} "
+                        f"has_tv={'teacher_v' in batch} "
+                        f"has_tq={'teacher_q' in batch} "
+                        f"has_t32={'latent_stu_teacher_32' in batch}"
+                    )
 
                 # backward
                 accelerator.backward(loss_g)

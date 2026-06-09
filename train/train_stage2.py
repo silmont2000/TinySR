@@ -14,6 +14,7 @@
 # See the License for the specific language governing permissions and
 import argparse
 import datetime
+import json
 import logging
 import math
 import os
@@ -44,7 +45,7 @@ from models.tinysr.pyramid_config import PyramidArchConfig
 from models.tinysr.pyramid_model import TinyPyramidSD3Transformer2DModel
 from models.tinysr.stage1_defaults import (
     CKPT, SMOKE_RANK_PATTERN, make_lora_config,
-    DEFAULT_PYRAMID_CONFIG, LORA_R, DEFAULT_TIMESTEP, VAE_CKPT,
+    LORA_R, DEFAULT_TIMESTEP, VAE_CKPT,
 )
 
 from diffusers.image_processor import  VaeImageProcessor
@@ -439,7 +440,11 @@ def main(args):
     # transformer = TinySD3Transformer2DModel.from_pretrained(
     #     args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
     # )
-    pc = DEFAULT_PYRAMID_CONFIG
+    pc_path = os.path.join(args.lora_dir, "pyramid_config.json")
+    if not os.path.exists(pc_path):
+        raise FileNotFoundError(f"pyramid_config.json not found in {args.lora_dir}")
+    with open(pc_path) as f:
+        pc = PyramidArchConfig.from_dict(json.load(f))
     transformer = TinyPyramidSD3Transformer2DModel.from_flat_pretrained(
         CKPT, pyramid_config=pc,
         subfolder="transformer",
@@ -463,7 +468,13 @@ def main(args):
     #     init_lora_weights="gaussian",
     #     target_modules=["to_k", "to_q", "to_v", "to_out.0","proj","linear", "linear_1", "linear_2", "net.2"],
     # )
-    transformer_lora_config = make_lora_config(rank_pattern=SMOKE_RANK_PATTERN)
+    rp_path = os.path.join(args.lora_dir, "rank_pattern.json")
+    if os.path.exists(rp_path):
+        with open(rp_path) as f:
+            rank_pattern = json.load(f)
+    else:
+        rank_pattern = SMOKE_RANK_PATTERN
+    transformer_lora_config = make_lora_config(rank_pattern=rank_pattern)
     transformer.add_adapter(transformer_lora_config, adapter_name="default")
     transformer.enable_adapters()
     transformer_lora_state_dict = StableDiffusion3Pipeline.lora_state_dict(args.lora_dir, weight_name="model.safetensors")
@@ -596,7 +607,7 @@ def main(args):
         log_name = args.log_name
         time = datetime.datetime.now().strftime('%m-%d_%H:%M')
         accelerator.init_trackers(tracker_name, config=vars(args), 
-                                  init_kwargs={"wandb": {"name": f"{log_name}_lr{args.learning_rate}_{time}","mode": 'dryrun'}}
+                                  init_kwargs={"wandb": {"name": f"{log_name}_lr{args.learning_rate}_{time}","mode": 'online'}}
                                   )
         if args.log_code:
             wandb.run.log_code(".", log_name,
@@ -689,14 +700,16 @@ def main(args):
                         pooled_projections=pooled_prompt_embeds,
                         return_dict=False,
                     )
-                    scale_factor = DEFAULT_PYRAMID_CONFIG.p_states[-1].grid_hw // DEFAULT_PYRAMID_CONFIG.p_states[0].grid_hw
+                    scale_factor = 64 // pc.sample_size
+
+                    # scale_factor = DEFAULT_PYRAMID_CONFIG.p_states[-1].grid_hw // DEFAULT_PYRAMID_CONFIG.p_states[0].grid_hw
                     input_up = F.interpolate(model_input.float(
                     ), scale_factor=scale_factor, mode='bilinear', align_corners=False)
                     latent_stu = input_up - model_pred.float()
 
                     l1_loss =  F.l1_loss(latent_stu.float(), latent_tea.float().detach(), reduction='mean') 
                     
-                    image_stu = vae_decode.decode(latent_stu / vae.config.scaling_factor, return_dict=False)[0].clamp(-1, 1)
+                    image_stu = vae.decode(latent_stu / vae.config.scaling_factor, return_dict=False)[0].clamp(-1, 1)
                     if accelerator.is_main_process and step % args.validation_steps == 49:
                         log_dict["image_stu"] = image_stu.cpu()
 
@@ -762,8 +775,14 @@ def main(args):
                                     shutil.rmtree(removing_checkpoint)
 
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        accelerator.save_state(save_path)
-                        logger.info(f"Saved state to {save_path}")
+                        try:
+                            accelerator.save_state(save_path)
+                            logger.info(f"Saved state to {save_path}")
+                        except (torch.cuda.OutOfMemoryError, RuntimeError, MemoryError) as e:
+                            logger.warning(f"Memory insufficient, skipping checkpoint save at step {global_step}: {e}")
+                            if os.path.exists(save_path):
+                                shutil.rmtree(save_path)
+                            torch.cuda.empty_cache()
 
             logs = {
                     "lpips_loss": lpips_loss.detach().item(), 
@@ -786,8 +805,14 @@ def main(args):
     if accelerator.is_main_process:
         if accelerator.sync_gradients:
             save_path = os.path.join(args.output_dir, f"checkpoint-latest")
-            accelerator.save_state(save_path)
-            logger.info(f"Saved state to {save_path}")
+            try:
+                accelerator.save_state(save_path)
+                logger.info(f"Saved state to {save_path}")
+            except (torch.cuda.OutOfMemoryError, RuntimeError, MemoryError) as e:
+                logger.warning(f"Memory insufficient, skipping final checkpoint save: {e}")
+                if os.path.exists(save_path):
+                    shutil.rmtree(save_path)
+                torch.cuda.empty_cache()
 
     accelerator.end_training()
 

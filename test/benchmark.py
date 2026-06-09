@@ -44,6 +44,8 @@ def parse_args():
     parser.add_argument("--cache_dir", type=str, default="/data/disk2/xby/models", help='cache directory for downloading models')
     parser.add_argument("--embedding_dir", type=str, default="dataset/default/", help='path to prompt embeddings')
 
+    parser.add_argument("--eval_size", type=int, default=1, help='eval size for benchmark')
+
     parser.add_argument("--batch_size", type=int, default=1, help='batch size for benchmark')
     parser.add_argument("--num_iterations", type=int, default=100, help='number of benchmark iterations')
 
@@ -75,7 +77,8 @@ def main(args, pixel_values):
             )
             last_grid_hw = transformer.pyramid_config.p_states[-1].grid_hw
             if pyramid_loss_type == "a":
-                scale_factor = last_grid_hw // transformer.pyramid_config.p_states[0].grid_hw
+                scale_factor = 64 // pc.sample_size
+                # scale_factor = last_grid_hw // transformer.pyramid_config.p_states[0].grid_hw
                 input_up = tfF.interpolate(model_input, scale_factor=scale_factor,
                                             mode='bilinear', align_corners=False)
                 denoised = input_up - output
@@ -185,10 +188,7 @@ if __name__ == "__main__":
     pooled_prompt_embeds = torch.load(os.path.join(args.embedding_dir, "pool_embeds.pt"), map_location=args.device).to(dtype=weight_dtype)
     pooled_prompt_embeds = pooled_prompt_embeds.expand(args.batch_size, -1)
 
-    if args.model=='p':
-        H, W = 256, 256
-    elif args.model=='t':
-        H, W = 512, 512
+    H, W = args.eval_size,args.eval_size
     total_time = 0.0
     mem_records = []
 

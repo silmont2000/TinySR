@@ -2,7 +2,7 @@
 # debug: true
 # distributed_type: MULTI_GPU
 # downcast_bf16: 'no'
-# gpu_ids: 7,0
+# gpu_ids: 1,2
 # machine_rank: 0
 # mixed_precision: fp16
 # fsdp_config:
@@ -24,6 +24,8 @@
 # tpu_use_cluster: false
 # tpu_use_sudo: false
 # use_cpu: false
+
+
 
 compute_environment: LOCAL_MACHINE
 debug: true
