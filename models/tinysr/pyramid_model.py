@@ -1,6 +1,8 @@
 import sys
 sys.path.append(".")
 
+import json
+import os
 from typing import Any, Dict, List, Optional, Tuple, Union
 import torch.nn.functional as F
 
@@ -20,6 +22,7 @@ from models.tinysr.tinysd3 import AdaLayerNormContinuous
 from models.tinysr.tinysd3block import JointTransformerBlock
 from models.tinysr.pyramid_config import PyramidArchConfig, PStateSpec
 from models.tinysr.pyramid_blocks import DownProj, BilinearUpsample, BilinearDownsample, DimProj, Bridge, ConvUpsample, BilinearResidualUpsample
+from models.tinysr.stage1_defaults import PYRAMID_MULT_CONFIG
 
 logger = logging.get_logger(__name__)
 
@@ -44,6 +47,7 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
         pooled_projection_dim: int = 2048,
         out_channels: int = 16,
         pos_embed_max_size: int = 96,
+        mult_config: Optional[Dict[int, float]] = None,
     ):
         super().__init__()
 
@@ -52,6 +56,8 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
         self.out_channels = out_channels if out_channels is not None else in_channels
 
         self.final_dim = pc.p_states[-1].dim
+
+        self._mult_config = dict(mult_config) if mult_config is not None else {}
 
         self.pos_embed = PatchEmbed(
             height=sample_size,
@@ -77,16 +83,19 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
             self.down_proj = None
 
         self.p_states = nn.ModuleList()
+        global_blk = 0
         for i, spec in enumerate(pc.p_states):
-            blocks = nn.ModuleList([
-                JointTransformerBlock(
+            blocks = nn.ModuleList()
+            for _ in range(spec.num_blocks):
+                mult = self._mult_config.get(global_blk, 4)
+                blocks.append(JointTransformerBlock(
                     dim=spec.dim,
                     num_attention_heads=spec.dim // 64,
                     attention_head_dim=spec.dim,
                     context_pre_only=False,
-                )
-                for _ in range(spec.num_blocks)
-            ])
+                    mult=mult,
+                ))
+                global_blk += 1
 
             if i == len(pc.p_states) - 1:
                 bridge = None
@@ -326,6 +335,7 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
         ignore_mismatched_sizes: bool = True,
         torch_dtype=None,
         cache_dir=None,
+        mult_config_path: Optional[str] = None,
         **kwargs,
     ):
         from models.tinysr.tinysd3 import TinySD3Transformer2DModel
@@ -342,6 +352,16 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
 
         pc = pyramid_config
 
+        mult_config = None
+        if mult_config_path is not None and os.path.isfile(mult_config_path):
+            with open(mult_config_path) as f:
+                mult_config = {int(k): float(v) for k, v in json.load(f).items()}
+        elif mult_config_path is None:
+            auto_path = os.path.join(pretrained_model_name_or_path, subfolder, "mult_config.json")
+            if os.path.isfile(auto_path):
+                with open(auto_path) as f:
+                    mult_config = {int(k): float(v) for k, v in json.load(f).items()}
+
         instance = cls(
             pyramid_config=pc.to_dict(),
             patch_size=pc.patch_size,
@@ -350,6 +370,7 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
             pooled_projection_dim=pc.pooled_projection_dim,
             out_channels=pc.out_channels,
             pos_embed_max_size=pc.pos_embed_max_size,
+            mult_config=mult_config,
         )
 
         instance._copy_truncated_weights(flat, pc)
@@ -384,7 +405,10 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
                 if tensor.shape == target_tensor.shape:
                     truncated_sd[key] = tensor
                 else:
-                    truncated = truncate_tensor(tensor, src_dim, tgt_dim)
+                    if 'ff.net.' in key and tensor.dim() == 2:
+                        truncated = tensor[:target_tensor.shape[0], :target_tensor.shape[1]]
+                    else:
+                        truncated = truncate_tensor(tensor, src_dim, tgt_dim)
                     if truncated.shape == target_tensor.shape:
                         truncated_sd[key] = truncated
 

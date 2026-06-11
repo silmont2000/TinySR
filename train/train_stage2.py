@@ -45,7 +45,7 @@ from models.tinysr.pyramid_config import PyramidArchConfig
 from models.tinysr.pyramid_model import TinyPyramidSD3Transformer2DModel
 from models.tinysr.stage1_defaults import (
     CKPT, SMOKE_RANK_PATTERN, make_lora_config,
-    LORA_R, DEFAULT_TIMESTEP, VAE_CKPT,
+    LORA_R, DEFAULT_TIMESTEP, VAE_CKPT, PYRAMID_MULT_CONFIG,
 )
 
 from diffusers.image_processor import  VaeImageProcessor
@@ -445,12 +445,18 @@ def main(args):
         raise FileNotFoundError(f"pyramid_config.json not found in {args.lora_dir}")
     with open(pc_path) as f:
         pc = PyramidArchConfig.from_dict(json.load(f))
+    mult_config_path = None
+    candidate = os.path.join(args.lora_dir, "mult_config.json")
+    if os.path.isfile(candidate):
+        mult_config_path = candidate
+        print(f"  mult_config loaded from {mult_config_path}")
     transformer = TinyPyramidSD3Transformer2DModel.from_flat_pretrained(
         CKPT, pyramid_config=pc,
         subfolder="transformer",
         revision=args.revision, variant=args.variant,
         torch_dtype=weight_dtype,
         ignore_mismatched_sizes=True,
+        mult_config_path=mult_config_path,
     )
     vae = AutoencoderTiny.from_pretrained("checkpoint/vae/separable")
     vae_decode = AutoencoderKL.from_pretrained("/data/disk2/xby/sd3-medium", subfolder="vae").to("cuda", weight_dtype)
@@ -603,7 +609,7 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        tracker_name = "tinysr"
+        tracker_name = "tinysr-stage2"
         log_name = args.log_name
         time = datetime.datetime.now().strftime('%m-%d_%H:%M')
         accelerator.init_trackers(tracker_name, config=vars(args), 
@@ -733,6 +739,8 @@ def main(args):
                     lpips_loss = lpips(image_stu, hr_values) 
                     # Compute total loss
                     loss_g = 0.3 * gan_loss  + 1 * lpips_loss + 5 * l1_loss
+                    # loss_g = 0.3 * gan_loss  + 1 * lpips_loss
+                    # loss_g = 0.3 * gan_loss
 
                 # backward
                 accelerator.backward(loss_g)
@@ -776,6 +784,10 @@ def main(args):
 
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         try:
+                            os.makedirs(save_path, exist_ok=True)
+                            unwrapped = accelerator.unwrap_model(transformer)
+                            with open(os.path.join(save_path, "mult_config.json"), "w") as f:
+                                json.dump(unwrapped._mult_config, f, indent=2)
                             accelerator.save_state(save_path)
                             logger.info(f"Saved state to {save_path}")
                         except (torch.cuda.OutOfMemoryError, RuntimeError, MemoryError) as e:
@@ -806,6 +818,9 @@ def main(args):
         if accelerator.sync_gradients:
             save_path = os.path.join(args.output_dir, f"checkpoint-latest")
             try:
+                os.makedirs(save_path, exist_ok=True)
+                with open(os.path.join(save_path, "mult_config.json"), "w") as f:
+                    json.dump(accelerator.unwrap_model(transformer)._mult_config, f, indent=2)
                 accelerator.save_state(save_path)
                 logger.info(f"Saved state to {save_path}")
             except (torch.cuda.OutOfMemoryError, RuntimeError, MemoryError) as e:

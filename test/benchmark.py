@@ -115,9 +115,16 @@ if __name__ == "__main__":
         with open(pc_path) as f:
             pc = PyramidArchConfig.from_dict(_json.load(f))
         print(f"  pyramid: sample_size={pc.sample_size}, {[(s.num_blocks,s.dim,s.grid_hw) for s in pc.p_states]}")
+
+        mult_config_path = None
+        candidate = os.path.join(args.lora_dir, "mult_config.json")
+        if os.path.isfile(candidate):
+            mult_config_path = candidate
+            print(f"  mult_config loaded from {mult_config_path}")
+
         transformer = TinyPyramidSD3Transformer2DModel.from_flat_pretrained(
             args.pretrained_model_name_or_path, pyramid_config=pc,
-            subfolder="transformer", torch_dtype=weight_dtype,
+            subfolder="transformer", torch_dtype=weight_dtype, mult_config_path=mult_config_path,
         )
     elif args.model=='t':
         transformer = TinySD3Transformer2DModel.from_pretrained(args.pretrained_model_name_or_path,subfolder="transformer", torch_dtype=weight_dtype, low_cpu_mem_usage=False, ignore_mismatched_sizes=True, cache_dir=args.cache_dir)

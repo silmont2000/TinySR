@@ -45,7 +45,7 @@ from diffusers.utils import (
 )
 from models.tinysr.pyramid_config import PyramidArchConfig, PStateSpec
 from models.tinysr.pyramid_model import TinyPyramidSD3Transformer2DModel
-from models.tinysr.stage1_defaults import CKPT,SMOKE_RANK_PATTERN, make_lora_config, DEFAULT_PYRAMID_CONFIG, LORA_R, DEFAULT_TIMESTEP
+from models.tinysr.stage1_defaults import PYRAMID_MULT_CONFIG, CKPT,SMOKE_RANK_PATTERN, make_lora_config, DEFAULT_PYRAMID_CONFIG, LORA_R, DEFAULT_TIMESTEP, PYRAMID_MULT_CONFIG
 if is_wandb_available():
     import wandb
 # Will error if the minimal version of diffusers is not installed. Remove at your own risks.
@@ -496,12 +496,18 @@ def main(args):
             pyramid_loss_type = args.loss_type
         print(f"  pyramid loss_type={pyramid_loss_type}")
 
+        mult_path = os.path.join(checkpoint_path, "mult_config.json")
+        mult_config_path = None
+        if os.path.isfile(mult_path):
+            mult_config_path = mult_path
+            print(f"  mult_config loaded from {mult_config_path}")
+
         try:
             global_step = int(path.split("-")[1])
         except (IndexError, ValueError):
             global_step = 0
 
-        return global_step, pc, transformer_lora_config, pyramid_loss_type, checkpoint_path
+        return global_step, pc, transformer_lora_config, pyramid_loss_type, checkpoint_path,mult_config_path
 
     def save_ckpt(step=None):
         accelerator.wait_for_everyone()
@@ -534,6 +540,8 @@ def main(args):
                 json.dump(SMOKE_RANK_PATTERN, f, indent=2)
             with open(os.path.join(save_path, "train_config.json"), "w") as f:
                 json.dump({"loss_type": args.loss_type}, f, indent=2)
+            with open(os.path.join(save_path, "mult_config.json"), "w") as f:
+                json.dump(unwrapped._mult_config, f, indent=2)
 
             # 保存完整训练状态（模型、优化器、调度器等）
             try:
@@ -547,36 +555,6 @@ def main(args):
                     pass
             except Exception as e:
                 logger.warning(f"Failed to save checkpoint to {save_path}: {e}, skipping")
-    # def save_ckpt(step=None):
-    #     accelerator.wait_for_everyone()
-    #     if accelerator.is_main_process:
-    #         model=transformer
-    #         current_time = datetime.now().strftime("%Y%m%d_%H%M%S")
-    #         suffix = f"_{step}" if step is not None else ""
-    #         ckpt_dir = f"outputs/smoke_checkpoint_s{2}_{current_time}{suffix}"
-    #         os.makedirs(ckpt_dir, exist_ok=True)
-    #         unwrapped = accelerator.unwrap_model(model)
-    #         with open(os.path.join(ckpt_dir, "pyramid_config.json"), "w") as f:
-    #             json.dump(unwrapped.pyramid_config.to_dict(), f, indent=2)
-    #         with open(os.path.join(ckpt_dir, "rank_pattern.json"), "w") as f:
-    #             json.dump(SMOKE_RANK_PATTERN, f, indent=2)
-    #         with open(os.path.join(ckpt_dir, "train_config.json"), "w") as f:
-    #             json.dump({"loss_type": args.loss_type}, f, indent=2)
-    #         # for n, p in unwrapped.named_parameters():
-    #         #     if "norm1" in n:
-    #         #         print(n, p.requires_grad, p.shape)
-    #         lora_state = get_peft_model_state_dict(unwrapped, adapter_name="default")
-
-    #         # print("LoRA keys count:", len(lora_state))
-    #         # for k in lora_state:
-    #         #     if 'norm1' in k:
-    #         #         print("Found:", k)
-                    
-    #         StableDiffusion3Pipeline.save_lora_weights(
-    #             ckpt_dir, transformer_lora_layers=lora_state,
-    #             weight_name="transformer.safetensors")
-    #         print(f"Saved: {ckpt_dir}")
-
 
     # ======================= 初始化变量 =======================
     global_step = 0
@@ -584,7 +562,7 @@ def main(args):
 
     # 尝试恢复训练（只读 metadata，不加载权重）
     if args.resume_from_checkpoint:
-        global_step, pc, transformer_lora_config, pyramid_loss_type, checkpoint_path = resume_training()
+        global_step, pc, transformer_lora_config, pyramid_loss_type, checkpoint_path,mult_config_path = resume_training()
         initial_global_step = global_step
     else:
         initial_global_step = 0
@@ -604,6 +582,8 @@ def main(args):
         CKPT, pyramid_config=pc,
         subfolder="transformer", revision=args.revision, variant=args.variant,
         torch_dtype=weight_dtype,
+        ignore_mismatched_sizes=True,
+        mult_config_path=mult_config_path,
     )
 
     transformer.requires_grad_(False)
@@ -783,7 +763,7 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        tracker_name = "tinysr"
+        tracker_name = "tinysr-实验8"
         log_name = args.log_name
         time = datetime.datetime.now().strftime('%m-%d_%H:%M')
         wandb_kwargs = {
@@ -965,7 +945,7 @@ def main(args):
                             cos_sim = F.cosine_similarity(student_h, teacher_32, dim=-1)
 
                             loss_cos = args.cos_loss_weight * (1.0 - cos_sim.mean())
-                            loss_g = loss_g + loss_cos
+                            # loss_g = loss_g + loss_cos
                             cos_loss = loss_cos.detach().item()
 
 
@@ -1005,7 +985,7 @@ def main(args):
                             loss_at += kl.sum(dim=-1).mean() \
                                 * (h_end - h) / num_heads
                         loss_at = args.attn_loss_weight * loss_at
-                        loss_g = loss_g + loss_at
+                        # loss_g = loss_g + loss_at
                         attn_loss = loss_at.detach().item()
 
                     if need_distill and args.vr_loss_weight > 0 \
@@ -1030,7 +1010,7 @@ def main(args):
                             loss_vr += kl.sum(dim=-1).mean() \
                                 * (h_end - h) / num_heads
                         loss_vr = args.vr_loss_weight * loss_vr
-                        loss_g = loss_g + loss_vr
+                        # loss_g = loss_g + loss_vr
                         vr_loss = loss_vr.detach().item()
 
                     cos_qkv_loss = 0.0
@@ -1047,7 +1027,7 @@ def main(args):
                         loss_k = (1.0 - F.cosine_similarity(student_k, teacher_k, dim=-1)).mean()
                         loss_v = (1.0 - F.cosine_similarity(student_v, teacher_v, dim=-1)).mean()
                         loss_cos_qkv = args.cos_qkv_loss_weight * (loss_q + loss_k + loss_v) / 3.0
-                        loss_g = loss_g + loss_cos_qkv
+                        # loss_g = loss_g + loss_cos_qkv
                         cos_qkv_loss = loss_cos_qkv.detach().item()
 
                 if global_step % 10 == 0 or global_step == initial_global_step:

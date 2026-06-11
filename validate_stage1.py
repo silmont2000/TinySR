@@ -147,9 +147,16 @@ if __name__ == "__main__":
     else:
         pc = DEFAULT_PYRAMID_CONFIG
     print(f"  pyramid: sample_size={pc.sample_size}, {[(s.num_blocks,s.dim,s.grid_hw) for s in pc.p_states]}")
+    mult_config_path = None
+    if has_lora:
+        candidate = os.path.join(args.lora_dir, "mult_config.json")
+        if os.path.isfile(candidate):
+            mult_config_path = candidate
+            print(f"  mult_config loaded from {mult_config_path}")
     transformer = TinyPyramidSD3Transformer2DModel.from_flat_pretrained(
         args.pretrained_model_name_or_path, pyramid_config=pc,
         subfolder="transformer", torch_dtype=weight_dtype,
+        mult_config_path=mult_config_path,
     )
     vae = AutoencoderTiny.from_pretrained(args.vae_path, torch_dtype=weight_dtype, cache_dir=args.cache_dir)
     vae_decode = AutoencoderKL.from_pretrained("/data/disk2/xby/sd3-medium", subfolder="vae").to("cuda", weight_dtype)
