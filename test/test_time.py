@@ -158,6 +158,7 @@ if __name__ == "__main__":
 
     vae = vae.to(args.device, dtype=weight_dtype)
     transformer = transformer.to(args.device, dtype=weight_dtype)
+    transformer.eval()
 
     # Sample timestep for each image
     timesteps = torch.tensor([1000.], device=args.device, dtype=weight_dtype)
@@ -173,12 +174,12 @@ if __name__ == "__main__":
 
     pixel_values = torch.randn(inference_iterations, batch_size ,3,128, 128, dtype=weight_dtype, device=args.device)
     for pixel_value in pixel_values:
-        image = main(args, pixel_value, (512, 512))
+        image = main(args, pixel_value, (args.process_size, args.process_size))
     
     for pixel_value in tqdm(pixel_values, desc="Inference"):
         start_time = time.time()
         
-        image = main(args, pixel_value, (512, 512))
+        image = main(args, pixel_value, (args.process_size, args.process_size))
         
         torch.cuda.synchronize()
         end_time = time.time()

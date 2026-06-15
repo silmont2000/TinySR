@@ -30,7 +30,8 @@ class PyramidArchConfig:
     out_channels: int = 16
     pooled_projection_dim: int = 2048
     pos_embed_max_size: int = 96
-    upsample_mode: str = "bilinear"  # "bilinear" | "conv"
+    upsample_mode: str = "bilinear"  # "bilinear" | "conv" | "pixel_shuffle"
+    downsample_mode: str = "bilinear"  # "bilinear" | "pixel_shuffle"
 
     @property
     def num_total_blocks(self) -> int:
@@ -73,6 +74,7 @@ class PyramidArchConfig:
             "pooled_projection_dim": self.pooled_projection_dim,
             "pos_embed_max_size": self.pos_embed_max_size,
             "upsample_mode": self.upsample_mode,
+            "downsample_mode": self.downsample_mode,
         }
 
     @classmethod
@@ -86,4 +88,5 @@ class PyramidArchConfig:
             pooled_projection_dim=d.get("pooled_projection_dim", 2048),
             pos_embed_max_size=d.get("pos_embed_max_size", 96),
             upsample_mode=d.get("upsample_mode", "bilinear"),
+            downsample_mode=d.get("downsample_mode", "bilinear"),
         )

@@ -679,6 +679,8 @@ def main(args):
     )
     log_dict = {}
     lpips = pyiqa.create_metric('lpips', as_loss=True).cuda()
+    maniqa_metric = pyiqa.create_metric('maniqa-pipal', as_loss=True, device=accelerator.device)
+    maniqa_metric.requires_grad_(False)
     autocast_ctx = torch.autocast(accelerator.device.type,dtype=weight_dtype)
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()
@@ -736,9 +738,10 @@ def main(args):
                     pred_fake = torch.cat(pred_fake, dim=1)
                     gan_loss = -torch.mean(pred_fake)
 
-                    lpips_loss = lpips(image_stu, hr_values) 
+                    lpips_loss = lpips(image_stu, hr_values)
+                    maniqa_loss = 1-maniqa_metric(image_stu) 
                     # Compute total loss
-                    loss_g = 0.3 * gan_loss  + 1 * lpips_loss + 5 * l1_loss
+                    loss_g = 0.3 * gan_loss + 1 * lpips_loss + 6 * l1_loss + 1 * maniqa_loss
                     # loss_g = 0.3 * gan_loss  + 1 * lpips_loss
                     # loss_g = 0.3 * gan_loss
 
@@ -801,6 +804,7 @@ def main(args):
                     "gan_loss": gan_loss.detach().item(),
                     "discrimitor_loss": loss_D.detach().item(),
                     "l1_loss": l1_loss.detach().item(),
+                    "maniqa_loss": maniqa_loss.detach().item()
                     }
             progress_bar.set_postfix(**logs)
             if accelerator.is_main_process:

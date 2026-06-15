@@ -9,7 +9,7 @@ nohup accelerate launch --config_file config/config_expB.yaml \
   train/train_stage1.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --train_batch_size=64 \
-  --num_train_epochs=20000 \
+  --num_train_epochs=2500 \
   --checkpointing_steps=5000 \
   --learning_rate=2e-04 \
   --checkpoints_total_limit=10 \

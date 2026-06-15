@@ -34,60 +34,60 @@ from models.tinysr.tinysd3block import JointTransformerBlock
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
-# class PatchEmbed(nn.Module):
-#     """2D Image to Patch Embedding with support for SD3 cropping."""
+class PatchEmbed(nn.Module):
+    """2D Image to Patch Embedding with support for SD3 cropping."""
 
-#     def __init__(
-#         self,
-#         height=224,
-#         width=224,
-#         patch_size=16,
-#         in_channels=3,
-#         embed_dim=768,
-#         layer_norm=False,
-#         flatten=True,
-#         bias=True,
-#         interpolation_scale=1,
-#         pos_embed_type="sincos",
-#         pos_embed_max_size=None,  # For SD3 cropping
-#     ):
-#         super().__init__()
+    def __init__(
+        self,
+        height=224,
+        width=224,
+        patch_size=16,
+        in_channels=3,
+        embed_dim=768,
+        layer_norm=False,
+        flatten=True,
+        bias=True,
+        interpolation_scale=1,
+        pos_embed_type="sincos",
+        pos_embed_max_size=None,  # For SD3 cropping
+    ):
+        super().__init__()
 
-#         self.flatten = flatten
-#         self.layer_norm = layer_norm
-#         self.pos_embed_max_size = pos_embed_max_size
+        self.flatten = flatten
+        self.layer_norm = layer_norm
+        self.pos_embed_max_size = pos_embed_max_size
 
-#         self.proj = nn.Conv2d(
-#             in_channels, embed_dim, kernel_size=(patch_size, patch_size), stride=patch_size, bias=bias
-#         )
-#         if layer_norm:
-#             self.norm = nn.LayerNorm(embed_dim, elementwise_affine=False, eps=1e-6)
-#         else:
-#             self.norm = None
+        self.proj = nn.Conv2d(
+            in_channels, embed_dim, kernel_size=(patch_size, patch_size), stride=patch_size, bias=bias
+        )
+        if layer_norm:
+            self.norm = nn.LayerNorm(embed_dim, elementwise_affine=False, eps=1e-6)
+        else:
+            self.norm = None
 
-#         self.patch_size = patch_size
-#         self.height, self.width = height // patch_size, width // patch_size
-#         self.base_size = height // patch_size
-#         self.interpolation_scale = interpolation_scale
+        self.patch_size = patch_size
+        self.height, self.width = height // patch_size, width // patch_size
+        self.base_size = height // patch_size
+        self.interpolation_scale = interpolation_scale
 
         
 
-#         print("loading pos_embed")
-#         # if (input_size!=256):
-#         self.register_buffer("pos_embed", torch.load("dataset/cache/pos_embed.pt"))
-#         # else:
-#         # self.register_buffer("pos_embed", torch.load("dataset/cache/pos_embed_256.pt"))
+        print("loading pos_embed")
+        # if (input_size!=256):
+        self.register_buffer("pos_embed", torch.load("dataset/cache/pos_embed.pt"))
+        # else:
+        # self.register_buffer("pos_embed", torch.load("dataset/cache/pos_embed_256.pt"))
 
-#         # self.pos_embed = torch.load("dataset/cache/pos_embed.pt")
+        # self.pos_embed = torch.load("dataset/cache/pos_embed.pt")
 
 
-#     def forward(self, latent):
-#         latent = self.proj(latent)
-#         if self.flatten:
-#             latent = latent.flatten(2).transpose(1, 2)  # BCHW -> BNC
-#         if self.layer_norm:
-#             latent = self.norm(latent)
-#         return (latent + self.pos_embed).to(latent.dtype)
+    def forward(self, latent):
+        latent = self.proj(latent)
+        if self.flatten:
+            latent = latent.flatten(2).transpose(1, 2)  # BCHW -> BNC
+        if self.layer_norm:
+            latent = self.norm(latent)
+        return (latent + self.pos_embed).to(latent.dtype)
 
 
 class AdaLayerNormContinuous(nn.Module):

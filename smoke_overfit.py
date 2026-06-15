@@ -142,7 +142,7 @@ def main(args):
         mi, tg, pl = batch["vae_stu"], batch["latent_stu"], batch["pool"]
 
         with accelerator.autocast():
-            out, pre_last = model(hidden_states=mi, timestep=t_step, pooled_projections=pl, return_dict=False)
+            out, pre_last, _ = model(hidden_states=mi, timestep=t_step, pooled_projections=pl, return_dict=False)
 
             if args.loss_type == "a":
                 scale_factor = pc.p_states[-1].grid_hw // pc.p_states[0].grid_hw

@@ -1,4 +1,4 @@
-export STAGE1_CKPT="/data/disk2/xby/TinySR/checkpoint/pyramid-stage1/checkpoint-100001"
+export STAGE1_CKPT="/data/disk2/xby/TinySR/checkpoint/pyramid-stage1-expB/checkpoint-50001"
 export DINO_MODEL_PATH="/data/disk2/xby/models/dinov2_vitl14_reg4_pretrain.pth"
 export OUTPUT_DIR="checkpoint/pyramid-stage2/"
 export OUTPUT_LOG="logs/pyramid_stage2.log"
@@ -11,7 +11,7 @@ nohup accelerate launch \
   --main_process_port 52341 \
   --mixed_precision="fp16" \
   train/train_stage2.py \
-  --train_batch_size=24 \
+  --train_batch_size=6 \
   --num_train_epochs=200 \
   --checkpointing_steps=1000 \
   --learning_rate=5e-06 \

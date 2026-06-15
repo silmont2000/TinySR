@@ -73,12 +73,12 @@ def main(args, batch):
         
         latent_stu_dir = img_name.replace(".png", ".pt").replace("sr_bicubic", "latent_stu")
         vae_stu_dir = img_name.replace(".png", ".pt").replace("sr_bicubic", "vae_stu")
-        if not os.path.exists(os.path.dirname(latent_stu_dir)):
-            os.makedirs(os.path.dirname(latent_stu_dir))
-        if not os.path.exists(os.path.dirname(vae_stu_dir)):
-            os.makedirs(os.path.dirname(vae_stu_dir))
-        torch.save(latent_stu.cpu().float(), latent_stu_dir)
-        torch.save(latent_stu.cpu().float(), vae_stu_dir)
+        # if not os.path.exists(os.path.dirname(latent_stu_dir)):
+        #     os.makedirs(os.path.dirname(latent_stu_dir))
+        # if not os.path.exists(os.path.dirname(vae_stu_dir)):
+        #     os.makedirs(os.path.dirname(vae_stu_dir))
+        # torch.save(latent_stu.cpu().float(), latent_stu_dir)
+        # torch.save(latent_stu.cpu().float(), vae_stu_dir)
         
         
 def main2(args, batch):
@@ -91,9 +91,9 @@ def main2(args, batch):
 
         
         vae_stu_dir = img_name.replace(".png", ".pt").replace("sr_bicubic", "vae_stu")
-        if not os.path.exists(os.path.dirname(vae_stu_dir)):
-            os.makedirs(os.path.dirname(vae_stu_dir))
-        torch.save(model_input.cpu().float(), vae_stu_dir)
+        # if not os.path.exists(os.path.dirname(vae_stu_dir)):
+        #     os.makedirs(os.path.dirname(vae_stu_dir))
+        # torch.save(model_input.cpu().float(), vae_stu_dir)
 
 def run_encode():
     # data_dir = [FLICKR2K_PATH ]

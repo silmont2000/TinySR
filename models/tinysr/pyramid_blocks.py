@@ -190,4 +190,75 @@ class LatentUpsample(nn.Module):
             x = self.conv(x)
         else:
             x = F.interpolate(x, scale_factor=2, mode='bilinear', align_corners=False)
+
+
+# ---------------------------------------------------------------------------
+# Pixel Shuffle bridge blocks  (lossless spatial rearrangement)
+# ---------------------------------------------------------------------------
+
+class PixelShuffleDownsample(nn.Module):
+    """Downsample via pixel_unshuffle (space-to-depth) + learned channel compression.
+
+    Input:  (B, N, D)  with N = (H*s)*(H*s)
+    Output: (B, N/s², D)  after pixel_unshuffle → Conv1x1(D*s² → D)
+    """
+    def __init__(self, dim: int, scale_factor: int = 2):
+        super().__init__()
+        self.scale_factor = scale_factor
+        s2 = scale_factor * scale_factor
+        self.norm = nn.LayerNorm(dim)
+        self.compress = nn.Conv2d(dim * s2, dim, kernel_size=1)
+
+    def forward(self, x: torch.Tensor, grid_hw: int) -> torch.Tensor:
+        B, N, D = x.shape
+        x = self.norm(x)
+        x = x.reshape(B, grid_hw, grid_hw, D).permute(0, 3, 1, 2)  # (B, D, H, H)
+        x = F.pixel_unshuffle(x, downscale_factor=self.scale_factor) # (B, D*s², H/s, H/s)
+        x = self.compress(x)                                          # (B, D, H/s, H/s)
+        x = x.permute(0, 2, 3, 1).flatten(1, 2)                      # (B, N/s², D)
         return x
+
+    def init_as_bilinear_ds(self):
+        """Initialise compress to mimic bilinear downsample: average each 2x2 block."""
+        s = self.scale_factor
+        s2 = s * s
+        D = self.compress.out_channels
+        self.compress.weight.data.zero_()
+        for f in range(D):
+            for pos in range(s2):
+                self.compress.weight.data[f, f + D * pos, 0, 0] = 1.0 / s2
+        self.compress.bias.data.zero_()
+
+
+class PixelShuffleUpsample(nn.Module):
+    """Upsample via learned channel expansion + pixel_shuffle (depth-to-space).
+
+    Input:  (B, N, D)
+    Output: (B, N*s², D)  after Conv1x1(D → D*s²) → pixel_shuffle
+    """
+    def __init__(self, dim: int, scale_factor: int = 2):
+        super().__init__()
+        self.scale_factor = scale_factor
+        s2 = scale_factor * scale_factor
+        self.expand = nn.Conv2d(dim, dim * s2, kernel_size=1)
+        self.norm = nn.LayerNorm(dim)
+
+    def forward(self, x: torch.Tensor, grid_hw: int) -> torch.Tensor:
+        B, N, D = x.shape
+        x = self.norm(x)
+        x = x.reshape(B, grid_hw, grid_hw, D).permute(0, 3, 1, 2)  # (B, D, H, H)
+        x = self.expand(x)                                           # (B, D*s², H, H)
+        x = F.pixel_shuffle(x, upscale_factor=self.scale_factor)     # (B, D, H*s, H*s)
+        x = x.permute(0, 2, 3, 1).flatten(1, 2)                     # (B, N*s², D)
+        return x
+
+    def init_as_nearest_us(self):
+        """Initialise expand to mimic nearest-neighbour upsample: replicate each channel."""
+        s = self.scale_factor
+        s2 = s * s
+        D = self.expand.in_channels
+        self.expand.weight.data.zero_()
+        for f in range(D):
+            for pos in range(s2):
+                self.expand.weight.data[f + D * pos, f, 0, 0] = 1.0
+        self.expand.bias.data.zero_()

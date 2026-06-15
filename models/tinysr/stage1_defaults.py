@@ -17,6 +17,8 @@ DEFAULT_PYRAMID_CONFIG = PyramidArchConfig(
     ),
     sample_size=64,
     upsample_mode="conv",
+    # downsample_mode="bilinear",     # default: "bilinear" | "pixel_shuffle"
+    # upsample_mode="pixel_shuffle",  # "bilinear" | "conv" | "pixel_shuffle"
 )
 # DEFAULT_PYRAMID_CONFIG = PyramidArchConfig(
 #     p_states=(

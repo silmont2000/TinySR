@@ -21,7 +21,7 @@ from models.tinysr.tinysd3 import PatchEmbed
 from models.tinysr.tinysd3 import AdaLayerNormContinuous
 from models.tinysr.tinysd3block import JointTransformerBlock
 from models.tinysr.pyramid_config import PyramidArchConfig, PStateSpec
-from models.tinysr.pyramid_blocks import DownProj, BilinearUpsample, BilinearDownsample, DimProj, Bridge, ConvUpsample, BilinearResidualUpsample
+from models.tinysr.pyramid_blocks import DownProj, BilinearUpsample, BilinearDownsample, DimProj, Bridge, ConvUpsample, BilinearResidualUpsample, PixelShuffleUpsample, PixelShuffleDownsample
 from models.tinysr.stage1_defaults import PYRAMID_MULT_CONFIG
 
 logger = logging.get_logger(__name__)
@@ -109,11 +109,18 @@ class TinyPyramidSD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin
                     scale = next_spec.grid_hw / spec.grid_hw
                     if pc.upsample_mode == "conv":
                         upsample = BilinearResidualUpsample(dim=spec.dim, scale_factor=scale)
+                    elif pc.upsample_mode == "pixel_shuffle":
+                        upsample = PixelShuffleUpsample(dim=spec.dim, scale_factor=int(scale))
+                        upsample.init_as_nearest_us()
                     else:
                         upsample = BilinearUpsample(dim=spec.dim, scale_factor=scale)
                 elif spec.grid_hw > next_spec.grid_hw:
                     scale = spec.grid_hw / next_spec.grid_hw
-                    downsample = BilinearDownsample(dim=spec.dim, scale_factor=1.0 / scale)
+                    if pc.downsample_mode == "pixel_shuffle":
+                        downsample = PixelShuffleDownsample(dim=spec.dim, scale_factor=int(scale))
+                        downsample.init_as_bilinear_ds()
+                    else:
+                        downsample = BilinearDownsample(dim=spec.dim, scale_factor=1.0 / scale)
 
                 if spec.dim != next_spec.dim:
                     dim_proj = DimProj(spec.dim, next_spec.dim)
