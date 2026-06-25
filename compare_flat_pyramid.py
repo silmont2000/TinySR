@@ -190,13 +190,15 @@ def main():
     flat = make_student_flat()
     flat_losses = train_student(flat, dataloader, teacher, vae, pooled_embeds, DEVICE, "flat", NUM_STEPS)
     del flat
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     print(f"\n=== Training pyramid student ({NUM_STEPS} steps) ===")
     pyramid = make_student_pyramid()
     pyramid_losses = train_student(pyramid, dataloader, teacher, vae, pooled_embeds, DEVICE, "pyramid", NUM_STEPS)
     del pyramid
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     results = {
         "config": {

@@ -9,6 +9,7 @@ _TINYSR_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _TINYSR_ROOT)
 
 import torch, numpy as np, glob
+from utils.device import get_optimal_device_name, get_optimal_device
 import torch.nn.functional as F
 from PIL import Image; from torchvision import transforms
 from models.tinysr.tinysd3 import TinySD3Transformer2DModel
@@ -18,7 +19,8 @@ from models.vae.autoencoder_tiny import AutoencoderTiny
 def set_seed(seed=42):
     import random; random.seed(seed)
     np.random.seed(seed); torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def spatial_err_per_channel(X):
@@ -90,16 +92,16 @@ def main():
     m = TinySD3Transformer2DModel.from_pretrained(
         'checkpoint/tinybackbone/prune-12-merge-tinysr', subfolder='transformer',
         torch_dtype=torch.float16, low_cpu_mem_usage=False,
-        ignore_mismatched_sizes=True, local_files_only=True).cuda()
+        ignore_mismatched_sizes=True, local_files_only=True).to(get_optimal_device())
     m.eval()
     vae = AutoencoderTiny.from_pretrained('checkpoint/vae/separable',
-        torch_dtype=torch.float16, local_files_only=True).cuda().eval()
-    pool = torch.load('dataset/default/pool_embeds.pt', map_location='cuda', weights_only=True)[:1].half()
-    t = torch.tensor([1000.], device='cuda', dtype=torch.float16)
+        torch_dtype=torch.float16, local_files_only=True).to(get_optimal_device()).eval()
+    pool = torch.load('dataset/default/pool_embeds.pt', map_location=get_optimal_device_name(), weights_only=True)[:1].half()
+    t = torch.tensor([1000.], device=get_optimal_device_name(), dtype=torch.float16)
     tt = transforms.Compose([transforms.ToTensor()])
 
     with torch.no_grad():
-        _ = m(hidden_states=torch.randn(1, 16, 64, 64, device='cuda', dtype=torch.float16),
+        _ = m(hidden_states=torch.randn(1, 16, 64, 64, device=get_optimal_device_name(), dtype=torch.float16),
               timestep=t, pooled_projections=pool, return_dict=False)
 
     print(f"[2/3] Running block-level tests on {args.num_images} images...")
@@ -112,7 +114,7 @@ def main():
 
     for idx, img_path in enumerate(test_imgs):
         img = Image.open(img_path).convert('RGB').resize((512, 512), Image.BICUBIC)
-        px = tt(img).unsqueeze(0).cuda().half() * 2 - 1
+        px = tt(img).unsqueeze(0).to(get_optimal_device()).half() * 2 - 1
         with torch.no_grad():
             lat = vae.encode(px).latents * vae.config.scaling_factor
             lat = F.interpolate(lat.float(), size=(64, 64), mode='bilinear').half()
@@ -123,7 +125,8 @@ def main():
                 h = m.transformer_blocks[bi].forward_(hidden_states=h)
         if (idx + 1) % 5 == 0:
             print(f"  {idx+1}/{len(test_imgs)}")
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     print(f"\n[3/3] Results (block-level relative L1 error, avg over {len(test_imgs)} images):")
     print(f"  Budget = fraction of full 32² compute")

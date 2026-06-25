@@ -66,6 +66,7 @@ def parse_args():
     parser.add_argument("--input_dir", "-i", type=str, default="dataset/test_image/")
     parser.add_argument("--quant_state_path", type=str, default="outputs/quant_state.pt")
     parser.add_argument("--profile_nunchaku", action="store_true")
+    parser.add_argument("--batch_size", type=int, default=1)
 
     parser.add_argument("--rank", type=int, default=64, help="LoRA rank for transformer.")
     parser.add_argument("--w_bits", type=int, default=8)
@@ -397,8 +398,25 @@ if __name__ == "__main__":
     print("image_num", datalen)
     os.makedirs(args.output_dir, exist_ok=True)
 
+    # Warmup: 30 iterations on first image (single image, no batching)
+    print("Warming up (30 iters)...")
+    w_img = Image.open(image_names[0]).convert("RGB")
+    w_w, w_h = w_img.size
+    w_nh = args.upscale * w_h - (args.upscale * w_h) % 8
+    w_nw = args.upscale * w_w - (args.upscale * w_w) % 8
+    w_lr = w_img.resize((int(w_w * args.upscale), int(w_h * args.upscale)))
+    w_pv = tensor_transforms(w_lr).unsqueeze(0).to(args.device, dtype=weight_dtype)
+    for _ in range(30):
+        main_one(args, w_pv, (w_nh, w_nw), transformer, vae, timesteps, pooled_prompt_embeds)
+    if args.device.startswith("cuda"):
+        torch.cuda.synchronize()
+    print("Warmup done.")
+
+    pbar = tqdm(total=datalen)
     total_time = 0.0
-    for image_name in tqdm(image_names):
+    img_idx = 0
+    while img_idx < datalen:
+        image_name = image_names[img_idx]
         lr = Image.open(image_name).convert("RGB")
         ori_width, ori_height = lr.size
         upscale = args.upscale
@@ -419,37 +437,69 @@ if __name__ == "__main__":
             new_height = new_height - new_height % 8
 
         lr_scale = lr.resize((int(ori_width * args.upscale), int(ori_height * args.upscale)))
-        pixel_values = tensor_transforms(lr).unsqueeze(0).to(args.device, dtype=weight_dtype)
+        pixel_values = tensor_transforms(lr_scale).unsqueeze(0).to(args.device, dtype=weight_dtype)
 
-        start_time = time.time()
-        image = main_one(
-            args,
-            pixel_values,
-            (new_height, new_width),
-            transformer,
-            vae,
-            timesteps,
-            pooled_prompt_embeds,
-        )
-        if args.device.startswith("cuda"):
-            torch.cuda.synchronize()
-        end_time = time.time()
+        # Batch same-size images
+        pv_list = [pixel_values]
+        batch_names = [image_name]
+        batch_lrs = [lr_scale]  # store resized LR for wavelet fix
+        batch_origs = [lr]       # store original LR for adain fix
+        for j in range(1, args.batch_size):
+            ni = img_idx + j
+            if ni >= datalen: break
+            nxt_name = image_names[ni]
+            nxt = Image.open(nxt_name).convert("RGB")
+            nlr = nxt.resize((int(nxt.size[0] * args.upscale), int(nxt.size[1] * args.upscale)))
+            npv = tensor_transforms(nlr).unsqueeze(0).to(args.device, dtype=weight_dtype)
+            if npv.shape != pixel_values.shape: break  # different sizes, stop batching
+            pv_list.append(npv)
+            batch_names.append(nxt_name)
+            batch_lrs.append(nlr)
+            batch_origs.append(nxt)
 
-        image_pil = transforms.ToPILImage()(image.cpu() / 2 + 0.5)
-        total_time += end_time - start_time
+        B = len(pv_list)
 
-        if resize_flag:
-            image_pil = image_pil.resize((int(ori_width * args.upscale), int(ori_height * args.upscale)))
+        if B > 1:
+            pv_batch = torch.cat(pv_list, dim=0)  # [B, 3, H, W]
+            start_time = time.time()
+            with torch.no_grad():
+                pb = torch.nn.functional.interpolate(pv_batch, size=(new_height, new_width), mode="bicubic", align_corners=False)
+                pb = pb * 2 - 1
+                mi = vae.encode(pb).latents * vae.config.scaling_factor
+                mp = transformer(hidden_states=mi, timestep=timesteps, pooled_projections=pooled_prompt_embeds, return_dict=False)[0]
+                ls = mi - mp
+                images = vae.decode(ls / vae.config.scaling_factor, return_dict=False)[0]
+            if args.device.startswith("cuda"): torch.cuda.synchronize()
+            total_time += time.time() - start_time
 
-        if args.align_method == "adain":
-            image_pil = adain_color_fix(target=image_pil, source=lr)
-        elif args.align_method == "wavelet":
-            image_pil = wavelet_color_fix(target=image_pil, source=lr_scale)
+            for k in range(B):
+                out_img = transforms.ToPILImage()(images[k].cpu() / 2 + 0.5)
+                if args.align_method == "adain":
+                    out_img = adain_color_fix(target=out_img, source=batch_origs[k])
+                elif args.align_method == "wavelet":
+                    out_img = wavelet_color_fix(target=out_img, source=batch_lrs[k])
+                out_img.save(os.path.join(args.output_dir, os.path.basename(batch_names[k])))
+        else:
+            start_time = time.time()
+            image = main_one(args, pixel_values, (new_height, new_width), transformer, vae, timesteps, pooled_prompt_embeds)
+            if args.device.startswith("cuda"): torch.cuda.synchronize()
+            total_time += time.time() - start_time
 
-        image_pil.save(os.path.join(args.output_dir, os.path.basename(image_name)))
+            image_pil = transforms.ToPILImage()(image.cpu() / 2 + 0.5)
+            if resize_flag:
+                image_pil = image_pil.resize((int(ori_width * args.upscale), int(ori_height * args.upscale)))
+            if args.align_method == "adain":
+                image_pil = adain_color_fix(target=image_pil, source=lr)
+            elif args.align_method == "wavelet":
+                image_pil = wavelet_color_fix(target=image_pil, source=lr_scale)
+            image_pil.save(os.path.join(args.output_dir, os.path.basename(image_name)))
+
+        img_idx += B
+        pbar.update(B)
         if args.device.startswith("cuda"):
             torch.cuda.empty_cache()
 
+    pbar.close()
     print(f"Average time: {total_time / max(datalen, 1)}")
     if args.profile_nunchaku:
         print_nunchaku_profile(transformer)

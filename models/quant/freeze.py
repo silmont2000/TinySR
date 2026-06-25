@@ -4,7 +4,7 @@ import torch.nn as nn
 from typing import Union
 
 from models.quant.ops import affine_fake_quant_weight, gptq_quantize_linear_weight, fake_quant_activation
-from models.quant.components import LowRankAffineQuantComponent, LowRankBranch
+from models.quant.components import LowRankAffineQuantComponent, decompose_svd_branch
 from models.quant.layers import QuantLinearW4A4, iter_quant_layers, set_quant_enabled, set_observer_enabled
 
 
@@ -19,6 +19,7 @@ def _eval_smooth_quant_error(
     act_bits: int = 8,
     act_symmetric: bool = True,
     act_scale: Union[torch.Tensor, float, None] = None,
+    act_group_size: int = -1,
 ) -> torch.Tensor:
     smooth_scale = act_absmax.pow(alpha) / weight_absmax.pow(1.0 - alpha)
     smooth_scale = smooth_scale.clamp_min(1e-8)
@@ -32,31 +33,28 @@ def _eval_smooth_quant_error(
         inputs_smoothed = inputs / smooth_scale.reshape(1, -1)
         orig_out = inputs @ weight.T
 
-        out_features, in_features = weight.shape
         rank = weight_quantizer.rank
-        if rank > 0:
-            branch = LowRankBranch(
-                in_features, out_features,
-                rank=rank, alpha=weight_quantizer.alpha,
-                weight=smoothed_weight,
-            )
-            L = branch.get_effective_weight()
-        else:
-            branch = None
-            L = torch.zeros_like(smoothed_weight)
-        R = smoothed_weight - L
+        weight_group_size = getattr(weight_quantizer, "weight_group_size", -1)
 
-        gptq_block_size = weight_quantizer.gptq_block_size
-        gptq_damp = weight_quantizer.gptq_damp_percentage
-        residual_q = gptq_quantize_linear_weight(
-            R, inputs_smoothed, bits=bits, symmetric=symmetric,
-            block_size=gptq_block_size, damp_percentage=gptq_damp, eps=eps,
+        # Single-SVD decomposition (no iterations: honest error for alpha search, matching deepcompressor)
+        branch, residual_q, _ = decompose_svd_branch(
+            smoothed_weight,
+            rank=rank,
+            alpha=weight_quantizer.alpha,
+            bits=bits,
+            symmetric=symmetric,
+            eps=eps,
+            inputs=inputs_smoothed if inputs is not None else None,
+            gptq_block_size=weight_quantizer.gptq_block_size,
+            gptq_damp_percentage=weight_quantizer.gptq_damp_percentage,
+            weight_group_size=weight_group_size,
+            num_iterations=0,
         )
 
         q_inputs = fake_quant_activation(
-            inputs_smoothed, bits=act_bits, symmetric=act_symmetric, eps=eps, scale=act_scale)
+            inputs_smoothed, bits=act_bits, symmetric=act_symmetric, eps=eps, scale=act_scale, group_size=act_group_size)
 
-        branch_out = branch(q_inputs) if branch is not None else 0.
+        branch_out = branch(inputs_smoothed) if branch is not None else 0.
         q_out = q_inputs @ residual_q.T + branch_out
         error = (orig_out - q_out).pow(2).mean()
     else:
@@ -77,7 +75,8 @@ def search_smooth_alpha_for_layer(
     num_grids: int = 7,
     act_bits: int = 8,
     act_symmetric: bool = True,
-    act_scale: Union[torch.Tensor, float, None] = None
+    act_scale: Union[torch.Tensor, float, None] = None,
+    act_group_size: int = -1,
 ) -> tuple[float, Union[torch.Tensor, None]]:
     if alpha_grid is None:
         num_grids = max(num_grids, 2)
@@ -107,6 +106,7 @@ def search_smooth_alpha_for_layer(
             act_bits=act_bits,
             act_symmetric=act_symmetric,
             act_scale=act_scale,
+            act_group_size=act_group_size,
         )
         if error < best_error:
             best_error = error
@@ -160,16 +160,18 @@ def freeze_one_layer(
                 act_bits = act_quantizer.quantizer.bits
                 act_sym = act_quantizer.quantizer.symmetric
                 act_scale_val = act_quantizer.quantizer.scale.detach().clone()
+                act_group_size = getattr(act_quantizer.quantizer, "group_size", -1)
             else:
-                act_bits, act_sym, act_scale_val = 8, True, None
+                act_bits, act_sym, act_scale_val, act_group_size = 8, True, None, -1
         else:
             act_quantizer = getattr(m, "act_quantizer", None)
             if act_quantizer and hasattr(act_quantizer, "quantizer"):
                 act_bits = act_quantizer.quantizer.bits
                 act_sym = act_quantizer.quantizer.symmetric
                 act_scale_val = act_quantizer.quantizer.scale.detach().clone()
+                act_group_size = getattr(act_quantizer.quantizer, "group_size", -1)
             else:
-                act_bits, act_sym, act_scale_val = 8, True, None
+                act_bits, act_sym, act_scale_val, act_group_size = 8, True, None, -1
 
         input_cache = getattr(m.weight_quantizer, "input_cache", None)
 
@@ -187,6 +189,7 @@ def freeze_one_layer(
                 act_symmetric=act_sym,
                 act_scale=act_scale_val,
                 num_grids=alpha_grid_size,
+                act_group_size=act_group_size,
             )
             m.weight_quantizer.smooth_alpha = alpha
             alpha_source = "search"
@@ -211,6 +214,7 @@ def freeze_one_layer(
                 act_bits=act_bits,
                 act_symmetric=act_sym,
                 act_scale=act_scale_val,
+                act_group_size=act_group_size,
             )
             err_str = f"err={err.item():.6e}"
         elif alpha_source == "search" and search_err is not None:

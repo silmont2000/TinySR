@@ -32,7 +32,9 @@ def _resolve(path):
 def set_seed(seed=42):
     import random
     random.seed(seed); np.random.seed(seed)
-    torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 def list_images(root, max_num=50):
     import glob
@@ -96,7 +98,8 @@ def run_analysis(model, vae, image_paths, pool_embeds, timestep, num_images, dev
             n_ok += 1
         except Exception as e:
             continue
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     if n_ok == 0:
         print("  WARNING: no images processed, using random latent fallback.")

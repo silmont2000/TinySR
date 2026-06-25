@@ -6,6 +6,7 @@ import time
 import numpy as np
 import torch
 from PIL import Image
+from utils.device import get_optimal_device_name
 from peft import LoraConfig
 from torchvision import transforms
 from tqdm import tqdm
@@ -78,7 +79,7 @@ def image_to_latent(upscale, process_size, vae, image_path, tensor_transform, de
     pixel_values = tensor_transform(lr).unsqueeze(
         0).to(device=device, dtype=weight_dtype)
     pixel_values = torch.nn.functional.interpolate(
-        pixel_values, size=(new_height, new_width), mode="bicubic", align_corners=False)
+        pixel_values, size=(new_height, new_width), mode="bilinear", align_corners=False)
     pixel_values = pixel_values * 2 - 1
     pixel_values = pixel_values.to(device=device, dtype=weight_dtype)
 
@@ -132,27 +133,29 @@ def load_models(pretrained_model_name_or_path, vae_path, lora_dir, rank,
     return transformer, vae
 
 
-def build_layer_replacement_kwargs(w_bits, a_bits, svdq_rank, svdq_smooth_alpha, svdq_iterations=0):
+def build_layer_replacement_kwargs(w_bits, a_bits, svdq_rank, svdq_smooth_alpha, svdq_iterations=0, act_group_size=64, weight_group_size=-1):
     return {
         "weight_quant_kwargs": {
             "bits": w_bits, "symmetric": True, "per_channel": True,
             "ch_axis": 0, "rank": svdq_rank, "smooth_alpha": svdq_smooth_alpha,
             "num_svd_iterations": svdq_iterations,
+            "weight_group_size": weight_group_size,
         },
         "act_quant_kwargs": {
             "bits": a_bits, "symmetric": True, "per_channel": False,
+            "group_size": act_group_size,
         },
     }
 
 
 def replace_quant_layers(transformer, quant_scope, quant_config,
                          w_bits, a_bits, svdq_rank, svdq_smooth_alpha,
-                         svdq_iterations=0):
+                         svdq_iterations=0, act_group_size=64, weight_group_size=-1):
     if quant_scope == "none":
         return []
     target_suffixes = get_target_suffixes(quant_scope)
     quant_kwargs = build_layer_replacement_kwargs(
-        w_bits, a_bits, svdq_rank, svdq_smooth_alpha, svdq_iterations)
+        w_bits, a_bits, svdq_rank, svdq_smooth_alpha, svdq_iterations, act_group_size, weight_group_size)
 
     if quant_config is not None:
         replaced = replace_linear_with_w4a4_from_config(
@@ -186,7 +189,7 @@ def calibrate_w4a4(
     search_mode,
     cascade_calib_images,
     load_smooth_alpha_report, latent_tiled_size, latent_tiled_overlap,
-    device="cuda", upscale=4, process_size=512,
+    device=None, upscale=4, process_size=512,
     alpha_grid_size=7,
 ):
     """Run calibration with the smooth_alpha priority chain.
@@ -199,6 +202,8 @@ def calibrate_w4a4(
     """
     if quant_scope == "none":
         return
+    if device is None:
+        device = get_optimal_device_name()
     device = torch.device(device)
     tensor_transform = transforms.Compose([transforms.ToTensor()])
     calib_count = min(max(calib_images, 1), len(calib_image_names))
@@ -240,8 +245,10 @@ def run_inference(
     output_dir, upscale, process_size,
     align_method, warmup_images,
     latent_tiled_size, latent_tiled_overlap,
-    device="cuda",
+    device=None,
 ):
+    if device is None:
+        device = get_optimal_device_name()
     device = torch.device(device)
     tensor_transform = transforms.Compose([transforms.ToTensor()])
     os.makedirs(output_dir, exist_ok=True)

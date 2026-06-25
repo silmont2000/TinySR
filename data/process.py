@@ -17,6 +17,7 @@ from PIL import Image
 from transformers import T5Tokenizer, T5EncoderModel, CLIPTokenizer, CLIPTextModelWithProjection, T5TokenizerFast
 from diffusers import AutoencoderKL
 from tqdm import tqdm
+from utils.device import get_optimal_device_name
 # from ram.models.ram_lora import ram
 # from ram import inference_ram as inference
 import pdb
@@ -209,6 +210,7 @@ def import_text_encoder(pretrained_model_name_or_path = "defualt", device=None):
     return tokenizers, text_encoders
 
 def run_encode_prompt():
+    dev = get_optimal_device_name()
     data_dir = [FLICKR2K_PATH, DIV2K_PATH, LSDIR20K_PATH, FFHQ10K_PATH ]
     hr_data_file, lr_data_file = merge_data(data_dir)
     for data_file in data_dir:
@@ -217,7 +219,7 @@ def run_encode_prompt():
         if not os.path.exists(os.path.join(data_file, "pool_embeds")):
             os.makedirs(os.path.join(data_file, "pool_embeds"))
             
-    tokenizers ,text_encoders = import_text_encoder(device="cuda")
+    tokenizers ,text_encoders = import_text_encoder(device=dev)
 
     for hr_img_file in tqdm(hr_data_file, total=len(hr_data_file)):
         prompt_file = hr_img_file.replace(".png",".txt").replace("gt", "gt_DAPE")
@@ -226,13 +228,14 @@ def run_encode_prompt():
         
         with open(prompt_file, "r") as f:
             prompt = f.read()
-        prompt_embeds, pooled_prompt_embeds = encode_prompt(text_encoders, tokenizers, prompt, device="cuda")
+        prompt_embeds, pooled_prompt_embeds = encode_prompt(text_encoders, tokenizers, prompt, device=dev)
         torch.save(prompt_embeds.detach().cpu(), prompt_path)    
         torch.save(pooled_prompt_embeds.detach().cpu(), pool_path)    
         print("{} Done !".format(prompt_path))
         
         
 def run_encode_val_prompt():
+    dev = get_optimal_device_name()
     data_dir = [FLICKR2K_PATH, DIV2K_PATH, LSDIR20K_PATH, FFHQ10K_PATH ]
     lr_data_file = merge_val_data(data_dir)
 
@@ -242,7 +245,7 @@ def run_encode_val_prompt():
         if not os.path.exists(os.path.join(data_file, "pool_embeds")):
             os.makedirs(os.path.join(data_file, "pool_embeds"))
             
-    tokenizers ,text_encoders = import_text_encoder(device="cuda")
+    tokenizers ,text_encoders = import_text_encoder(device=dev)
 
     for hr_img_file in tqdm(lr_data_file, total=len(lr_data_file)):
         prompt_file = hr_img_file.replace(".png",".txt").replace("test_LR", "DAPE")
@@ -251,14 +254,15 @@ def run_encode_val_prompt():
         
         with open(prompt_file, "r") as f:
             prompt = f.read()
-        prompt_embeds, pooled_prompt_embeds = encode_prompt(text_encoders, tokenizers, prompt, device="cuda")
+        prompt_embeds, pooled_prompt_embeds = encode_prompt(text_encoders, tokenizers, prompt, device=dev)
         torch.save(prompt_embeds.detach().cpu(), prompt_path)    
         torch.save(pooled_prompt_embeds.detach().cpu(), pool_path)    
         print("{} Done !".format(prompt_path))
         
 # ---------------------- vae encode ---------------------- #
 def vae_encode(lr_img_paths, hr_img_paths,lr_latent_path="latent_lr",hr_latent_path="latent_hr" ,sd3_model_path="defualt", weight_dtype=torch.float32):
-    vae = AutoencoderKL.from_pretrained(sd3_model_path, subfolder="vae").to("cuda", weight_dtype)
+    dev = get_optimal_device_name()
+    vae = AutoencoderKL.from_pretrained(sd3_model_path, subfolder="vae").to(dev, weight_dtype)
     with torch.no_grad():
         for lr_img_file,hr_img_file in tqdm(zip(lr_img_paths, hr_img_paths), total=len(lr_img_paths)):
             lr_save_path = lr_img_file.replace(".png",".pt").replace("sr_bicubic", lr_latent_path)
@@ -266,8 +270,8 @@ def vae_encode(lr_img_paths, hr_img_paths,lr_latent_path="latent_lr",hr_latent_p
             lr_img = Image.open(lr_img_file).convert("RGB")
             hr_img = Image.open(hr_img_file).convert("RGB")
             trans = transforms.ToTensor()
-            lq = trans(lr_img).unsqueeze(0).to("cuda",dtype=weight_dtype) * 2 - 1
-            hq = trans(hr_img).unsqueeze(0).to("cuda",dtype=weight_dtype) * 2 - 1
+            lq = trans(lr_img).unsqueeze(0).to(dev,dtype=weight_dtype) * 2 - 1
+            hq = trans(hr_img).unsqueeze(0).to(dev,dtype=weight_dtype) * 2 - 1
             lq_latent = vae.encode(lq).latent_dist.sample() * vae.config.scaling_factor
             hq_latent = vae.encode(hq).latent_dist.sample() * vae.config.scaling_factor
             torch.save(lq_latent.detach().cpu(), lr_save_path)
@@ -277,7 +281,8 @@ def vae_encode(lr_img_paths, hr_img_paths,lr_latent_path="latent_lr",hr_latent_p
             print("{} Done !".format(lr_save_path.split("/")[-1]))
 
 def vae_encode_down(lr_img_paths, hr_img_paths, sd3_model_path="checkpoint/tinybackbone/prune-12-merge-tinysr", weight_dtype=torch.float32, target_dir="256_path", scale=0.5):
-    vae = AutoencoderKL.from_pretrained(sd3_model_path, subfolder="vae").to("cuda", weight_dtype)
+    dev = get_optimal_device_name()
+    vae = AutoencoderKL.from_pretrained(sd3_model_path, subfolder="vae").to(dev, weight_dtype)
     with torch.no_grad():
         for lr_img_file,hr_img_file in tqdm(zip(lr_img_paths, hr_img_paths), total=len(lr_img_paths)):
             save_path = lr_img_file.replace(".png",".pt").replace("sr_bicubic", target_dir)
@@ -286,8 +291,8 @@ def vae_encode_down(lr_img_paths, hr_img_paths, sd3_model_path="checkpoint/tinyb
             hr_img = Image.open(hr_img_file).convert("RGB")
 
             trans = transforms.ToTensor()
-            lq = trans(lr_img).unsqueeze(0).to("cuda",dtype=weight_dtype) * 2 - 1
-            hq = trans(hr_img).unsqueeze(0).to("cuda",dtype=weight_dtype) * 2 - 1
+            lq = trans(lr_img).unsqueeze(0).to(dev,dtype=weight_dtype) * 2 - 1
+            hq = trans(hr_img).unsqueeze(0).to(dev,dtype=weight_dtype) * 2 - 1
             
             lq = torch.nn.functional.interpolate(lq, scale_factor=scale, mode="bicubic", align_corners=False)
             hq = torch.nn.functional.interpolate(hq, scale_factor=scale, mode="bicubic", align_corners=False)

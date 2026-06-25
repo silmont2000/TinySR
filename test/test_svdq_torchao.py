@@ -39,7 +39,10 @@ class TinySRModel(nn.Module):
 
 
 def main():
-    print(f"PyTorch {torch.__version__}, torchao, GPU: {torch.cuda.get_device_name(0)}")
+    if torch.cuda.is_available():
+        print(f"PyTorch {torch.__version__}, torchao, GPU: {torch.cuda.get_device_name(0)}")
+    else:
+        print(f"PyTorch {torch.__version__}, torchao, CPU")
     x_test = torch.randn(256, 1536, dtype=DT, device=DEV)
 
     # ─── 1. Build ──────────────────────────────────────────────
@@ -84,19 +87,22 @@ def main():
     # ─── 5. Latency ────────────────────────────────────────────
     print("\n═══ 5. Latency (256×1536 input, no torch.compile) ═══")
     gc.collect()
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     # bf16 eager
     with torch.no_grad():
         for _ in range(30):
             original(x_test)
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         t_bf16 = benchmark_model(original, 200, (x_test,))
 
         # SVDQ int4 eager
         for _ in range(30):
             model(x_test)
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         t_int4 = benchmark_model(model, 200, (x_test,))
 
     print(f"  bf16 eager:  {t_bf16:.3f}ms  (baseline)")

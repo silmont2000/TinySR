@@ -1,4 +1,5 @@
 import torch
+from utils.device import get_optimal_device_name, get_optimal_device
 import torch.nn as nn
 from torchao.quantization import quantize_, Int8DynamicActivationInt8WeightConfig
 
@@ -6,7 +7,7 @@ from torchao.quantization import quantize_, Int8DynamicActivationInt8WeightConfi
 model = nn.Sequential(
     nn.Linear(1024, 512),   # 第一层：输入1024维，输出512维
     nn.Linear(512, 256)     # 第二层：输入512维，输出256维
-).eval().to("cuda")
+).eval().to(get_optimal_device())
 
 # 2. 应用 int8 动态量化的配置，同时量化激活值和权重
 quantize_(model, Int8DynamicActivationInt8WeightConfig())
@@ -15,7 +16,7 @@ quantize_(model, Int8DynamicActivationInt8WeightConfig())
 print(type(model[0].weight).__name__)
 
 # 4. 创建与模型第一层输入维度匹配的随机输入
-input_tensor = torch.randn(1, 1024, device="cuda")
+input_tensor = torch.randn(1, 1024, device=get_optimal_device_name())
 
 # 5. 执行推理，整个过程会自动进行int8计算
 output = model(input_tensor)

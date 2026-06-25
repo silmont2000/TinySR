@@ -5,7 +5,31 @@ from typing import Union
 
 
 @torch.no_grad()
-def affine_fake_quant_weight(weight, bits=4, symmetric=True, eps=1e-8):
+def affine_fake_quant_weight(weight, bits=4, symmetric=True, eps=1e-8, group_size=-1):
+    if group_size > 0 and weight.dim() >= 2:
+        out_feat, in_feat = weight.shape
+        if in_feat % group_size != 0:
+            group_size = -1
+        else:
+            gs = group_size
+            num_groups = in_feat // gs
+            w_groups = weight.view(out_feat, num_groups, gs)
+            if symmetric:
+                qmin = -(2 ** (bits - 1))
+                qmax = 2 ** (bits - 1) - 1
+                scale = w_groups.abs().amax(dim=-1).div(float(qmax)).clamp_min(eps)
+                zp = torch.zeros_like(scale)
+            else:
+                qmin = 0
+                qmax = 2 ** bits - 1
+                min_val = w_groups.amin(dim=-1)
+                max_val = w_groups.amax(dim=-1)
+                scale = (max_val - min_val).div(float(qmax - qmin)).clamp_min(eps)
+                zp = (qmin - torch.round(min_val / scale)).clamp(qmin, qmax)
+            w_int = torch.round(w_groups / scale.unsqueeze(-1) + zp.unsqueeze(-1))
+            w_int = torch.clamp(w_int, qmin, qmax)
+            return ((w_int - zp.unsqueeze(-1)) * scale.unsqueeze(-1)).view(out_feat, in_feat)
+
     if symmetric:
         qmin = -(2 ** (bits - 1))
         qmax = 2 ** (bits - 1) - 1
@@ -32,9 +56,13 @@ def gptq_quantize_linear_weight(
     block_size=128,
     damp_percentage=0.01,
     eps=1e-8,
+    group_size=-1,
 ):
     if inputs is None or inputs.numel() == 0:
-        return affine_fake_quant_weight(weight, bits=bits, symmetric=symmetric, eps=eps)
+        return affine_fake_quant_weight(weight, bits=bits, symmetric=symmetric, eps=eps, group_size=group_size)
+
+    if group_size > 0:
+        return affine_fake_quant_weight(weight, bits=bits, symmetric=symmetric, eps=eps, group_size=group_size)
 
     orig_dtype = weight.dtype
     work_weight = weight.float()
@@ -114,19 +142,48 @@ def gptq_quantize_linear_weight(
 
 @torch.no_grad()
 def fake_quant_activation(x: torch.Tensor, bits: int = 8, symmetric: bool = True, eps: float = 1e-8,
-                           scale: Union[torch.Tensor, float, None] = None) -> torch.Tensor:
+                           scale: Union[torch.Tensor, float, None] = None,
+                           group_size: int = -1) -> torch.Tensor:
     if symmetric:
         qmin = -(2 ** (bits - 1))
         qmax = 2 ** (bits - 1) - 1
-        if scale is not None:
-            scale = scale.item() if isinstance(scale, torch.Tensor) else scale
-        else:
-            max_abs = x.abs().max().clamp_min(eps)
-            scale = max_abs / float(qmax)
         zero_point = 0
     else:
         qmin = 0
         qmax = 2 ** bits - 1
+        zero_point = None
+
+    if group_size > 0 and x.dim() >= 2:
+        orig_shape = x.shape
+        x_flat = x.reshape(-1, x.shape[-1])
+        N, K = x_flat.shape
+        if K % group_size != 0:
+            return x
+        num_groups = K // group_size
+        x_view = x_flat.view(N, num_groups, group_size)
+        if symmetric:
+            max_abs = x_view.abs().amax(dim=-1)
+            s = max_abs / float(qmax)
+            s = s.clamp_min(eps)
+            zp = torch.zeros_like(s)
+        else:
+            min_val = x_view.amin(dim=-1)
+            max_val = x_view.amax(dim=-1)
+            s = (max_val - min_val) / float(qmax - qmin)
+            s = s.clamp_min(eps)
+            zp = qmin - torch.round(min_val / s)
+            zp = zp.clamp(qmin, qmax)
+        x_int = torch.round(x_view / s.unsqueeze(-1) + zp.unsqueeze(-1))
+        x_int = torch.clamp(x_int, qmin, qmax)
+        x_dequant = (x_int - zp.unsqueeze(-1)) * s.unsqueeze(-1)
+        return x_dequant.view(*orig_shape)
+
+    if scale is not None:
+        scale = scale.item() if isinstance(scale, torch.Tensor) else scale
+    else:
+        max_abs = x.abs().max().clamp_min(eps)
+        scale = max_abs / float(qmax)
+    if not symmetric:
         scale = (x.max() - x.min()).clamp_min(eps) / float(qmax - qmin)
         zero_point = qmin - torch.round(x.min() / scale)
         zero_point = zero_point.clamp(qmin, qmax)

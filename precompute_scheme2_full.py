@@ -24,7 +24,8 @@ DATASETS = [
 
 
 def worker(gpu_id, jobs):
-    torch.cuda.set_device(gpu_id)
+    if torch.cuda.is_available():
+        torch.cuda.set_device(gpu_id)
     device = f"cuda:{gpu_id}"
     dtype = torch.float16
 
@@ -91,7 +92,8 @@ def worker(gpu_id, jobs):
                 torch.save(qkv, os.path.join(base_path, QKV_SUBDIR, fname))
 
     del teacher
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 
 def main():

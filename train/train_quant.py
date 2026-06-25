@@ -40,6 +40,12 @@ def parse_args():
 
     parser.add_argument("--w_bits", type=int, default=4)
     parser.add_argument("--a_bits", type=int, default=4)
+    parser.add_argument("--act_group_size", type=int, default=64,
+                        help="Per-group size for activation quantization. -1 = per-tensor. "
+                             "Default 64 matches nunchaku SVDQ-W4A4.")
+    parser.add_argument("--weight_group_size", type=int, default=-1,
+                        help="Per-group size for weight residual quantization. -1 = per-channel GPTQ. "
+                             "Set to 64 to match nunchaku.")
     parser.add_argument("--quant_config", type=str, default=None)
     parser.add_argument("--rank", type=int, default=64)
     parser.add_argument("--svdq_rank", type=int, default=32)
@@ -164,10 +170,12 @@ def main():
         transformer, vae = load_models(
             args.pretrained_model_name_or_path, args.vae_path, args.lora_dir,
             args.rank, args.cache_dir, device, weight_dtype, skip_lora=False)
+        transformer = transformer.merge_and_unload()
         replaced_layers = replace_quant_layers(
             transformer, args.quant_scope, args.quant_config,
             args.w_bits, args.a_bits, args.svdq_rank, args.svdq_smooth_alpha,
-            svdq_iterations=args.svdq_iterations)
+            svdq_iterations=args.svdq_iterations, act_group_size=args.act_group_size,
+            weight_group_size=args.weight_group_size)
         missing, unexpected = transformer.load_state_dict(
             torch.load(args.load_quant_state, map_location="cpu"), strict=False)
         print(f"[QUANT] quant state loaded <- {args.load_quant_state}")
@@ -183,10 +191,12 @@ def main():
         transformer, vae = load_models(
             args.pretrained_model_name_or_path, args.vae_path, args.lora_dir,
             args.rank, args.cache_dir, device, weight_dtype, skip_lora=False)
+        transformer = transformer.merge_and_unload()
         replaced_layers = replace_quant_layers(
             transformer, args.quant_scope, args.quant_config,
             args.w_bits, args.a_bits, args.svdq_rank, args.svdq_smooth_alpha,
-            svdq_iterations=args.svdq_iterations)
+            svdq_iterations=args.svdq_iterations, act_group_size=args.act_group_size,
+            weight_group_size=args.weight_group_size)
 
         if args.quant_config:
             print(

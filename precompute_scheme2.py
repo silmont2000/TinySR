@@ -75,7 +75,8 @@ def extract_teacher_targets(fname):
             targets[target_hw] = refined.squeeze(0).cpu().half()
 
     del teacher
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     return targets
 
 

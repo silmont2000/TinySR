@@ -36,6 +36,7 @@ from models.quant.tiler import tile_sample
 from utils.vaehook import _init_tiled_vae
 from utils.wavelet_color_fix import adain_color_fix, wavelet_color_fix
 from utils.util import load_lora_state_dict_warn
+from utils.device import get_optimal_device_name, device_sync, device_empty_cache, device_reset_peak_memory_stats, device_max_memory_allocated
 
 from torchinfo import summary
 
@@ -71,7 +72,7 @@ def parse_args():
     parser.add_argument("--latent_tiled_size", type=int, default=64, help='tiled size for transformer latent')
     parser.add_argument("--latent_tiled_overlap", type=int, default=8, help='tiled overlap for transformer latent')
 
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--device", type=str, default=get_optimal_device_name())
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--upscale", type=int, default=4, help='upscale factor')
     parser.add_argument("--process_size", type=int, default=512, help='process size for images')
@@ -131,6 +132,7 @@ if __name__ == "__main__":
     os.environ['HF_HOME'] = args.cache_dir
     os.environ['HF_HUB_CACHE'] = args.cache_dir
 
+    args.device = torch.device(args.device)
     weight_dtype = torch.float32
     if args.mixed_precision == "fp16":
         weight_dtype = torch.float16
@@ -159,7 +161,7 @@ if __name__ == "__main__":
         mult_config_path=mult_config_path,
     )
     vae = AutoencoderTiny.from_pretrained(args.vae_path, torch_dtype=weight_dtype, cache_dir=args.cache_dir)
-    vae_decode = AutoencoderKL.from_pretrained("/data/disk2/xby/sd3-medium", subfolder="vae").to("cuda", weight_dtype)
+    # vae_decode = AutoencoderKL.from_pretrained("/data/disk2/xby/sd3-medium", subfolder="vae").to("cuda", weight_dtype)
     # vae = AutoencoderKL.from_pretrained("/data/disk2/xby/sd3-medium", subfolder="vae").to("cuda", weight_dtype)
 
     if args.is_use_tile:
@@ -236,7 +238,10 @@ if __name__ == "__main__":
 
 
     # Warmup: 5 forward passes on first image for GPU warmup
-    torch.cuda.empty_cache()
+    if args.device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif args.device.type == "mps":
+        torch.mps.empty_cache()
     if image_names:
         first_lr = Image.open(image_names[0]).convert('RGB')
         first_lr = first_lr.resize((args.eval_size, args.eval_size), Image.BICUBIC)
@@ -263,11 +268,13 @@ if __name__ == "__main__":
         lr_scale = lr.resize((int(ori_width*args.upscale), int(ori_height*args.upscale)))
         pixel_values = tensor_transforms(lr).unsqueeze(0).to(args.device, dtype=weight_dtype)
         start_time = time.time()
-        torch.cuda.reset_peak_memory_stats()
+        if args.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats()
         image,denoised = main(args, pixel_values)
-        torch.cuda.synchronize()
+        if args.device.type == "cuda":
+            torch.cuda.synchronize()
         end_time = time.time()
-        peak_mem = torch.cuda.max_memory_allocated() / 1024**2
+        peak_mem = torch.cuda.max_memory_allocated() / 1024**2 if args.device.type == "cuda" else 0
 
         total_time += (end_time - start_time)
         mem_records.append(peak_mem)
@@ -291,7 +298,10 @@ if __name__ == "__main__":
             pass
 
         image_pil_image.save(os.path.join(args.output_dir, os.path.basename(image_name)))
-        torch.cuda.empty_cache()
+        if args.device.type == "cuda":
+            torch.cuda.empty_cache()
+        elif args.device.type == "mps":
+            torch.mps.empty_cache()
     param_cnt = sum(p.numel() for p in transformer.p_states.parameters())
     mem_arr = np.array(mem_records)
     print("#Param.", param_cnt/1e6, "M")

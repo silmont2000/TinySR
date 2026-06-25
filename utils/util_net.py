@@ -70,18 +70,26 @@ def measure_time(net, inputs, num_forward=100):
     Measuring the average runing time (seconds) for pytorch.
     out = net(*inputs)
     '''
-    start = torch.cuda.Event(enable_timing=True)
-    end = torch.cuda.Event(enable_timing=True)
+    if torch.cuda.is_available():
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
 
-    start.record()
-    with torch.set_grad_enabled(False):
-        for _ in range(num_forward):
-            out = net(*inputs)
-    end.record()
+        start.record()
+        with torch.set_grad_enabled(False):
+            for _ in range(num_forward):
+                out = net(*inputs)
+        end.record()
 
-    torch.cuda.synchronize()
+        torch.cuda.synchronize()
 
-    return start.elapsed_time(end) / 1000
+        return start.elapsed_time(end) / 1000
+    else:
+        import time
+        t0 = time.time()
+        with torch.set_grad_enabled(False):
+            for _ in range(num_forward):
+                out = net(*inputs)
+        return time.time() - t0
 
 def reload_model(model, ckpt):
     if list(model.state_dict().keys())[0].startswith('module.'):

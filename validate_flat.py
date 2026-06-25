@@ -6,6 +6,7 @@ from torchvision import transforms
 
 from models.vae.autoencoder_tiny import AutoencoderTiny
 from models.tinysr.tinysd3 import TinySD3Transformer2DModel
+from utils.device import get_optimal_device_name
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -13,7 +14,7 @@ def parse_args():
                    help="flat stage1 checkpoint dir")
     p.add_argument("--input_image", type=str, default="dataset/test_image/Canon_10_x1.png")
     p.add_argument("--output_dir", type=str, default="outputs/validate_flat")
-    p.add_argument("--device", type=str, default="cuda:0")
+    p.add_argument("--device", type=str, default=get_optimal_device_name())
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--no_lora", action="store_true", help="skip LoRA, run base model only")
     return p.parse_args()

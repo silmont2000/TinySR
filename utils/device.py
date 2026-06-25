@@ -5,15 +5,12 @@ from functools import lru_cache
 import torch
 #from modules import errors
 
-if sys.platform == "darwin":
-    from modules import mac_specific
-
 
 def has_mps() -> bool:
     if sys.platform != "darwin":
         return False
     else:
-        return mac_specific.has_mps
+        return torch.backends.mps.is_available()
 
 
 def get_cuda_device_string():
@@ -46,7 +43,7 @@ def torch_gc():
             torch.cuda.ipc_collect()
 
     if has_mps():
-        mac_specific.torch_mps_gc()
+        torch.mps.empty_cache()
 
 
 def enable_tf32():
@@ -65,11 +62,38 @@ enable_tf32()
 #errors.run(enable_tf32, "Enabling TF32")
 
 cpu = torch.device("cpu")
-device = device_interrogate = device_gfpgan = device_esrgan = device_codeformer = torch.device("cuda")
+device = device_interrogate = device_gfpgan = device_esrgan = device_codeformer = get_optimal_device()
 dtype = torch.float16
 dtype_vae = torch.float16
 dtype_unet = torch.float16
 unet_needs_upcast = False
+
+
+def get_current_device() -> torch.device:
+    return get_optimal_device()
+
+
+def device_sync():
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+
+def device_empty_cache():
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+    elif has_mps():
+        torch.mps.empty_cache()
+
+
+def device_reset_peak_memory_stats():
+    if device.type == "cuda":
+        torch.cuda.reset_peak_memory_stats()
+
+
+def device_max_memory_allocated():
+    if device.type == "cuda":
+        return torch.cuda.max_memory_allocated()
+    return 0
 
 
 def cond_cast_unet(input):
@@ -93,11 +117,15 @@ def autocast(disable=False):
     if disable:
         return contextlib.nullcontext()
 
-    return torch.autocast("cuda")
+    dev = get_optimal_device_name()
+    if dev == "cuda" or dev == "mps":
+        return torch.autocast(dev)
+    return contextlib.nullcontext()
 
 
 def without_autocast(disable=False):
-    return torch.autocast("cuda", enabled=False) if torch.is_autocast_enabled() and not disable else contextlib.nullcontext()
+    dev = get_optimal_device_name()
+    return torch.autocast(dev, enabled=False) if torch.is_autocast_enabled() and not disable else contextlib.nullcontext()
 
 
 class NansException(Exception):
@@ -129,10 +157,11 @@ def first_time_calculation():
     spends about 2.7 seconds doing that, at least wih NVidia.
     """
 
-    x = torch.zeros((1, 1)).to(device, dtype)
-    linear = torch.nn.Linear(1, 1).to(device, dtype)
+    dev = get_optimal_device()
+    x = torch.zeros((1, 1)).to(dev, dtype)
+    linear = torch.nn.Linear(1, 1).to(dev, dtype)
     linear(x)
 
-    x = torch.zeros((1, 1, 3, 3)).to(device, dtype)
-    conv2d = torch.nn.Conv2d(1, 1, (3, 3)).to(device, dtype)
+    x = torch.zeros((1, 1, 3, 3)).to(dev, dtype)
+    conv2d = torch.nn.Conv2d(1, 1, (3, 3)).to(dev, dtype)
     conv2d(x)

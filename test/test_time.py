@@ -57,6 +57,9 @@ def parse_args():
     parser.add_argument("--align_method", type=str, choices=['wavelet', 'adain', 'nofix'], default='adain', help='color alignment method')
     parser.add_argument("--pyramid", action="store_true", help="use pyramid model")
         
+    parser.add_argument("--batch_size", type=int, default=10, help='number of images batched per forward')
+    parser.add_argument("--inference_iterations", type=int, default=100, help='number of inference iterations')
+
     return parser.parse_args()
 
 tensor_transforms = transforms.Compose([
@@ -169,25 +172,22 @@ if __name__ == "__main__":
     pooled_prompt_embeds = torch.load(os.path.join(args.embedding_dir, "pool_embeds.pt"), map_location=args.device).to(dtype=weight_dtype)
    
     total_time = 0.
-    batch_size = 10
-    inference_iterations = 100
 
-    pixel_values = torch.randn(inference_iterations, batch_size ,3,128, 128, dtype=weight_dtype, device=args.device)
-    for pixel_value in pixel_values:
-        image = main(args, pixel_value, (args.process_size, args.process_size))
-    
+    pixel_values = torch.randn(args.inference_iterations, args.batch_size, 3, 128, 128, dtype=weight_dtype, device=args.device)
+    # warmup
+    _ = main(args, pixel_values[0], (args.process_size, args.process_size))
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+
     for pixel_value in tqdm(pixel_values, desc="Inference"):
         start_time = time.time()
-        
         image = main(args, pixel_value, (args.process_size, args.process_size))
-        
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         end_time = time.time()
         total_time += (end_time - start_time)
-        # torch.cuda.empty_cache() # 不加更快
-        
-    print(transformer)
-    print(f"Average time: {total_time / inference_iterations / batch_size}")
+
+    print(f"Average time: {total_time / args.inference_iterations / args.batch_size}")
             
 
 

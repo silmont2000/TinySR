@@ -52,7 +52,8 @@ def set_seed(seed: int = 42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
 
 
 def list_images(root: str, max_num: int = 20) -> list:
@@ -267,7 +268,7 @@ def run_activation_analysis(model, image_paths, device, weight_dtype, pool_embed
                           pooled_projections=pool_embeds, return_dict=False)
         except Exception as e:
             print(f"  skip {os.path.basename(img_path)}: {e}")
-        if device.type == "cuda":
+        if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     collector.remove()
@@ -303,7 +304,7 @@ def run_activation_analysis_with_vae(model, vae, image_paths, device, weight_dty
                           pooled_projections=pool_embeds, return_dict=False)
         except Exception as e:
             print(f"  skip {os.path.basename(img_path)}: {e}")
-        if device.type == "cuda":
+        if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
     collector.remove()

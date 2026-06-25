@@ -42,6 +42,7 @@ class UniformAffineQuantizer(nn.Module):
         symmetric=True,
         per_channel=False,
         ch_axis=0,
+        group_size=-1,
         eps=1e-8,
     ):
         super().__init__()
@@ -49,6 +50,7 @@ class UniformAffineQuantizer(nn.Module):
         self.symmetric = symmetric
         self.per_channel = per_channel
         self.ch_axis = ch_axis
+        self.group_size = group_size
         self.eps = eps
         self.enabled = True
         self.observer_enabled = True
@@ -92,6 +94,26 @@ class UniformAffineQuantizer(nn.Module):
         self.zero_point = zero_point.detach()
         self.calibrated = True
 
+    @torch.no_grad()
+    def _get_qparams_per_group(self, x):
+        N, K = x.shape
+        gs = self.group_size
+        num_groups = K // gs
+        x_view = x.view(N, num_groups, gs)
+        if self.symmetric:
+            max_abs = x_view.abs().amax(dim=-1)
+            scale = max_abs / float(self.qmax)
+            scale = scale.clamp_min(self.eps)
+            zero_point = torch.zeros_like(scale)
+        else:
+            min_val = x_view.amin(dim=-1)
+            max_val = x_view.amax(dim=-1)
+            scale = (max_val - min_val) / float(self.qmax - self.qmin)
+            scale = scale.clamp_min(self.eps)
+            zero_point = self.qmin - torch.round(min_val / scale)
+            zero_point = zero_point.clamp(self.qmin, self.qmax)
+        return scale, zero_point
+
     def reshape_qparams(self, x):
         scale = self.scale
         zero_point = self.zero_point
@@ -111,6 +133,23 @@ class UniformAffineQuantizer(nn.Module):
         if not self.enabled:
             return x
 
+        if self.group_size > 0 and x.dim() >= 2:
+            orig_shape = x.shape
+            x_flat = x.reshape(-1, x.shape[-1])
+            N, K = x_flat.shape
+            gs = self.group_size
+            if K % gs != 0:
+                return x
+            num_groups = K // gs
+            scale, zero_point = self._get_qparams_per_group(x_flat)
+            scale = scale.to(device=x.device)
+            zero_point = zero_point.to(device=x.device)
+            x_view = x_flat.view(N, num_groups, gs)
+            x_int = torch.round(x_view / scale.unsqueeze(-1) + zero_point.unsqueeze(-1))
+            x_int = torch.clamp(x_int, self.qmin, self.qmax)
+            x_dequant = (x_int - zero_point.unsqueeze(-1)) * scale.unsqueeze(-1)
+            return x_dequant.view(*orig_shape)
+
         if not self.calibrated:
             self.calculate_qparams()
 
@@ -118,7 +157,6 @@ class UniformAffineQuantizer(nn.Module):
             return x
 
         scale, zero_point = self.reshape_qparams(x)
-        # return x
 
         x_int = torch.round(x / scale + zero_point)
         x_int = torch.clamp(x_int, self.qmin, self.qmax)

@@ -128,7 +128,8 @@ maniqa = pyiqa.create_metric("maniqa-pipal", device=DEVICE)
 
 # ─── 逐层消融 ────────────────────────────────────────
 results = {}
-torch.cuda.empty_cache()
+if torch.cuda.is_available():
+    torch.cuda.empty_cache()
 
 print("\n===== Baseline (no skip) =====", flush=True)
 scores_base = []
@@ -147,7 +148,8 @@ print(f"\n{'full model':>11s}  {score_base:9.4f}  {'---':>9s}")
 
 for skip_idx in range(NUM_LAYERS):
     print(f"\n===== Skip Layer {skip_idx} =====", flush=True)
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     scores = []
     for i, lc in enumerate(latents_list):
         sr = run_one(lc, skip_idx)

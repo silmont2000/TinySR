@@ -71,7 +71,7 @@ class PatchEmbed(nn.Module):
         self.interpolation_scale = interpolation_scale
 
         print("loading pos_embed")
-        self.register_buffer("pos_embed", torch.load("dataset/cache/pos_embed.pt"))
+        self.register_buffer("pos_embed", torch.load("dataset/cache/pos_embed.pt", map_location="cpu"))
         # self.pos_embed = torch.load("dataset/cache/pos_embed.pt")
 
 
@@ -455,12 +455,15 @@ class TinySD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromO
                 module.to(weight.device)
 
 if __name__ == "__main__":
+    from utils.device import get_optimal_device
+    device = get_optimal_device()
+
     model = TinySD3Transformer2DModel.from_pretrained("checkpoint/tinyfusion/tinymerge/prune-12-merge-tinysr", subfolder="transformer", low_cpu_mem_usage=False, ignore_mismatched_sizes=True)
     print(model)
-    model = model.to(torch.float16).cuda()
+    model = model.to(torch.float16).to(device)
     # torch.save(model.state_dict(), "pytorch_model.bin") # 1.3GB
-    a = torch.randn(1, 16, 64, 64).to(torch.float16).cuda()
-    b = torch.randn(1, 2048).to(torch.float16).cuda()
-    model(a, pooled_projections = b, timestep=torch.tensor([1000]).long().cuda(), return_dict=True)
+    a = torch.randn(1, 16, 64, 64).to(torch.float16).to(device)
+    b = torch.randn(1, 2048).to(torch.float16).to(device)
+    model(a, pooled_projections = b, timestep=torch.tensor([1000]).long().to(device), return_dict=True)
     print(model)
     

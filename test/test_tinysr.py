@@ -12,6 +12,7 @@ sys.path.append(".")
 import argparse
 from PIL import Image
 import torch
+from utils.device import get_optimal_device_name
 from torchvision import transforms
 from tqdm import tqdm
 import numpy as np
@@ -52,7 +53,7 @@ def parse_args():
     parser.add_argument("--latent_tiled_size", type=int, default=64, help='tiled size for transformer latent')
     parser.add_argument("--latent_tiled_overlap", type=int, default=8, help='tiled overlap for transformer latent')
 
-    parser.add_argument("--device", type=str, default="cuda")
+    parser.add_argument("--device", type=str, default=get_optimal_device_name())
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--upscale", type=int, default=4, help='upscale factor')
     parser.add_argument("--process_size", type=int, default=512, help='process size for images')
@@ -104,8 +105,7 @@ if __name__ == "__main__":
     transformer = TinySD3Transformer2DModel.from_pretrained(args.pretrained_model_name_or_path,subfolder="transformer", 
                                             torch_dtype=weight_dtype, low_cpu_mem_usage=False, ignore_mismatched_sizes=True, cache_dir=args.cache_dir)
     vae = AutoencoderTiny.from_pretrained(args.vae_path, torch_dtype=weight_dtype, cache_dir=args.cache_dir)
-    # vae = AutoencoderKL.from_pretrained(args.vae_path, torch_dtype=weight_dtype, cache_dir=args.cache_dir)
-    vae_decode = AutoencoderKL.from_pretrained("/data/disk2/xby/sd3-medium", subfolder="vae").to("cuda", weight_dtype)
+    vae_decode = vae
 
     if args.is_use_tile:
         _init_tiled_vae(vae, encoder_tile_size=args.vae_encoder_tiled_size, decoder_tile_size=args.vae_decoder_tiled_size)
@@ -147,7 +147,8 @@ if __name__ == "__main__":
     if os.path.exists(args.output_dir) is False:
         os.makedirs(args.output_dir)
 
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     if (image_names):
         lr = Image.open(image_names[0]).convert('RGB')
         ori_width, ori_height = lr.size
@@ -173,8 +174,12 @@ if __name__ == "__main__":
         for i in range(5):
             main(args, pixel_values, (new_height, new_width))
 
-    start_ev = torch.cuda.Event(enable_timing=True)
-    end_ev = torch.cuda.Event(enable_timing=True)
+    if torch.cuda.is_available():
+        start_ev = torch.cuda.Event(enable_timing=True)
+        end_ev = torch.cuda.Event(enable_timing=True)
+    else:
+        start_ev = None
+        end_ev = None
 
     total_wall_time = 0.0
     total_gpu_time = 0.0
@@ -202,17 +207,20 @@ if __name__ == "__main__":
         lr_scale = lr.resize((int(ori_width*args.upscale), int(ori_height*args.upscale)))
         pixel_values = tensor_transforms(lr).unsqueeze(0).to(args.device, dtype=weight_dtype)
 
-        torch.cuda.reset_peak_memory_stats()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         wall_start = time.time()
-        start_ev.record()
+        if torch.cuda.is_available():
+            start_ev.record()
         image = main(args, pixel_values, (new_height, new_width))
-        end_ev.record()
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            end_ev.record()
+            torch.cuda.synchronize()
         wall_end = time.time()
 
-        gpu_time = start_ev.elapsed_time(end_ev) / 1000
+        gpu_time = start_ev.elapsed_time(end_ev) / 1000 if torch.cuda.is_available() else wall_end - wall_start
         wall_time = wall_end - wall_start
-        peak_mem = torch.cuda.max_memory_allocated() / 1024**2
+        peak_mem = torch.cuda.max_memory_allocated() / 1024**2 if torch.cuda.is_available() else 0
         image_pil_image = transforms.ToPILImage()(image.cpu() / 2 + 0.5)
         total_gpu_time += gpu_time
         total_wall_time += wall_time
@@ -228,7 +236,8 @@ if __name__ == "__main__":
             pass
 
         image_pil_image.save(os.path.join(args.output_dir, os.path.basename(image_name)))
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     param_cnt = sum(p.numel() for p in transformer.transformer_blocks.parameters() )
     mem_arr = np.array(mem_records)
     print("#Param.", param_cnt/1e6, "M")

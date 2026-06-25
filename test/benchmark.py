@@ -200,7 +200,8 @@ if __name__ == "__main__":
     mem_records = []
 
     # Warmup: 5 forward passes on dummy data for GPU warmup
-    torch.cuda.empty_cache()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
     transformer.eval()
     warmup_pixels = torch.randn(args.batch_size, 3, H, W, device=args.device, dtype=weight_dtype)
     for _ in range(20):
@@ -211,16 +212,19 @@ if __name__ == "__main__":
         pixel_values = torch.randn(args.batch_size, 3, H, W, device=args.device, dtype=weight_dtype)
 
         start_time = time.time()
-        torch.cuda.reset_peak_memory_stats()
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         image, denoised = main(args, pixel_values)
-        torch.cuda.synchronize()
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         end_time = time.time()
-        peak_mem = torch.cuda.max_memory_allocated() / 1024**2
+        peak_mem = torch.cuda.max_memory_allocated() / 1024**2 if torch.cuda.is_available() else 0
 
         total_time += (end_time - start_time)
         mem_records.append(peak_mem)
 
-        torch.cuda.empty_cache()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     if args.model=='p':
         param_cnt = sum(p.numel() for p in (transformer.p_states).parameters())

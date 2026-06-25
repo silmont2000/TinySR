@@ -234,10 +234,11 @@ if __name__ == "__main__":
 
 
     # Release FP16 residuals from CUDA cache so they don't inflate peak mem
-    torch.cuda.empty_cache()
-    torch.cuda.synchronize()
-    model_mem = torch.cuda.memory_allocated() / 1024**2
-    print(f"[bench]   model memory (weights+buffers): {model_mem:.0f} MB")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        model_mem = torch.cuda.memory_allocated() / 1024**2
+        print(f"[bench]   model memory (weights+buffers): {model_mem:.0f} MB")
 
     set_observer_enabled(transformer, False)
     set_quant_enabled(transformer, True)
@@ -305,14 +306,16 @@ if __name__ == "__main__":
         pixel_values = tensor_transform(lr).unsqueeze(0).to(device, dtype=weight_dtype)
 
         # torch.cuda.synchronize()
-        torch.cuda.reset_peak_memory_stats()
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats()
         t0 = time.time()
         # --- TIMING START ---
         decoded = main(args, pixel_values, new_height, new_width, transformer, vae, timesteps, pooled_prompt_embeds, weight_dtype)
         # --- TIMING END ---
-        torch.cuda.synchronize()
+        if device.type == "cuda":
+            torch.cuda.synchronize()
         elapsed = time.time() - t0
-        peak_mem = torch.cuda.max_memory_allocated() / 1024**2
+        peak_mem = torch.cuda.max_memory_allocated() / 1024**2 if device.type == "cuda" else 0
 
         times.append(elapsed)
         mem_records.append(peak_mem)

@@ -25,6 +25,7 @@ from contextlib import nullcontext
 from pathlib import Path
 import torch.nn.functional as F
 import torch
+from utils.device import get_optimal_device_name
 import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator
@@ -459,7 +460,7 @@ def main(args):
         mult_config_path=mult_config_path,
     )
     vae = AutoencoderTiny.from_pretrained("checkpoint/vae/separable")
-    vae_decode = AutoencoderKL.from_pretrained("/data/disk2/xby/sd3-medium", subfolder="vae").to("cuda", weight_dtype)
+    vae_decode = AutoencoderKL.from_pretrained("/data/disk2/xby/sd3-medium", subfolder="vae").to(get_optimal_device_name(), weight_dtype)
 
 
     vae.requires_grad_(False)
@@ -678,7 +679,7 @@ def main(args):
         disable=not accelerator.is_local_main_process,
     )
     log_dict = {}
-    lpips = pyiqa.create_metric('lpips', as_loss=True).cuda()
+    lpips = pyiqa.create_metric('lpips', as_loss=True).to(get_optimal_device_name())
     maniqa_metric = pyiqa.create_metric('maniqa-pipal', as_loss=True, device=accelerator.device)
     maniqa_metric.requires_grad_(False)
     autocast_ctx = torch.autocast(accelerator.device.type,dtype=weight_dtype)

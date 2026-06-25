@@ -132,7 +132,7 @@ class QuantLinearW4A4(nn.Module):
         x_q = self.act_quantizer(x)
         w_q = self.weight_quantizer(weight)
         out = F.linear(x_q, w_q, self.bias)
-        branch_out = self.weight_quantizer.branch_forward(x_q) if hasattr(
+        branch_out = self.weight_quantizer.branch_forward(x) if hasattr(
             self.weight_quantizer, "branch_forward") else None
         if branch_out is not None:
             out = out + branch_out
