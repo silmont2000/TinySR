@@ -65,9 +65,6 @@ def parse_args():
     parser.add_argument("--timestep", type=float, default=1000.0)
     parser.add_argument("--rank", type=int, default=64, help="LoRA rank (must match calibration).")
 
-    parser.add_argument("--int4_cuda", action="store_true",
-                        help="Use WMMA int8 Tensor Core kernel for true int4 matmul.")
-
     return parser.parse_args()
 
 
@@ -210,7 +207,7 @@ if __name__ == "__main__":
     if quant_injected:
         print(f"[bench]   quantizer state injected (residual/branch): {quant_injected} layers")
 
-    # Pass 4: inject act_quantizer scales from state_dict (required by int4 CUDA)
+    # Pass 4: inject act_quantizer scales from state_dict
     act_loaded = 0
     for rec in replaced:
         name = rec["name"]
@@ -222,16 +219,6 @@ if __name__ == "__main__":
             act_loaded += 1
     if act_loaded:
         print(f"[bench]   act scales injected: {act_loaded} layers")
-
-    # Optionally switch to int4 dequant + cuBLAS fp16 path
-    if args.int4_cuda:
-        from models.quant.int4_pack import pack_all_quant_layers
-        n_packed = pack_all_quant_layers(transformer)
-        if n_packed:
-            print(f"[bench]   int4 dequant + cuBLAS fp16 enabled: {n_packed} layers")
-        else:
-            print("[bench]   int4 CUDA skipped (no layers packed)")
-
 
     # Release FP16 residuals from CUDA cache so they don't inflate peak mem
     if torch.cuda.is_available():
@@ -273,15 +260,6 @@ if __name__ == "__main__":
         args.output_dir = f"outputs/timing_w{args.w_bits}a{args.a_bits}_r{args.svdq_rank}_{args.quant_scope}_{ts}"
     os.makedirs(args.output_dir, exist_ok=True)
     print(f"[bench] output -> {args.output_dir}")
-    from torchao.quantization import Int4WeightOnlyConfig, quantize_
-    # config = Int4WeightOnlyConfig(
-    #     group_size=32,
-    #     # int4_packing_format="tile_packed_to_4d",
-    #     # int4_choose_qparams_algorithm="hqq",
-    # )
-    # transformer = transformer.eval().to(torch.bfloat16).to("cuda")
-    # transformer = torch.compile(transformer, mode="max-autotune")
-    # quantize_(transformer, config)
 
     # ---- Warmup ----
     if n_warmup > 0:
