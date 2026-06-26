@@ -90,16 +90,15 @@ def parse_args():
     parser.add_argument("--latent_tiled_overlap", type=int, default=8)
     parser.add_argument("--timestep", type=float, default=1000.0)
     parser.add_argument("--save_quant_meta", action="store_true")
-    parser.add_argument("--save_model_path", nargs="?", const="__auto__", default=None)
-    parser.add_argument("--load_model_path", type=str, default=None)
-    parser.add_argument("--save_quant_state", type=str, default=None,
-                        help="Save full quantized model state_dict after calibration+freeze. "
-                             "Includes all weights, quant params, smooth_scale, branch weights. "
-                             "Load back with --load_quant_state to skip calibration entirely.")
-    parser.add_argument("--load_quant_state", type=str, default=None,
-                        help="Load a previously saved quantized state_dict. "
-                             "Replaces Linear layers, loads all weights/quant params, "
-                             "disables observers, enables quantizers. Skips calibration.")
+    parser.add_argument("--save_nunchaku", type=str, default=None,
+                        help="After calibration+freeze, convert SVDQ low-rank+quantized layers "
+                             "to nunchaku compatible safetensors and save to this path. "
+                             "Requires nunchaku to be installed.")
+    parser.add_argument("--save_merged_backbone", type=str, default=None,
+                        help="After merge_and_unload(LoRA), save the complete merged backbone "
+                             "to a directory (creates config.json + model.safetensors). "
+                             "Pass this directory as --pretrained_model_name_or_path to "
+                             "nunchaku inference scripts, no separate LoRA merge needed.")
     parser.add_argument("--analyze_activation", action="store_true")
     parser.add_argument("--analyze_max_samples", type=int, default=200)
     parser.add_argument("--analyze_max_points", type=int, default=20000)
@@ -119,6 +118,105 @@ def _derive_output_dir(args):
         alpha_tag = str(int(args.svdq_smooth_alpha * 100))
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     return f"outputs/w{args.w_bits}a{args.a_bits}_svdq_r{args.svdq_rank}_{scope_tag}_a{alpha_tag}_{ts}"
+
+
+def save_nunchaku_safetensors(transformer, output_path: str):
+    from safetensors.torch import save_file
+
+    try:
+        from nunchaku.lora.flux.packer import NunchakuWeightPacker
+    except ImportError:
+        raise ImportError(
+            "nunchaku is required for --save_nunchaku. "
+            "Install from the whl: nunchaku-0.3.1+torch2.7-cp311-cp311-linux_x86_64.whl"
+        )
+
+    packer = NunchakuWeightPacker(bits=4)
+    group_size = 64
+    eps = 1e-8
+
+    state_dict = {}
+    layer_count = 0
+
+    for name, m in transformer.named_modules():
+        if not isinstance(m, QuantLinearW4A4):
+            continue
+        wq = m.weight_quantizer
+        if not hasattr(wq, "branch") or wq.branch is None:
+            continue
+
+        out_features = m.out_features
+        in_features = m.in_features
+        rank = wq.rank
+        if rank <= 0:
+            continue
+
+        smooth_scale = wq.smooth_scale
+        if smooth_scale is None:
+            smooth_scale = torch.ones(in_features, device=m.weight.device, dtype=m.weight.dtype)
+        else:
+            smooth_scale = smooth_scale.detach().to(device=m.weight.device, dtype=m.weight.dtype)
+
+        branch_a = wq.branch.a.weight.detach()  # (rank, in_features)
+        branch_b = wq.branch.b.weight.detach()  # (out_features, rank)
+
+        low_rank = branch_b @ branch_a  # (out_features, rank) @ (rank, in_features) = (out_features, in_features)
+        smoothed_weight = m.weight.detach() * smooth_scale.reshape(1, -1)
+        residual_for_nunchaku = (smoothed_weight - low_rank) / smooth_scale.reshape(1, -1)
+
+        # Per-group int4 quantization for nunchaku
+        assert in_features % group_size == 0, \
+            f"[nunchaku] in_features ({in_features}) must be divisible by group_size ({group_size}) for layer {name}"
+        residual_fp = residual_for_nunchaku.float()
+        residual_groups = residual_fp.view(out_features, in_features // group_size, group_size)
+        per_group_scale = residual_groups.abs().amax(dim=-1).clamp_min(eps) / 7.0  # (out, in//group_size)
+        qweight_int = torch.round(residual_groups / per_group_scale.unsqueeze(-1)).clamp_(-8, 7).to(torch.int32)
+        qweight_int = qweight_int.view(out_features, in_features).contiguous()
+
+        # Pack qweight: int32 → int8 packed layout
+        packed_qweight = packer.pack_weight(qweight_int)
+
+        # Pack wscales: input (out, in//group_size) → output (in//group_size, out) in nunchaku layout
+        per_group_scale_fp = per_group_scale.contiguous().to(dtype=m.weight.dtype)  # (out, in//group_size)
+        packed_wscales = packer.pack_scale(per_group_scale_fp, group_size=group_size)
+
+        # Pack proj_down / proj_up
+        # pack_lowrank_weight(down=True) handles the (rank,in) → (in,rank) transpose internally.
+        # The quantize kernel computes lora_act = RAW_x @ proj_down (no smooth division),
+        # so we must "unsmooth" proj_down by dividing by smooth_scale.
+        # This matches deepcompressor's converter: lora_down.div_(smooth.unsqueeze(0))
+        proj_down_raw = branch_a.contiguous().to(dtype=torch.float32)   # (rank, in_features)
+        proj_down_raw = proj_down_raw / smooth_scale.float().reshape(1, -1).clamp_min(eps)
+        proj_down_raw = proj_down_raw.to(dtype=m.weight.dtype)
+        proj_up_raw = branch_b.contiguous().to(dtype=m.weight.dtype)     # (out_features, rank)
+        packed_proj_down = packer.pack_lowrank_weight(proj_down_raw, down=True)
+        packed_proj_up = packer.pack_lowrank_weight(proj_up_raw, down=False)
+
+        state_dict[f"{name}.qweight"] = packed_qweight.cpu()
+        state_dict[f"{name}.wscales"] = packed_wscales.cpu()
+        state_dict[f"{name}.proj_down"] = packed_proj_down.cpu()
+        state_dict[f"{name}.proj_up"] = packed_proj_up.cpu()
+        smooth_factor_cpu = torch.ones(in_features, dtype=torch.float16)
+        state_dict[f"{name}.smooth_factor"] = smooth_factor_cpu
+        state_dict[f"{name}.smooth_factor_orig"] = smooth_factor_cpu.clone()
+        if m.bias is not None:
+            state_dict[f"{name}.bias"] = m.bias.detach().cpu().to(torch.float16)
+
+        print(
+            f"  [nunchaku] {name}: "
+            f"qweight={tuple(packed_qweight.shape)} "
+            f"wscales={tuple(packed_wscales.shape)} "
+            f"pdown={tuple(packed_proj_down.shape)} "
+            f"pup={tuple(packed_proj_up.shape)} "
+            f"rank={rank} bias={'Y' if m.bias is not None else 'N'}"
+        )
+        layer_count += 1
+
+    if layer_count == 0:
+        print("[nunchaku] WARNING: no SVDQ layers found — empty safetensors saved")
+
+    save_file(state_dict, output_path)
+    print(f"[nunchaku] saved {layer_count} layers ({len(state_dict)} tensors) -> {output_path}")
 
 
 def main():
@@ -163,78 +261,55 @@ def main():
         [args.timestep], device=device, dtype=weight_dtype)
 
     # Model preparation
-    #   Branch A: load saved state_dict → skip all calibration
-    #   Branch B: load torchao export → TorchAOQuantLinear modules（invalid）
-    #   Branch C: calibration + freeze
-    if args.load_quant_state:
-        transformer, vae = load_models(
-            args.pretrained_model_name_or_path, args.vae_path, args.lora_dir,
-            args.rank, args.cache_dir, device, weight_dtype, skip_lora=False)
-        transformer = transformer.merge_and_unload()
-        replaced_layers = replace_quant_layers(
-            transformer, args.quant_scope, args.quant_config,
-            args.w_bits, args.a_bits, args.svdq_rank, args.svdq_smooth_alpha,
-            svdq_iterations=args.svdq_iterations, act_group_size=args.act_group_size,
-            weight_group_size=args.weight_group_size)
-        missing, unexpected = transformer.load_state_dict(
-            torch.load(args.load_quant_state, map_location="cpu"), strict=False)
-        print(f"[QUANT] quant state loaded <- {args.load_quant_state}")
-        if missing:
-            print(
-                f"[QUANT]   missing keys (from backbone, expected): {len(missing)}")
-        if unexpected:
-            print(f"[QUANT]   unexpected keys: {len(unexpected)}")
-        quant_meta = collect_quant_meta(
-            transformer) if args.quant_scope != "none" else []
+    transformer, vae = load_models(
+        args.pretrained_model_name_or_path, args.vae_path, args.lora_dir,
+        args.rank, args.cache_dir, device, weight_dtype, skip_lora=False)
+    transformer = transformer.merge_and_unload()
+    if args.save_merged_backbone:
+        import json
+        from safetensors.torch import save_file
+        out_dir = args.save_merged_backbone
+        os.makedirs(out_dir, exist_ok=True)
+        weight_path = os.path.join(out_dir, "model.safetensors")
+        save_file(transformer.state_dict(), weight_path)
+        config_path = os.path.join(out_dir, "config.json")
+        with open(config_path, "w") as f:
+            json.dump(dict(transformer.config), f, indent=2)
+        print(f"[MERGED] saved merged backbone ({len(transformer.state_dict())} keys) -> {out_dir}/")
+    replaced_layers = replace_quant_layers(
+        transformer, args.quant_scope, args.quant_config,
+        args.w_bits, args.a_bits, args.svdq_rank, args.svdq_smooth_alpha,
+        svdq_iterations=args.svdq_iterations, act_group_size=args.act_group_size,
+        weight_group_size=args.weight_group_size)
 
+    if args.quant_config:
+        print("[INFO] freezing with config-provided per-layer params (no calibration)")
+        freeze_quant_params(
+            transformer, search_smooth_alpha=False, compute_error=False)
+    elif args.quant_scope != "none" and args.calib_cache and os.path.exists(args.calib_cache):
+        load_calib_cache(transformer, args.calib_cache)
     else:
-        transformer, vae = load_models(
-            args.pretrained_model_name_or_path, args.vae_path, args.lora_dir,
-            args.rank, args.cache_dir, device, weight_dtype, skip_lora=False)
-        transformer = transformer.merge_and_unload()
-        replaced_layers = replace_quant_layers(
-            transformer, args.quant_scope, args.quant_config,
-            args.w_bits, args.a_bits, args.svdq_rank, args.svdq_smooth_alpha,
-            svdq_iterations=args.svdq_iterations, act_group_size=args.act_group_size,
-            weight_group_size=args.weight_group_size)
+        calibrate_w4a4(
+            transformer, vae, calib_image_names,
+            pooled_prompt_embeds, timesteps, weight_dtype,
+            quant_scope=args.quant_scope,
+            calib_images=args.calib_images,
+            search_mode=args.search_smooth_alpha,
+            cascade_calib_images=args.cascade_calib_images,
+            load_smooth_alpha_report=args.load_smooth_alpha_report,
+            latent_tiled_size=args.latent_tiled_size,
+            latent_tiled_overlap=args.latent_tiled_overlap,
+            device=args.device, upscale=args.upscale, process_size=args.process_size,
+            alpha_grid_size=args.svdq_alpha_grid,
+        )
+        if args.calib_cache:
+            save_calib_cache(transformer, args.calib_cache)
 
-        if args.quant_config:
-            print(
-                "[INFO] freezing with config-provided per-layer params (no calibration)")
-            freeze_quant_params(
-                transformer, search_smooth_alpha=False, compute_error=False)
-        elif args.quant_scope != "none" and args.calib_cache and os.path.exists(args.calib_cache):
-            load_calib_cache(transformer, args.calib_cache)
-        else:
-            calibrate_w4a4(
-                transformer, vae, calib_image_names,
-                pooled_prompt_embeds, timesteps, weight_dtype,
-                quant_scope=args.quant_scope,
-                calib_images=args.calib_images,
-                search_mode=args.search_smooth_alpha,
-                cascade_calib_images=args.cascade_calib_images,
-                load_smooth_alpha_report=args.load_smooth_alpha_report,
-                latent_tiled_size=args.latent_tiled_size,
-                latent_tiled_overlap=args.latent_tiled_overlap,
-                device=args.device, upscale=args.upscale, process_size=args.process_size,
-                alpha_grid_size=args.svdq_alpha_grid,
-            )
-            if args.calib_cache:
-                save_calib_cache(transformer, args.calib_cache)
+    if args.save_nunchaku and args.quant_scope != "none":
+        save_nunchaku_safetensors(transformer, args.save_nunchaku)
 
-        if args.save_quant_state and args.quant_scope != "none":
-            quant_state = {}
-            for name, m in transformer.named_modules():
-                if isinstance(m, QuantLinearW4A4):
-                    for k, v in m.state_dict().items():
-                        quant_state[f"{name}.{k}"] = v
-            torch.save(quant_state, args.save_quant_state)
-            print(
-                f"[QUANT] quant state saved ({len(quant_state)} keys) -> {args.save_quant_state}")
-
-        quant_meta = collect_quant_meta(
-            transformer) if args.quant_scope != "none" else []
-        save_path = args.save_model_path
+    quant_meta = collect_quant_meta(
+        transformer) if args.quant_scope != "none" else []
 
     # Activation analysis
     analyzer = None
