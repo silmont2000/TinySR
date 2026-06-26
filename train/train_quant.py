@@ -162,7 +162,7 @@ def save_nunchaku_safetensors(transformer, output_path: str):
 
         low_rank = branch_b @ branch_a
         smoothed_weight = m.weight.detach() * smooth_scale.reshape(1, -1)
-        residual_for_nunchaku = smoothed_weight - low_rank  # keep smoothed, kernel smooth_factor handles x/s
+        residual_for_nunchaku = (smoothed_weight - low_rank) / smooth_scale.reshape(1, -1)
         # Per-group int4 quantization — use GPTQ if raw calibration inputs available
         assert in_features % group_size == 0, \
             f"[nunchaku] in_features ({in_features}) must be divisible by group_size ({group_size}) for layer {name}"
@@ -209,7 +209,7 @@ def save_nunchaku_safetensors(transformer, output_path: str):
         state_dict[f"{name}.wscales"] = packed_wscales.cpu()
         state_dict[f"{name}.proj_down"] = packed_proj_down.cpu()
         state_dict[f"{name}.proj_up"] = packed_proj_up.cpu()
-        smooth_factor_cpu = smooth_scale.cpu().to(dtype=torch.float16)
+        smooth_factor_cpu = torch.ones(in_features, dtype=torch.float16)
         state_dict[f"{name}.smooth_factor"] = smooth_factor_cpu
         state_dict[f"{name}.smooth_factor_orig"] = smooth_factor_cpu.clone()
         if m.bias is not None:
