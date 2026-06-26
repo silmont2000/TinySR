@@ -19,7 +19,7 @@ from models.quant.layers import (
     load_smooth_alpha_from_report,
 )
 from models.quant.tiler import gaussian_weights, tile_sample
-from models.quant.calibration import calibrate_and_freeze
+from models.quant.calibration import run_calibration, save_calib_cache, load_calib_cache
 from utils.wavelet_color_fix import adain_color_fix, wavelet_color_fix
 from utils.util import load_lora_state_dict
 from models.vae.autoencoder_tiny import AutoencoderTiny
@@ -192,13 +192,11 @@ def calibrate_w4a4(
     device=None, upscale=4, process_size=512,
     alpha_grid_size=7,
 ):
-    """Run calibration with the smooth_alpha priority chain.
+    """Prepare calibration data and run the calibration pipeline.
 
-    search_mode: None → use svdq_smooth_alpha from layer construction
+    search_mode: None → use preset smooth_alpha from layer construction
                  "grid" → single-pass grid search
                  "cascade" → layer-by-layer cascade freeze
-    The caller is responsible for setting the correct svdq_smooth_alpha
-    in weight_quant_kwargs before calling this function.
     """
     if quant_scope == "none":
         return
@@ -209,6 +207,7 @@ def calibrate_w4a4(
     calib_count = min(max(calib_images, 1), len(calib_image_names))
     calib_names = calib_image_names[:calib_count]
 
+    # Build calibration data: encode each image to latent
     calib_data_list = []
     for image_path in tqdm(calib_names, desc="Building calib data"):
         model_input, _ = image_to_latent(
@@ -226,14 +225,12 @@ def calibrate_w4a4(
         smooth_alpha_override = load_smooth_alpha_from_report(
             load_smooth_alpha_report)
 
-    calibrate_and_freeze(
+    run_calibration(
         transformer, calib_data_list, _forward_fn,
         quant_scope=quant_scope,
         search_mode=search_mode,
         cascade_calib_images=cascade_calib_images,
         smooth_alpha_override=smooth_alpha_override,
-        latent_tiled_size=latent_tiled_size,
-        latent_tiled_overlap=latent_tiled_overlap,
         alpha_grid_size=alpha_grid_size,
     )
 

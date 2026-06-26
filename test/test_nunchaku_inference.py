@@ -248,7 +248,10 @@ if __name__ == "__main__":
 
     datalen = len(image_names)
     print(f"image_num {datalen}")
-    os.makedirs(args.output_dir, exist_ok=True)
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    os.makedirs(args.output_dir+ts, exist_ok=True)
 
     tensor_transforms = transforms.Compose([transforms.ToTensor()])
 

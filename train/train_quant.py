@@ -11,7 +11,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from models.quant.layers import QuantLinearW4A4, collect_quant_meta, set_quant_enabled, set_observer_enabled
 from models.quant.calibration import load_calib_cache, save_calib_cache
-from models.quant.freeze import freeze_quant_params
+from models.quant.calibrate import calibrate_all_layers
 from models.quant.inference import (
     calibrate_w4a4,
     get_image_names,
@@ -160,18 +160,31 @@ def save_nunchaku_safetensors(transformer, output_path: str):
         branch_a = wq.branch.a.weight.detach()  # (rank, in_features)
         branch_b = wq.branch.b.weight.detach()  # (out_features, rank)
 
-        low_rank = branch_b @ branch_a  # (out_features, rank) @ (rank, in_features) = (out_features, in_features)
+        low_rank = branch_b @ branch_a
         smoothed_weight = m.weight.detach() * smooth_scale.reshape(1, -1)
-        residual_for_nunchaku = (smoothed_weight - low_rank) / smooth_scale.reshape(1, -1)
-
-        # Per-group int4 quantization for nunchaku
+        residual_for_nunchaku = smoothed_weight - low_rank  # keep smoothed, kernel smooth_factor handles x/s
+        # Per-group int4 quantization — use GPTQ if raw calibration inputs available
         assert in_features % group_size == 0, \
             f"[nunchaku] in_features ({in_features}) must be divisible by group_size ({group_size}) for layer {name}"
-        residual_fp = residual_for_nunchaku.float()
-        residual_groups = residual_fp.view(out_features, in_features // group_size, group_size)
-        per_group_scale = residual_groups.abs().amax(dim=-1).clamp_min(eps) / 7.0  # (out, in//group_size)
-        qweight_int = torch.round(residual_groups / per_group_scale.unsqueeze(-1)).clamp_(-8, 7).to(torch.int32)
-        qweight_int = qweight_int.view(out_features, in_features).contiguous()
+
+        raw_cache = getattr(wq, "raw_input_cache", None)
+        raw_samples = sum(t.shape[0] for t in raw_cache) if raw_cache else 0
+        gptq_used = (raw_samples > 0)
+        if gptq_used:
+            from models.quant.ops import gptq_per_group_int4
+            raw_inputs = torch.cat(raw_cache, dim=0).to(
+                device=residual_for_nunchaku.device, dtype=torch.float32)
+            qweight_int, per_group_scale = gptq_per_group_int4(
+                residual_for_nunchaku, raw_inputs, group_size=group_size, bits=4,
+                symmetric=True, block_size=128, damp_percentage=0.01, eps=eps)
+            per_group_scale = per_group_scale.to(dtype=m.weight.dtype)
+            qweight_int = qweight_int.to(torch.int32)
+        else:
+            residual_fp = residual_for_nunchaku.float()
+            residual_groups = residual_fp.view(out_features, in_features // group_size, group_size)
+            per_group_scale = residual_groups.abs().amax(dim=-1).clamp_min(eps) / 7.0
+            qweight_int = torch.round(residual_groups / per_group_scale.unsqueeze(-1)).clamp_(-8, 7).to(torch.int32)
+            qweight_int = qweight_int.view(out_features, in_features).contiguous()
 
         # Pack qweight: int32 → int8 packed layout
         packed_qweight = packer.pack_weight(qweight_int)
@@ -185,7 +198,7 @@ def save_nunchaku_safetensors(transformer, output_path: str):
         # The quantize kernel computes lora_act = RAW_x @ proj_down (no smooth division),
         # so we must "unsmooth" proj_down by dividing by smooth_scale.
         # This matches deepcompressor's converter: lora_down.div_(smooth.unsqueeze(0))
-        proj_down_raw = branch_a.contiguous().to(dtype=torch.float32)   # (rank, in_features)
+        proj_down_raw = branch_a.contiguous().to(dtype=torch.float32)  # (rank, in_features)
         proj_down_raw = proj_down_raw / smooth_scale.float().reshape(1, -1).clamp_min(eps)
         proj_down_raw = proj_down_raw.to(dtype=m.weight.dtype)
         proj_up_raw = branch_b.contiguous().to(dtype=m.weight.dtype)     # (out_features, rank)
@@ -196,7 +209,7 @@ def save_nunchaku_safetensors(transformer, output_path: str):
         state_dict[f"{name}.wscales"] = packed_wscales.cpu()
         state_dict[f"{name}.proj_down"] = packed_proj_down.cpu()
         state_dict[f"{name}.proj_up"] = packed_proj_up.cpu()
-        smooth_factor_cpu = torch.ones(in_features, dtype=torch.float16)
+        smooth_factor_cpu = smooth_scale.cpu().to(dtype=torch.float16)
         state_dict[f"{name}.smooth_factor"] = smooth_factor_cpu
         state_dict[f"{name}.smooth_factor_orig"] = smooth_factor_cpu.clone()
         if m.bias is not None:
@@ -208,7 +221,8 @@ def save_nunchaku_safetensors(transformer, output_path: str):
             f"wscales={tuple(packed_wscales.shape)} "
             f"pdown={tuple(packed_proj_down.shape)} "
             f"pup={tuple(packed_proj_up.shape)} "
-            f"rank={rank} bias={'Y' if m.bias is not None else 'N'}"
+            f"rank={rank} bias={'Y' if m.bias is not None else 'N'} "
+            f"{'GPTQ('+str(raw_samples)+')' if gptq_used else 'MINMAX'}"
         )
         layer_count += 1
 
@@ -270,7 +284,7 @@ def main():
         from safetensors.torch import save_file
         out_dir = args.save_merged_backbone
         os.makedirs(out_dir, exist_ok=True)
-        weight_path = os.path.join(out_dir, "model.safetensors")
+        weight_path = os.path.join(out_dir, "diffusion_pytorch_model.safetensors")
         save_file(transformer.state_dict(), weight_path)
         config_path = os.path.join(out_dir, "config.json")
         with open(config_path, "w") as f:
@@ -284,8 +298,8 @@ def main():
 
     if args.quant_config:
         print("[INFO] freezing with config-provided per-layer params (no calibration)")
-        freeze_quant_params(
-            transformer, search_smooth_alpha=False, compute_error=False)
+        calibrate_all_layers(
+            transformer, do_search=False, compute_error=False)
     elif args.quant_scope != "none" and args.calib_cache and os.path.exists(args.calib_cache):
         load_calib_cache(transformer, args.calib_cache)
     else:
@@ -343,7 +357,7 @@ def main():
           f"count={timing['timed_image_count']}")
 
     save_report(args.output_dir, vars(args), replaced_layers,
-                quant_meta if args.save_quant_meta else [], timing)
+                quant_meta, timing)
 
 
 if __name__ == "__main__":

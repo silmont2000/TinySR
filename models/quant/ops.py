@@ -48,6 +48,73 @@ def affine_fake_quant_weight(weight, bits=4, symmetric=True, eps=1e-8, group_siz
 
 
 @torch.no_grad()
+def gptq_per_group_int4(weight, inputs, group_size=64, bits=4, symmetric=True,
+                        block_size=128, damp_percentage=0.01, eps=1e-8):
+    """Per-group GPTQ for nunchaku export. Returns (int4_weight, scales)."""
+    out_feat, in_feat = weight.shape
+    assert in_feat % group_size == 0
+    num_groups = in_feat // group_size
+    qmin = -(2 ** (bits - 1))
+    qmax = 2 ** (bits - 1) - 1
+
+    work_weight = weight.float()
+    work_inputs = inputs.float().to(device=weight.device)
+
+    qweight_int = torch.zeros(out_feat, in_feat, dtype=torch.int32, device=weight.device)
+    all_scales = torch.zeros(out_feat, num_groups, dtype=torch.float32, device=weight.device)
+
+    for g in range(num_groups):
+        g_start = g * group_size
+        g_end = g_start + group_size
+        w_g = work_weight[:, g_start:g_end].clone()
+        x_g = work_inputs[:, g_start:g_end]
+
+        scales_g = w_g.abs().amax(dim=1).div(float(qmax)).clamp_min(eps)
+
+        H = x_g.T @ x_g
+        dead = H.diagonal() == 0
+        if dead.any():
+            H[dead, dead] = 1
+            w_g[:, dead] = 0
+
+        importance = torch.diag(H)
+        perm = torch.argsort(importance, descending=True)
+        H = H[perm][:, perm]
+        w_g = w_g[:, perm]
+
+        H_diag = H.diagonal()
+        H_diag += damp_percentage * H_diag.mean()
+        H_inv = None
+        for _ in range(200):
+            try:
+                L = torch.linalg.cholesky(H)
+                H_inv = torch.cholesky_inverse(L)
+                H_inv = torch.linalg.cholesky(H_inv, upper=True)
+                break
+            except RuntimeError:
+                H_diag += (damp_percentage * 0.1) * H_diag.mean()
+
+        if H_inv is None:
+            q_g = torch.round(w_g / scales_g.unsqueeze(1)).clamp(qmin, qmax)
+        else:
+            q_g = torch.zeros_like(w_g)
+            for col in range(group_size):
+                column = w_g[:, col]
+                pos_diag = H_inv[col, col].clamp_min(eps)
+                qcol = torch.round(column / scales_g).clamp(qmin, qmax)
+                q_g[:, col] = qcol
+                err = (column - qcol * scales_g) / pos_diag
+                if col < group_size - 1:
+                    w_g[:, col + 1:] -= err.unsqueeze(1) * H_inv[col, col + 1:].unsqueeze(0)
+
+        q_g = q_g[:, torch.argsort(perm)]
+        qweight_int[:, g_start:g_end] = q_g.to(torch.int32)
+        all_scales[:, g] = scales_g
+
+    return qweight_int, all_scales
+
+
+@torch.no_grad()
 def gptq_quantize_linear_weight(
     weight,
     inputs,
@@ -62,7 +129,9 @@ def gptq_quantize_linear_weight(
         return affine_fake_quant_weight(weight, bits=bits, symmetric=symmetric, eps=eps, group_size=group_size)
 
     if group_size > 0:
-        return affine_fake_quant_weight(weight, bits=bits, symmetric=symmetric, eps=eps, group_size=group_size)
+        return gptq_per_group_int4(weight, inputs, group_size=group_size, bits=bits,
+                                   symmetric=symmetric, block_size=block_size,
+                                   damp_percentage=damp_percentage, eps=eps)
 
     orig_dtype = weight.dtype
     work_weight = weight.float()

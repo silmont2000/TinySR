@@ -300,6 +300,7 @@ class LowRankAffineQuantComponent(QuantComponent):
         self.register_buffer("act_absmax", None)
         self.register_buffer("residual", None)
         self.input_cache = []
+        self.raw_input_cache = []       # raw x for nunchaku export GPTQ (before smooth)
 
     @property
     def enabled(self):
@@ -369,6 +370,7 @@ class LowRankAffineQuantComponent(QuantComponent):
         self.act_absmax = None
         self.residual = None
         self.input_cache = []
+        self.raw_input_cache = []
         self.svd_iter_trace = []
 
     @torch.no_grad()
@@ -384,6 +386,7 @@ class LowRankAffineQuantComponent(QuantComponent):
 
         inputs = None
         if self.input_cache:
+            self.raw_input_cache = list(self.input_cache)   # keep raw x for nunchaku export GPTQ
             inputs = torch.cat(self.input_cache, dim=0).to(
                 device=weight.device, dtype=weight.dtype)
             inputs = inputs / self.smooth_scale.reshape(1, -1)
