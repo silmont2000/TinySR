@@ -299,6 +299,7 @@ class LowRankAffineQuantComponent(QuantComponent):
         self.register_buffer("smooth_scale", None)
         self.register_buffer("act_absmax", None)
         self.register_buffer("residual", None)
+        self.register_buffer("_nunchaku_residual", None)  # per-group-per-channel GPTQ for alignment
         self.input_cache = []
         self.raw_input_cache = []       # raw x for nunchaku export GPTQ (before smooth)
 
@@ -406,7 +407,33 @@ class LowRankAffineQuantComponent(QuantComponent):
         )
 
         self.input_cache = []
+        if self.branch is not None and self.rank > 0:
+            self._build_nunchaku_residual(
+                weight, self.branch.get_effective_weight(), self.smooth_scale)
         return self.branch
+
+    def _build_nunchaku_residual(self, weight, low_rank, smooth_scale):
+        """Compute per-group-per-channel GPTQ residual matching nunchaku export."""
+        if self.raw_input_cache is None or len(self.raw_input_cache) == 0:
+            self._nunchaku_residual = None
+            return
+
+        from models.quant.ops import gptq_per_group_int4
+
+        target = (weight * smooth_scale.reshape(1, -1) - low_rank) / smooth_scale.reshape(1, -1)
+        raw_inputs = torch.cat(self.raw_input_cache, dim=0).to(
+            device=weight.device, dtype=torch.float32)
+
+        group_size = 64
+        q_int, scales = gptq_per_group_int4(
+            target.float(), raw_inputs, group_size=group_size, bits=4,
+            symmetric=True, block_size=self.gptq_block_size,
+            damp_percentage=self.gptq_damp_percentage, eps=self.quantizer.eps,
+        )
+        out_feat, in_feat = target.shape
+        n_groups = in_feat // group_size
+        deq = (q_int.float() * scales.unsqueeze(-1).expand(-1, -1, group_size).reshape(out_feat, in_feat))
+        self._nunchaku_residual = deq.to(dtype=weight.dtype)
 
     def forward(self, x):   # x = 原始权重 weight
         if self.observer_enabled:

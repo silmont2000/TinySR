@@ -94,6 +94,9 @@ class QuantLinearW4A4(nn.Module):
                 pass
 
     def forward(self, x):
+        if getattr(self, "_nunchaku_aligned", False) and self.weight_quantizer._nunchaku_residual is not None:
+            return self._forward_nunchaku_aligned(x)
+
         if hasattr(self.weight_quantizer, "collect_inputs") and self.weight_quantizer.observer_enabled:
             self.weight_quantizer.collect_inputs(x)
         smooth_scale = getattr(self.weight_quantizer, "smooth_scale", None)
@@ -111,6 +114,37 @@ class QuantLinearW4A4(nn.Module):
         if branch_out is not None:
             out = out + branch_out
         return out
+
+    def _forward_nunchaku_aligned(self, x):
+        """Nunchaku-aligned forward: dynamic per-group act quant + per-group residual."""
+        wq = self.weight_quantizer
+        group_size = getattr(self.act_quantizer.quantizer, "group_size", 64)
+
+        # 1. Dynamic per-group int4 act quantization (matches CUDA kernel)
+        n_groups = x.shape[-1] // group_size
+        x_view = x.reshape(-1, n_groups, group_size)
+        act_scale = x_view.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / 7.0
+        x_q = (torch.round(x_view / act_scale) * act_scale).reshape_as(x)
+
+        # 2. Per-group-per-channel GPTQ residual (matches exported qweight + wscales)
+        w_q = wq._nunchaku_residual
+
+        out = F.linear(x_q, w_q, self.bias)
+
+        # 3. Lora branch: x @ (A/s)^T @ B^T  (unsmoothed proj_down, matches nunchaku)
+        if wq.branch is not None and wq.rank > 0:
+            s = wq.smooth_scale
+            proj_down = wq.branch.a.weight  # (rank, in)
+            proj_down_uns = proj_down / s.reshape(1, -1).clamp_min(1e-8)
+            lora_h = F.linear(x, proj_down_uns)        # (N, rank)
+            lora_h = lora_h.to(dtype=wq.branch.b.weight.dtype)
+            lora_out = F.linear(lora_h, wq.branch.b.weight)  # (N, out)
+            out = out + wq.alpha * lora_out
+
+        return out
+
+    def enable_nunchaku_aligned(self):
+        self._nunchaku_aligned = True
 
 
 def _expand_braces(pattern):
