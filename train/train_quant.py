@@ -85,20 +85,24 @@ def parse_args():
                         default="ffn_only")
     parser.add_argument("--calib_images", type=int, default=8)
     parser.add_argument("--calib_cache", type=str, default=None)
+    parser.add_argument("--enable_hadamard_rotate", action="store_true")
+    parser.add_argument("--align_nunchaku_inference", action="store_true",
+                        help="After calibration, switch QuantLinearW4A4 forward to nunchaku-aligned "
+                             "path (dynamic per-group act quant + per-group residual + unsmoothed lora). "
+                             "Makes train_quant validation output match nunchaku inference exactly.")
     parser.add_argument("--warmup_images", type=int, default=1)
     parser.add_argument("--latent_tiled_size", type=int, default=64)
     parser.add_argument("--latent_tiled_overlap", type=int, default=8)
     parser.add_argument("--timestep", type=float, default=1000.0)
     parser.add_argument("--save_quant_meta", action="store_true")
-    parser.add_argument("--save_nunchaku", type=str, default=None,
+    parser.add_argument("--save_nunchaku", type=str, default="__auto__",
                         help="After calibration+freeze, convert SVDQ low-rank+quantized layers "
                              "to nunchaku compatible safetensors and save to this path. "
-                             "Requires nunchaku to be installed.")
-    parser.add_argument("--save_merged_backbone", type=str, default=None,
+                             "Default: <output_dir>/nunchaku.safetensors. Pass empty string to disable.")
+    parser.add_argument("--save_merged_backbone", type=str, default="__auto__",
                         help="After merge_and_unload(LoRA), save the complete merged backbone "
                              "to a directory (creates config.json + model.safetensors). "
-                             "Pass this directory as --pretrained_model_name_or_path to "
-                             "nunchaku inference scripts, no separate LoRA merge needed.")
+                             "Default: <output_dir>/merged_backbone. Pass empty string to disable.")
     parser.add_argument("--analyze_activation", action="store_true")
     parser.add_argument("--analyze_max_samples", type=int, default=200)
     parser.add_argument("--analyze_max_points", type=int, default=20000)
@@ -212,6 +216,8 @@ def save_nunchaku_safetensors(transformer, output_path: str):
         smooth_factor_cpu = torch.ones(in_features, dtype=torch.float16)
         state_dict[f"{name}.smooth_factor"] = smooth_factor_cpu
         state_dict[f"{name}.smooth_factor_orig"] = smooth_factor_cpu.clone()
+        if hasattr(m, "hadamard_signs") and m.hadamard_signs is not None:
+            state_dict[f"{name}.hadamard_rotated"] = torch.tensor([1], dtype=torch.int32)
         if m.bias is not None:
             state_dict[f"{name}.bias"] = m.bias.detach().cpu().to(torch.float16)
 
@@ -228,6 +234,12 @@ def save_nunchaku_safetensors(transformer, output_path: str):
 
     if layer_count == 0:
         print("[nunchaku] WARNING: no SVDQ layers found — empty safetensors saved")
+
+    # Save rotation matrices (global, shared by all rotated layers)
+    rot_mats = getattr(transformer, "_hadamard_rotation_matrices", None)
+    if rot_mats:
+        for size, Q in rot_mats.items():
+            state_dict[f"_rotation.{size}"] = Q.cpu().contiguous()
 
     save_file(state_dict, output_path)
     print(f"[nunchaku] saved {layer_count} layers ({len(state_dict)} tensors) -> {output_path}")
@@ -266,6 +278,16 @@ def main():
     if args.output_dir is None:
         args.output_dir = _derive_output_dir(args)
     print(f"[INFO] output_dir: {args.output_dir}")
+    if args.save_merged_backbone == "__auto__":
+        args.save_merged_backbone = os.path.join(args.output_dir, "merged_backbone")
+    if args.save_nunchaku == "__auto__":
+        args.save_nunchaku = os.path.join(args.output_dir, "nunchaku.safetensors")
+
+    if args.align_nunchaku_inference:
+        if args.weight_group_size < 0:
+            args.weight_group_size = 64
+        if args.act_group_size < 0:
+            args.act_group_size = 64
 
     # Shared runtime data
     pooled_prompt_embeds = torch.load(
@@ -296,6 +318,12 @@ def main():
         svdq_iterations=args.svdq_iterations, act_group_size=args.act_group_size,
         weight_group_size=args.weight_group_size)
 
+    if args.enable_hadamard_rotate:
+        from models.quant.hadamard import enable_rotation
+        rotation_matrices = enable_rotation(transformer)
+        # Store rotation matrices on the transformer for export
+        transformer._hadamard_rotation_matrices = rotation_matrices
+
     if args.quant_config:
         print("[INFO] freezing with config-provided per-layer params (no calibration)")
         calibrate_all_layers(
@@ -318,6 +346,13 @@ def main():
         )
         if args.calib_cache:
             save_calib_cache(transformer, args.calib_cache)
+
+    if args.align_nunchaku_inference and args.quant_scope != "none":
+        from models.quant.layers import QuantLinearW4A4
+        for name, m in transformer.named_modules():
+            if isinstance(m, QuantLinearW4A4):
+                m.enable_nunchaku_aligned()
+        print(f"[ALIGN] nunchaku-aligned inference enabled on QuantLinearW4A4 layers")
 
     if args.save_nunchaku and args.quant_scope != "none":
         save_nunchaku_safetensors(transformer, args.save_nunchaku)

@@ -51,6 +51,8 @@ def parse_args():
     parser.add_argument("--latent_tiled_size", type=int, default=64)
     parser.add_argument("--latent_tiled_overlap", type=int, default=8)
     parser.add_argument("--batch_size", type=int, default=1)
+    parser.add_argument("--profile_nunchaku", action="store_true",
+                        help="Enable per-layer nunchaku call counting and timing.")
     return parser.parse_args()
 
 
@@ -146,8 +148,8 @@ def tile_sample(lq_latent, transformer, timesteps, pooled_prompt_embeds, weight_
     return noise_pred
 
 
-def replace_linear_with_nunchaku(module, target_suffixes, exclude_keywords, rank):
-    from nunchaku.models.linear import SVDQW4A4Linear
+def replace_linear_with_nunchaku(module, target_suffixes, exclude_keywords, rank, profile=False):
+    from tinysd3_nunchaku_w4a4 import NunchakuSVDQLinear
 
     replaced = []
     for name, child in list(module.named_modules()):
@@ -160,11 +162,25 @@ def replace_linear_with_nunchaku(module, target_suffixes, exclude_keywords, rank
 
         parent_name, child_name = name.rsplit(".", 1) if "." in name else ("", name)
         parent = module.get_submodule(parent_name) if parent_name else module
-        quant_linear = SVDQW4A4Linear.from_linear(child, rank=rank, torch_dtype=child.weight.dtype)
+        quant_linear = NunchakuSVDQLinear(
+            in_features=child.in_features,
+            out_features=child.out_features,
+            rank=rank,
+            bias=child.bias is not None,
+            torch_dtype=child.weight.dtype,
+            device=child.weight.device,
+        )
+        if profile:
+            quant_linear.enable_profile = True
+            quant_linear.debug_name = name
+
         setattr(parent, child_name, quant_linear)
         replaced.append(name)
 
-    print(f"[NUNCHAKU] replaced {len(replaced)} nn.Linear -> SVDQW4A4Linear")
+    if profile:
+        print(f"[NUNCHAKU] profiling enabled on {len(replaced)} layers")
+    else:
+        print(f"[NUNCHAKU] replaced {len(replaced)} nn.Linear -> NunchakuSVDQLinear")
     return replaced
 
 
@@ -179,6 +195,16 @@ def load_nunchaku_state(transformer, state_path):
         (".qweight", ".wscales", ".proj_down", ".proj_up", ".smooth_factor", ".bias")
     )]
     print(f"[NUNCHAKU] loaded {len(nunchaku_keys)} nunchaku tensors from {state_path}")
+
+    # Register Hadamard rotation hooks
+    if rotation_matrices:
+        from models.quant.hadamard import make_rotate_input_hook
+        for name, m in transformer.named_modules():
+            if name in rotated_layer_names:
+                Q = rotation_matrices[m.in_features]
+                m.register_forward_pre_hook(make_rotate_input_hook(Q))
+        print(f"[NUNCHAKU] registered rotation hooks on {len(rotated_layer_names)} layers")
+
     if missing:
         nunchaku_missing = [k for k in missing if any(
             k.endswith(s) for s in (".qweight", ".wscales", ".proj_down",
@@ -191,7 +217,12 @@ def load_nunchaku_state(transformer, state_path):
         if non_nunchaku_missing:
             print(f"[NUNCHAKU]   non-nunchaku missing (backbone, expected): {non_nunchaku_missing}")
     if unexpected:
-        print(f"[NUNCHAKU]   unexpected keys: {len(unexpected)}")
+        rotation_unexpected = [k for k in unexpected if k.startswith("_rotation.") or k.endswith(".hadamard_rotated")]
+        other_unexpected = [k for k in unexpected if k not in rotation_unexpected]
+        if other_unexpected:
+            print(f"[NUNCHAKU]   unexpected keys: {len(other_unexpected)}")
+        if rotation_unexpected:
+            print(f"[NUNCHAKU]   rotation keys extracted: {len(rotation_unexpected)} (handled separately)")
 
 
 if __name__ == "__main__":
@@ -205,6 +236,11 @@ if __name__ == "__main__":
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
+
+    # Prefix output dir with the calibration run name (parent of merged_backbone)
+    calib_dir = os.path.basename(os.path.dirname(args.pretrained_model_name_or_path))
+    args.output_dir = f"outputs/tinysr_nunchaku_{calib_dir}"
+    os.makedirs(args.output_dir, exist_ok=True)
 
     print("[NUNCHAKU] loading merged backbone ...")
     transformer = TinySD3Transformer2DModel.from_pretrained(
@@ -221,8 +257,22 @@ if __name__ == "__main__":
     exclude_keywords = tuple(
         s.strip() for s in args.quant_exclude_keywords.split(",") if s.strip()
     )
+
+    # Scan safetensors for Hadamard rotation info
+    from safetensors.torch import load_file as _load_st
+    nk_state = _load_st(args.nunchaku_state)
+    rotation_matrices = {}
+    rotated_layer_names = set()
+    for k, v in nk_state.items():
+        if k.endswith(".hadamard_rotated"):
+            rotated_layer_names.add(k.rsplit(".", 1)[0])
+        elif k.startswith("_rotation."):
+            size = int(k.split(".")[1])
+            rotation_matrices[size] = v
+
     replaced = replace_linear_with_nunchaku(
-        transformer, target_suffixes, exclude_keywords, args.rank)
+        transformer, target_suffixes, exclude_keywords, args.rank,
+        profile=args.profile_nunchaku)
 
     load_nunchaku_state(transformer, args.nunchaku_state)
 
@@ -363,3 +413,15 @@ if __name__ == "__main__":
 
     pbar.close()
     print(f"Average time: {total_time / max(datalen, 1):.4f}s")
+
+    if args.profile_nunchaku:
+        from tinysd3_nunchaku_w4a4 import summarize_nunchaku_profile
+        stats = summarize_nunchaku_profile(transformer)
+        print(f"[NUNCHAKU][PROFILE] layers: {stats['layers']}")
+        print(f"[NUNCHAKU][PROFILE] called_layers: {stats['called_layers']}")
+        print(f"[NUNCHAKU][PROFILE] total_calls: {stats['calls']}")
+        print(f"[NUNCHAKU][PROFILE] backend_calls: {stats['backend_calls']}")
+        print(f"[NUNCHAKU][PROFILE] fallback_calls: {stats['fallback_calls']}")
+        print(f"[NUNCHAKU][PROFILE] backend_ms: {stats['backend_ms']:.1f}")
+        if stats['calls']:
+            print(f"[NUNCHAKU][PROFILE] backend_ratio: {stats['backend_calls']/stats['calls']:.4f}")

@@ -115,6 +115,19 @@ def gptq_per_group_int4(weight, inputs, group_size=64, bits=4, symmetric=True,
 
 
 @torch.no_grad()
+def gptq_per_group_dequant(weight, inputs, group_size=64, bits=4, symmetric=True,
+                           block_size=128, damp_percentage=0.01, eps=1e-8):
+    """Per-group GPTQ for train_quant calibration, returns dequantized FP weights."""
+    qw_int, scales = gptq_per_group_int4(
+        weight, inputs, group_size=group_size, bits=bits, symmetric=symmetric,
+        block_size=block_size, damp_percentage=damp_percentage, eps=eps)
+    out_feat, in_feat = qw_int.shape
+    num_groups = in_feat // group_size
+    scales_expanded = scales.unsqueeze(-1).expand(out_feat, num_groups, group_size).reshape(out_feat, in_feat)
+    return qw_int.float().mul_(scales_expanded).to(dtype=weight.dtype)
+
+
+@torch.no_grad()
 def gptq_quantize_linear_weight(
     weight,
     inputs,
@@ -129,9 +142,9 @@ def gptq_quantize_linear_weight(
         return affine_fake_quant_weight(weight, bits=bits, symmetric=symmetric, eps=eps, group_size=group_size)
 
     if group_size > 0:
-        return gptq_per_group_int4(weight, inputs, group_size=group_size, bits=bits,
-                                   symmetric=symmetric, block_size=block_size,
-                                   damp_percentage=damp_percentage, eps=eps)
+        return gptq_per_group_dequant(weight, inputs, group_size=group_size, bits=bits,
+                                      symmetric=symmetric, block_size=block_size,
+                                      damp_percentage=damp_percentage, eps=eps)
 
     orig_dtype = weight.dtype
     work_weight = weight.float()
