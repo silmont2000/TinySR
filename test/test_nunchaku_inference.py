@@ -53,6 +53,14 @@ def parse_args():
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--profile_nunchaku", action="store_true",
                         help="Enable per-layer nunchaku call counting and timing.")
+    parser.add_argument("--benchmark", action="store_true",
+                        help="Benchmark mode: random tensors, skip VAE, measure raw transformer time.")
+    parser.add_argument("--bench_iterations", type=int, default=100,
+                        help="Number of benchmark iterations.")
+    parser.add_argument("--bench_latent_h", type=int, default=64,
+                        help="Height of random latent tensor for benchmark.")
+    parser.add_argument("--bench_latent_w", type=int, default=64,
+                        help="Width of random latent tensor for benchmark.")
     return parser.parse_args()
 
 
@@ -148,8 +156,9 @@ def tile_sample(lq_latent, transformer, timesteps, pooled_prompt_embeds, weight_
     return noise_pred
 
 
-def replace_linear_with_nunchaku(module, target_suffixes, exclude_keywords, rank, profile=False):
+def replace_linear_with_nunchaku(module, target_suffixes, exclude_keywords, rank, profile=False, padded_dims=None):
     from tinysd3_nunchaku_w4a4 import NunchakuSVDQLinear
+    padded_dims = padded_dims or {}
 
     replaced = []
     for name, child in list(module.named_modules()):
@@ -160,10 +169,11 @@ def replace_linear_with_nunchaku(module, target_suffixes, exclude_keywords, rank
         if exclude_keywords and any(kw in name for kw in exclude_keywords):
             continue
 
+        in_features = padded_dims.get(name, child.in_features)
         parent_name, child_name = name.rsplit(".", 1) if "." in name else ("", name)
         parent = module.get_submodule(parent_name) if parent_name else module
         quant_linear = NunchakuSVDQLinear(
-            in_features=child.in_features,
+            in_features=in_features,
             out_features=child.out_features,
             rank=rank,
             bias=child.bias is not None,
@@ -196,15 +206,6 @@ def load_nunchaku_state(transformer, state_path):
     )]
     print(f"[NUNCHAKU] loaded {len(nunchaku_keys)} nunchaku tensors from {state_path}")
 
-    # Register Hadamard rotation hooks
-    if rotation_matrices:
-        from models.quant.hadamard import make_rotate_input_hook
-        for name, m in transformer.named_modules():
-            if name in rotated_layer_names:
-                Q = rotation_matrices[m.in_features]
-                m.register_forward_pre_hook(make_rotate_input_hook(Q))
-        print(f"[NUNCHAKU] registered rotation hooks on {len(rotated_layer_names)} layers")
-
     if missing:
         nunchaku_missing = [k for k in missing if any(
             k.endswith(s) for s in (".qweight", ".wscales", ".proj_down",
@@ -223,6 +224,50 @@ def load_nunchaku_state(transformer, state_path):
             print(f"[NUNCHAKU]   unexpected keys: {len(other_unexpected)}")
         if rotation_unexpected:
             print(f"[NUNCHAKU]   rotation keys extracted: {len(rotation_unexpected)} (handled separately)")
+
+
+def run_nunchaku_benchmark(args, transformer, timesteps, pooled_prompt_embeds, weight_dtype, device):
+    """Benchmark transformer only (skip VAE, use random latents)."""
+    in_channels = transformer.config.in_channels
+    latent_h, latent_w = args.bench_latent_h, args.bench_latent_w
+    print(f"[BENCH] latent: {args.batch_size} × {in_channels} × {latent_h} × {latent_w}, "
+          f"{args.bench_iterations} iterations")
+
+    # Random input tensors (mimic VAE-encoded latents)
+    latents = torch.randn(args.bench_iterations, args.batch_size, in_channels,
+                          latent_h, latent_w, device=device, dtype=weight_dtype)
+
+    # Warmup
+    print(f"[BENCH] warming up ({args.warmup} iters)...")
+    for i in range(args.warmup):
+        _ = transformer(
+            hidden_states=latents[i % len(latents)],
+            timestep=timesteps,
+            pooled_projections=pooled_prompt_embeds,
+            return_dict=False,
+        )[0]
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+
+    # Timed run
+    print(f"[BENCH] running {args.bench_iterations} iterations...")
+    times = []
+    for i in tqdm(range(args.bench_iterations), desc="bench"):
+        start = time.time()
+        _ = transformer(
+            hidden_states=latents[i],
+            timestep=timesteps,
+            pooled_projections=pooled_prompt_embeds,
+            return_dict=False,
+        )[0]
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        times.append(time.time() - start)
+
+    avg_ms = sum(times) / len(times) * 1000
+    avg_per_sample_ms = avg_ms / args.batch_size
+    print(f"[BENCH] avg: {avg_ms:.2f}ms/iter  ({avg_per_sample_ms:.2f}ms/sample)  "
+          f"batch={args.batch_size}  latent={latent_h}×{latent_w}")
 
 
 if __name__ == "__main__":
@@ -248,6 +293,7 @@ if __name__ == "__main__":
         torch_dtype=weight_dtype,
         low_cpu_mem_usage=False,
         ignore_mismatched_sizes=True,
+        attn_implementation="flash_attention_2",
         cache_dir=args.cache_dir,
     )
     vae = AutoencoderTiny.from_pretrained(
@@ -258,23 +304,61 @@ if __name__ == "__main__":
         s.strip() for s in args.quant_exclude_keywords.split(",") if s.strip()
     )
 
-    # Scan safetensors for Hadamard rotation info
+    # Scan safetensors for rotation info (before replacing layers, for padded sizes)
     from safetensors.torch import load_file as _load_st
     nk_state = _load_st(args.nunchaku_state)
+    rotation_mode = None                        # "random_orthogonal" | "fast_hadamard"
     rotation_matrices = {}
-    rotated_layer_names = set()
+    padded_dims = {}                            # layer_name → padded_in_features (fast_hadamard)
+    hadamard_signs = {}                         # layer_name → signs tensor (fast_hadamard)
+
     for k, v in nk_state.items():
-        if k.endswith(".hadamard_rotated"):
-            rotated_layer_names.add(k.rsplit(".", 1)[0])
+        if k.endswith(".hadamard_padded"):
+            layer_name = k.rsplit(".", 1)[0]
+            padded_dims[layer_name] = v.item()
+        elif k.endswith(".hadamard_signs"):
+            layer_name = k.rsplit(".", 1)[0]
+            hadamard_signs[layer_name] = v
         elif k.startswith("_rotation."):
             size = int(k.split(".")[1])
             rotation_matrices[size] = v
 
+    if rotation_matrices:
+        rotation_mode = "random_orthogonal"
+    elif hadamard_signs:
+        rotation_mode = "fast_hadamard"
+
     replaced = replace_linear_with_nunchaku(
         transformer, target_suffixes, exclude_keywords, args.rank,
-        profile=args.profile_nunchaku)
+        profile=args.profile_nunchaku, padded_dims=padded_dims if rotation_mode == "fast_hadamard" else None)
 
     load_nunchaku_state(transformer, args.nunchaku_state)
+
+    # Register rotation hooks after state is loaded (only on NunchakuSVDQLinear layers)
+    if rotation_mode == "random_orthogonal":
+        from models.quant.hadamard import _make_dense_rotation_hook as _make_hook
+        from tinysd3_nunchaku_w4a4 import NunchakuSVDQLinear
+        for name, m in transformer.named_modules():
+            if not isinstance(m, NunchakuSVDQLinear):
+                continue
+            Q = rotation_matrices.get(m.in_features)
+            if Q is not None:
+                m.register_forward_pre_hook(_make_hook(Q))
+    elif rotation_mode == "fast_hadamard":
+        from models.quant.hadamard import _make_hadamard_rotation_hook as _make_hook
+        from tinysd3_nunchaku_w4a4 import NunchakuSVDQLinear
+        for name, m in transformer.named_modules():
+            if not isinstance(m, NunchakuSVDQLinear):
+                continue
+            signs = hadamard_signs.get(name)
+            if signs is not None:
+                original = padded_dims.get(name, m.in_features)
+                if original == signs.numel():
+                    original = None
+                else:
+                    original = m.in_features
+                m.register_forward_pre_hook(_make_hook(signs, original))
+        print(f"[NUNCHAKU] registered fast Hadamard hooks on {len(hadamard_signs)} layers")
 
     transformer = transformer.to(device, dtype=weight_dtype).eval()
     vae = vae.to(device, dtype=weight_dtype).eval()
@@ -287,6 +371,16 @@ if __name__ == "__main__":
         os.path.join(args.embedding_dir, "pool_embeds.pt"),
         map_location=device,
     ).to(dtype=weight_dtype)
+
+    timesteps = torch.tensor([1000.0], device=device, dtype=weight_dtype)
+    pooled_prompt_embeds = torch.load(os.path.join(args.embedding_dir, "pool_embeds.pt"), map_location=device).to(dtype=weight_dtype)
+
+    timesteps = torch.tensor([1000.0], device=device, dtype=weight_dtype)
+    pooled_prompt_embeds = torch.load(os.path.join(args.embedding_dir, "pool_embeds.pt"), map_location=device).to(dtype=weight_dtype)
+
+    if args.benchmark:
+        run_nunchaku_benchmark(args, transformer, timesteps, pooled_prompt_embeds, weight_dtype, device)
+        exit(0)
 
     if os.path.isdir(args.input_dir):
         image_names = []
