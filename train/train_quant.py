@@ -241,17 +241,19 @@ def save_nunchaku_safetensors(transformer, output_path: str):
         print("[nunchaku] WARNING: no SVDQ layers found — empty safetensors saved")
 
     # Save rotation matrices (global, shared by all rotated layers)
-    # Save rotation info (global for random_orthogonal, per-layer for fast_hadamard)
+    # Save rotation info
     rot_info = getattr(transformer, "_hadamard_rotation_info", None)
     if rot_info:
         if rot_info["mode"] == "random_orthogonal":
             for size, Q in rot_info["matrices"].items():
                 state_dict[f"_rotation.{size}"] = Q.cpu().contiguous()
         elif rot_info["mode"] == "fast_hadamard":
-            for layer_name, signs in rot_info["signs_map"].items():
-                state_dict[f"{layer_name}.hadamard_signs"] = signs.cpu()
-                state_dict[f"{layer_name}.hadamard_padded"] = torch.tensor(
-                    [rot_info["padded_map"][layer_name]], dtype=torch.int32)
+            for name, m in transformer.named_modules():
+                if hasattr(m, "hadamard_signs") and m.hadamard_signs is not None:
+                    state_dict[f"{name}.hadamard_rotated"] = torch.tensor([1], dtype=torch.int32)
+            if "factorized_cache" in rot_info:
+                for k, L in rot_info["factorized_cache"].items():
+                    state_dict[f"_hadamard_L.{k}"] = L.cpu().contiguous()
 
     save_file(state_dict, output_path)
     print(f"[nunchaku] saved {layer_count} layers ({len(state_dict)} tensors) -> {output_path}")

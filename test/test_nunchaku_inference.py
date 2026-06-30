@@ -218,7 +218,9 @@ def load_nunchaku_state(transformer, state_path):
         if non_nunchaku_missing:
             print(f"[NUNCHAKU]   non-nunchaku missing (backbone, expected): {non_nunchaku_missing}")
     if unexpected:
-        rotation_unexpected = [k for k in unexpected if k.startswith("_rotation.") or k.endswith(".hadamard_rotated")]
+        rotation_unexpected = [k for k in unexpected
+                               if k.startswith("_rotation.") or k.startswith("_hadamard_L.")
+                               or k.endswith(".hadamard_rotated")]
         other_unexpected = [k for k in unexpected if k not in rotation_unexpected]
         if other_unexpected:
             print(f"[NUNCHAKU]   unexpected keys: {len(other_unexpected)}")
@@ -304,33 +306,32 @@ if __name__ == "__main__":
         s.strip() for s in args.quant_exclude_keywords.split(",") if s.strip()
     )
 
-    # Scan safetensors for rotation info (before replacing layers, for padded sizes)
+    # Scan safetensors for rotation info
     from safetensors.torch import load_file as _load_st
     nk_state = _load_st(args.nunchaku_state)
-    rotation_mode = None                        # "random_orthogonal" | "fast_hadamard"
+    rotation_mode = None
     rotation_matrices = {}
-    padded_dims = {}                            # layer_name → padded_in_features (fast_hadamard)
-    hadamard_signs = {}                         # layer_name → signs tensor (fast_hadamard)
+    hadamard_L = {}                               # k → L matrix (factorized fast_hadamard)
+    hadamard_rotated_layers = set()              # layer names that are rotated
 
     for k, v in nk_state.items():
-        if k.endswith(".hadamard_padded"):
-            layer_name = k.rsplit(".", 1)[0]
-            padded_dims[layer_name] = v.item()
-        elif k.endswith(".hadamard_signs"):
-            layer_name = k.rsplit(".", 1)[0]
-            hadamard_signs[layer_name] = v
+        if k.endswith(".hadamard_rotated"):
+            hadamard_rotated_layers.add(k.rsplit(".", 1)[0])
+        elif k.startswith("_hadamard_L."):
+            size = int(k.split(".")[-1])
+            hadamard_L[size] = v
         elif k.startswith("_rotation."):
             size = int(k.split(".")[1])
             rotation_matrices[size] = v
 
     if rotation_matrices:
         rotation_mode = "random_orthogonal"
-    elif hadamard_signs:
+    elif hadamard_rotated_layers:
         rotation_mode = "fast_hadamard"
 
     replaced = replace_linear_with_nunchaku(
         transformer, target_suffixes, exclude_keywords, args.rank,
-        profile=args.profile_nunchaku, padded_dims=padded_dims if rotation_mode == "fast_hadamard" else None)
+        profile=args.profile_nunchaku)
 
     load_nunchaku_state(transformer, args.nunchaku_state)
 
@@ -345,20 +346,19 @@ if __name__ == "__main__":
             if Q is not None:
                 m.register_forward_pre_hook(_make_hook(Q))
     elif rotation_mode == "fast_hadamard":
-        from models.quant.hadamard import _make_hadamard_rotation_hook as _make_hook
+        from models.quant.hadamard import _make_hadamard_factorized_hook, _largest_pow2_divisor
         from tinysd3_nunchaku_w4a4 import NunchakuSVDQLinear
         for name, m in transformer.named_modules():
             if not isinstance(m, NunchakuSVDQLinear):
                 continue
-            signs = hadamard_signs.get(name)
-            if signs is not None:
-                original = padded_dims.get(name, m.in_features)
-                if original == signs.numel():
-                    original = None
-                else:
-                    original = m.in_features
-                m.register_forward_pre_hook(_make_hook(signs, original))
-        print(f"[NUNCHAKU] registered fast Hadamard hooks on {len(hadamard_signs)} layers")
+            if name not in hadamard_rotated_layers:
+                continue
+            n = m.in_features
+            n_div_k = _largest_pow2_divisor(n)
+            k = n // n_div_k
+            L = hadamard_L.get(k) if k > 1 else None
+            m.register_forward_pre_hook(_make_hadamard_factorized_hook(L, n_div_k))
+        print(f"[NUNCHAKU] registered fast Hadamard hooks on {len(hadamard_rotated_layers)} layers")
 
     transformer = transformer.to(device, dtype=weight_dtype).eval()
     vae = vae.to(device, dtype=weight_dtype).eval()

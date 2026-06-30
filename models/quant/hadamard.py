@@ -53,44 +53,58 @@ def _make_dense_rotation_hook(Q: torch.Tensor):
     return _hook
 
 
-# ── Mode: fast_hadamard (Walsh-Hadamard + power-of-2 padding) ──────────
+# ── Mode: fast_hadamard (factorized Walsh-Hadamard, no padding) ─────────
 
-def _generate_fast_hadamard_signs(n: int, seed: int) -> torch.Tensor:
-    g = torch.Generator()
-    g.manual_seed(seed)
-    return (torch.randint(0, 2, (n,), generator=g) * 2 - 1).to(torch.float16)
-
-
-def _fast_hadamard_transform(x: torch.Tensor) -> None:
-    """In-place Walsh-Hadamard transform on last dim. n must be power of 2."""
-    n = x.shape[-1]
-    h = 1
-    while h < n:
-        for i in range(0, n, 2 * h):
-            a = x[..., i : i + h].clone()
-            b = x[..., i + h : i + 2 * h]
-            x[..., i : i + h] = a + b
-            x[..., i + h : i + 2 * h] = a - b
-        h *= 2
-    x.div_(math.sqrt(float(n)))
+def _largest_pow2_divisor(n: int) -> int:
+    """Return the largest power-of-2 divisor of n."""
+    p = 1
+    while n % 2 == 0:
+        n //= 2
+        p *= 2
+    return p
 
 
-def _rotate_weight_hadamard(weight: torch.Tensor, signs: torch.Tensor) -> None:
-    """W ← fast_hadamard(W * signs), in-place."""
-    weight.mul_(signs.to(device=weight.device, dtype=weight.dtype))
-    _fast_hadamard_transform(weight)
+def _build_factorized_cache(sizes: set[int], dtype, device) -> dict[int, torch.Tensor]:
+    """Build {k: L_matrix} cache where L is a (k,k) random orthogonal matrix.
+    Each dimension n = k * n_div_k where n_div_k is the power-of-2 part.
+    """
+    cache = {}
+    for n in sizes:
+        n_div_k = _largest_pow2_divisor(n)
+        k = n // n_div_k
+        if k > 1 and k not in cache:
+            R = torch.randn(k, k, dtype=torch.float32)
+            Q, _ = torch.linalg.qr(R)
+            cache[k] = Q.to(dtype=dtype).to(device=device)
+    return cache
 
 
-def _make_hadamard_rotation_hook(signs: torch.Tensor, original_dim: int):
+def _factorized_transform(x: torch.Tensor, L: torch.Tensor | None) -> None:
+    """Apply (L ⊗ H) on the last two dimensions of x in-place.
+    x shape: (..., k, n_div_k) where n_div_k must be power of 2.
+    """
+    _fast_hadamard_transform(x)         # apply H on dim=-1
+    if L is not None:                   # apply L on dim=-2
+        x.copy_(torch.einsum("ji,...is->...js", L.to(dtype=x.dtype, device=x.device), x))
+
+
+def _rotate_weight_hadamard_factorized(weight: torch.Tensor, L: torch.Tensor | None,
+                                       n_div_k: int) -> None:
+    """W ← (L ⊗ H) applied to input channels, in-place. No padding."""
+    k = weight.shape[1] // n_div_k
+    weight.copy_(weight.view(-1, k, n_div_k))
+    _factorized_transform(weight, L)
+    weight.copy_(weight.reshape(weight.shape[0], -1))
+
+
+def _make_hadamard_factorized_hook(L: torch.Tensor | None, n_div_k: int):
     def _hook(module, args):
         x = args[0]
-        if x.shape[-1] < signs.numel():
-            pad = torch.zeros(*x.shape[:-1], signs.numel() - x.shape[-1],
-                              device=x.device, dtype=x.dtype)
-            x = torch.cat([x, pad], dim=-1)
-        x = x.clone()
-        x.mul_(signs.to(device=x.device, dtype=x.dtype))
-        _fast_hadamard_transform(x)
+        k = x.shape[-1] // n_div_k
+        x = x.reshape(-1, k, n_div_k)
+        x = x.clone() if x.requires_grad else x
+        _factorized_transform(x, L)
+        x = x.reshape(args[0].shape)
         return (x, *args[1:])
     return _hook
 
@@ -148,35 +162,27 @@ def enable_rotation(model, mode: str = "random_orthogonal", seed: int = 0,
             print(f"[rotate] random_orthogonal: {count} layers (sizes: {sorted(sizes)})")
 
     elif mode == "fast_hadamard":
-        signs_map: dict[str, torch.Tensor] = {}
-        padded_map: dict[str, int] = {}
+        cache = _build_factorized_cache(sizes, dtype, device)
 
         count = 0
         for name, m in tqdm(list(model.named_modules()), desc="[rotate] fast_hadamard", disable=not verbose):
             if not isinstance(m, QuantLinearW4A4):
                 continue
             n = m.in_features
-            padded = _next_power_of_2(n)
-            layer_seed = seed + hash(name) % 100000
-            signs = torch.ones(padded, dtype=dtype, device=device)
+            n_div_k = _largest_pow2_divisor(n)
+            k = n // n_div_k
+            L = cache.get(k) if k > 1 else None
 
-            if padded != n:
-                pad_size = padded - n
-                pad = torch.zeros(m.out_features, pad_size, dtype=dtype, device=device)
-                m.weight = torch.nn.Parameter(torch.cat([m.weight.data, pad], dim=1))
-
-            _rotate_weight_hadamard(m.weight.data, signs.to(dtype=dtype, device=device))
-            m.hadamard_signs = padded
-            m.register_forward_pre_hook(_make_hadamard_rotation_hook(signs, original_dim=n))
-            signs_map[name] = signs
-            padded_map[name] = padded
+            _rotate_weight_hadamard_factorized(m.weight.data, L, n_div_k)
+            m.hadamard_signs = n
+            m.register_forward_pre_hook(_make_hadamard_factorized_hook(L, n_div_k))
             count += 1
 
-        info["signs_map"] = signs_map
-        info["padded_map"] = padded_map
+        info["factorized"] = True
+        info["factorized_cache"] = cache
         if verbose:
-            print(f"[rotate] fast_hadamard: {count} layers "
-                  f"(padded sizes: {sorted(set(padded_map.values()))})")
+            print(f"[rotate] fast_hadamard (factorized): {count} layers "
+                  f"(sizes: {sorted(sizes)})")
 
     else:
         raise ValueError(f"Unknown rotation mode: {mode}")
