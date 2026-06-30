@@ -214,11 +214,11 @@ def calibrate_one_layer(m, layer_name, *, do_search=False, compute_error=True,
 def calibrate_all_layers(module, do_search=False, compute_error=True,
                          smooth_alpha_override=None, alpha_grid_size=7):
     """Single-pass calibration: iterate all QuantLinearW4A4 layers, calibrate each one."""
+    from tqdm import tqdm
     alpha_counts: dict[float, int] = {}
 
-    for name, m in module.named_modules():
-        if not isinstance(m, QuantLinearW4A4):
-            continue
+    layers = [(name, m) for name, m in module.named_modules() if isinstance(m, QuantLinearW4A4)]
+    for name, m in tqdm(layers, desc="[calibrate]"):
         calibrate_one_layer(m, name, do_search=do_search, compute_error=compute_error,
                             smooth_alpha_override=smooth_alpha_override, alpha_grid_size=alpha_grid_size)
         if do_search:

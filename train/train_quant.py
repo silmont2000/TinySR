@@ -154,8 +154,8 @@ def save_nunchaku_safetensors(transformer, output_path: str):
         if not hasattr(wq, "branch") or wq.branch is None:
             continue
 
-        out_features = m.out_features
-        in_features = m.in_features
+        out_features = m.weight.shape[0]
+        in_features = m.weight.shape[1]
         rank = wq.rank
         if rank <= 0:
             continue

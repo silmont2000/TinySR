@@ -16,6 +16,7 @@ to preserve the original linear layer output.
 import math
 
 import torch
+from tqdm import tqdm
 
 
 # ── Shared utilities ────────────────────────────────────────────────────
@@ -65,10 +66,11 @@ def _fast_hadamard_transform(x: torch.Tensor) -> None:
     n = x.shape[-1]
     h = 1
     while h < n:
-        a = x[..., :h].clone()
-        b = x[..., h : 2 * h]
-        x[..., :h] = a + b
-        x[..., h : 2 * h] = a - b
+        for i in range(0, n, 2 * h):
+            a = x[..., i : i + h].clone()
+            b = x[..., i + h : i + 2 * h]
+            x[..., i : i + h] = a + b
+            x[..., i + h : i + 2 * h] = a - b
         h *= 2
     x.div_(math.sqrt(float(n)))
 
@@ -86,7 +88,7 @@ def _make_hadamard_rotation_hook(signs: torch.Tensor, original_dim: int):
             pad = torch.zeros(*x.shape[:-1], signs.numel() - x.shape[-1],
                               device=x.device, dtype=x.dtype)
             x = torch.cat([x, pad], dim=-1)
-        x = x.clone() if x.requires_grad else x
+        x = x.clone()
         x.mul_(signs.to(device=x.device, dtype=x.dtype))
         _fast_hadamard_transform(x)
         return (x, *args[1:])
@@ -134,7 +136,7 @@ def enable_rotation(model, mode: str = "random_orthogonal", seed: int = 0,
         info["matrices"] = cache
 
         count = 0
-        for name, m in list(model.named_modules()):
+        for name, m in tqdm(list(model.named_modules()), desc="[rotate] random_orthogonal", disable=not verbose):
             if not isinstance(m, QuantLinearW4A4):
                 continue
             Q = cache[m.in_features]
@@ -150,13 +152,13 @@ def enable_rotation(model, mode: str = "random_orthogonal", seed: int = 0,
         padded_map: dict[str, int] = {}
 
         count = 0
-        for name, m in list(model.named_modules()):
+        for name, m in tqdm(list(model.named_modules()), desc="[rotate] fast_hadamard", disable=not verbose):
             if not isinstance(m, QuantLinearW4A4):
                 continue
             n = m.in_features
             padded = _next_power_of_2(n)
             layer_seed = seed + hash(name) % 100000
-            signs = _generate_fast_hadamard_signs(padded, seed=layer_seed)
+            signs = torch.ones(padded, dtype=dtype, device=device)
 
             if padded != n:
                 pad_size = padded - n

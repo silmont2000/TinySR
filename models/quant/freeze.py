@@ -286,12 +286,12 @@ def _print_freeze_summary(search_smooth_alpha, smooth_alpha_override, alpha_stat
 def freeze_quant_params(module: nn.Module, search_smooth_alpha: bool = False,
                         compute_error: bool = True, smooth_alpha_override=None,
                         alpha_grid_size: int = 7):
+    from tqdm import tqdm
     alpha_stats: dict[float, int] = {}
     alpha_per_layer: list[tuple[str, float]] = []
 
-    for name, m in module.named_modules():
-        if not isinstance(m, QuantLinearW4A4):
-            continue
+    layers = [(name, m) for name, m in module.named_modules() if isinstance(m, QuantLinearW4A4)]
+    for name, m in tqdm(layers, desc="[freeze]"):
         freeze_one_layer(
             m, name,
             search_smooth_alpha=search_smooth_alpha,
