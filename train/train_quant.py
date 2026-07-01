@@ -87,10 +87,8 @@ def parse_args():
     parser.add_argument("--calib_cache", type=str, default=None)
     parser.add_argument("--enable_hadamard_rotate", action="store_true")
     parser.add_argument("--hadamard_mode", type=str, default="random_orthogonal",
-                        choices=["random_orthogonal", "fast_hadamard"],
-                        help="Rotation mode for --enable_hadamard_rotate. "
-                             "random_orthogonal: dense QR, O(n²), any size. "
-                             "fast_hadamard: Walsh-Hadamard with power-of-2 pad, O(n log n).")
+                        choices=["random_orthogonal"],
+                        help="Rotation mode for --enable_hadamard_rotate.")
     parser.add_argument("--align_nunchaku_inference", action="store_true",
                         help="After calibration, switch QuantLinearW4A4 forward to nunchaku-aligned "
                              "path (dynamic per-group act quant + per-group residual + unsmoothed lora). "
@@ -154,8 +152,8 @@ def save_nunchaku_safetensors(transformer, output_path: str):
         if not hasattr(wq, "branch") or wq.branch is None:
             continue
 
-        out_features = m.weight.shape[0]
-        in_features = m.weight.shape[1]
+        out_features = m.out_features
+        in_features = m.in_features
         rank = wq.rank
         if rank <= 0:
             continue
@@ -241,19 +239,10 @@ def save_nunchaku_safetensors(transformer, output_path: str):
         print("[nunchaku] WARNING: no SVDQ layers found — empty safetensors saved")
 
     # Save rotation matrices (global, shared by all rotated layers)
-    # Save rotation info
     rot_info = getattr(transformer, "_hadamard_rotation_info", None)
     if rot_info:
-        if rot_info["mode"] == "random_orthogonal":
-            for size, Q in rot_info["matrices"].items():
-                state_dict[f"_rotation.{size}"] = Q.cpu().contiguous()
-        elif rot_info["mode"] == "fast_hadamard":
-            for name, m in transformer.named_modules():
-                if hasattr(m, "hadamard_signs") and m.hadamard_signs is not None:
-                    state_dict[f"{name}.hadamard_rotated"] = torch.tensor([1], dtype=torch.int32)
-            if "factorized_cache" in rot_info:
-                for k, L in rot_info["factorized_cache"].items():
-                    state_dict[f"_hadamard_L.{k}"] = L.cpu().contiguous()
+        for size, Q in rot_info["matrices"].items():
+            state_dict[f"_rotation.{size}"] = Q.cpu().contiguous()
 
     save_file(state_dict, output_path)
     print(f"[nunchaku] saved {layer_count} layers ({len(state_dict)} tensors) -> {output_path}")
