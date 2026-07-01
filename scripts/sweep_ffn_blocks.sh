@@ -13,9 +13,30 @@ set -e
 
 CONFIGS=(
     "attn_only|"
-    "tier_a|0"
-    "tier_a|0,1"
-    "tier_a|0,2"
+    "tier_a0|0"
+    "tier_a1|1"
+    "tier_a2|2"
+    "tier_a12|1,2"
+    "tier_a01|0,1"
+    "tier_a02|0,2"
+    "tier_a3|3"
+    "tier_a4|4"
+    "tier_a5|5"
+    "tier_a34|3,4"
+    "tier_a35|3,5"
+    "tier_a45|4,5"
+    "tier_a6|6"
+    "tier_a7|7"
+    "tier_a8|8"
+    "tier_a67|6,7"
+    "tier_a68|6,8"
+    "tier_a78|7,8"
+    "tier_a9|9"
+    "tier_a10|10"
+    "tier_a11|11"
+    "tier_a910|9,10"
+    "tier_a911|9,11"
+    "tier_a1011|10,11"
 )
 
 RESULTS_FILE="logs/sweep_ffn_blocks_$(date +%Y%m%d_%H%M%S).txt"
@@ -37,6 +58,8 @@ for CONFIG in "${CONFIGS[@]}"; do
     INF_OUT="outputs/sweep_nunchaku_${NAME}"
 
     # ── Step 1: train + quant ─────────────────────────────────
+    cd /root/autodl-tmp/TinySR
+    source /root/miniconda3/etc/profile.d/conda.sh
     conda activate tinysr_nunchaku
 
     python train/train_quant.py \

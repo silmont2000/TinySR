@@ -233,26 +233,27 @@ def load_nunchaku_state(transformer, state_path):
 def run_nunchaku_benchmark(args, transformer, vae, timesteps, pooled_prompt_embeds, weight_dtype, device):
     """Benchmark full pipeline: VAE encode → transformer → latent subtract → VAE decode."""
     image_h, image_w = args.bench_image_h, args.bench_image_w
-    print(f"[BENCH] pixel: {args.batch_size} × 3 × {image_h} × {image_w}, "
+    print(f"[BENCH] pixel: {args.batch_size} × 3 × {image_h//4}→{image_h} × {image_w//4}→{image_w}, "
           f"{args.bench_iterations} iterations")
-
-    # Random pixel tensors (mimic upsampled LR input)
-    pixels = torch.randn(args.bench_iterations, args.batch_size, 3,
-                         image_h, image_w, device=device, dtype=weight_dtype)
 
     # Warmup
     print(f"[BENCH] warming up ({args.warmup} iters)...")
     for i in range(args.warmup):
-        pv = pixels[i % len(pixels)]
-        mi = vae.encode(pv).latents * vae.config.scaling_factor
-        mp = transformer(
-            hidden_states=mi,
-            timestep=timesteps,
-            pooled_projections=pooled_prompt_embeds,
-            return_dict=False,
-        )[0]
-        ls = mi - mp
-        _ = vae.decode(ls / vae.config.scaling_factor, return_dict=False)[0]
+        with torch.no_grad():
+            pv = torch.randn(args.batch_size, 3, image_h // 4, image_w // 4,
+                             device=device, dtype=weight_dtype)
+            pv = torch.nn.functional.interpolate(pv, size=(image_h, image_w),
+                                                  mode="bicubic", align_corners=False)
+            pv = pv * 2 - 1
+            mi = vae.encode(pv).latents * vae.config.scaling_factor
+            mp = transformer(
+                hidden_states=mi,
+                timestep=timesteps,
+                pooled_projections=pooled_prompt_embeds,
+                return_dict=False,
+            )[0]
+            ls = mi - mp
+            _ = vae.decode(ls / vae.config.scaling_factor, return_dict=False)[0]
     if device.type == "cuda":
         torch.cuda.synchronize()
 
@@ -260,17 +261,22 @@ def run_nunchaku_benchmark(args, transformer, vae, timesteps, pooled_prompt_embe
     print(f"[BENCH] running {args.bench_iterations} iterations...")
     times = []
     for i in tqdm(range(args.bench_iterations), desc="bench"):
-        pv = pixels[i]
-        start = time.time()
-        mi = vae.encode(pv).latents * vae.config.scaling_factor
-        mp = transformer(
-            hidden_states=mi,
-            timestep=timesteps,
-            pooled_projections=pooled_prompt_embeds,
-            return_dict=False,
-        )[0]
-        ls = mi - mp
-        _ = vae.decode(ls / vae.config.scaling_factor, return_dict=False)[0]
+        with torch.no_grad():
+            pv = torch.randn(args.batch_size, 3, image_h // 4, image_w // 4,
+                             device=device, dtype=weight_dtype)
+            pv = torch.nn.functional.interpolate(pv, size=(image_h, image_w),
+                                                  mode="bicubic", align_corners=False)
+            pv = pv * 2 - 1
+            start = time.time()
+            mi = vae.encode(pv).latents * vae.config.scaling_factor
+            mp = transformer(
+                hidden_states=mi,
+                timestep=timesteps,
+                pooled_projections=pooled_prompt_embeds,
+                return_dict=False,
+            )[0]
+            ls = mi - mp
+            _ = vae.decode(ls / vae.config.scaling_factor, return_dict=False)[0]
         if device.type == "cuda":
             torch.cuda.synchronize()
         times.append(time.time() - start)
