@@ -55,6 +55,20 @@ def _make_dense_rotation_hook(Q: torch.Tensor):
 
 # ── Mode: fast_hadamard (factorized Walsh-Hadamard, no padding) ─────────
 
+def _fast_hadamard_transform(x: torch.Tensor) -> None:
+    """In-place Walsh-Hadamard on the last dim. n must be power of 2."""
+    n = x.shape[-1]
+    h = 1
+    while h < n:
+        for i in range(0, n, 2 * h):
+            a = x[..., i : i + h].clone()
+            b = x[..., i + h : i + 2 * h]
+            x[..., i : i + h] = a + b
+            x[..., i + h : i + 2 * h] = a - b
+        h *= 2
+    x.div_(math.sqrt(float(n)))
+
+
 def _largest_pow2_divisor(n: int) -> int:
     """Return the largest power-of-2 divisor of n."""
     p = 1
@@ -92,9 +106,9 @@ def _rotate_weight_hadamard_factorized(weight: torch.Tensor, L: torch.Tensor | N
                                        n_div_k: int) -> None:
     """W ← (L ⊗ H) applied to input channels, in-place. No padding."""
     k = weight.shape[1] // n_div_k
-    weight.copy_(weight.view(-1, k, n_div_k))
-    _factorized_transform(weight, L)
-    weight.copy_(weight.reshape(weight.shape[0], -1))
+    w = weight.view(-1, k, n_div_k)
+    _factorized_transform(w, L)
+    weight.copy_(w.reshape(weight.shape[0], -1))
 
 
 def _make_hadamard_factorized_hook(L: torch.Tensor | None, n_div_k: int):
