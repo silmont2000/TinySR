@@ -245,6 +245,10 @@ def calibrate_all_layers_cascade(module, calib_data, cascade_forward_fn, num_cas
     
     Each layer is frozen sequentially so that layer N sees pre-quantized activations
     from previously calibrated layers (more realistic than single-pass).
+
+    Phase 1 act_absmax (from 100 images) is preserved for alpha search accuracy.
+    Only input_cache is reset and re-collected via cascade forward to capture
+    post-quantized activation distribution for GPTQ error evaluation.
     """
     set_observer_enabled(module, False)
     all_layers = list(iter_quant_layers(module))
@@ -253,8 +257,8 @@ def calibrate_all_layers_cascade(module, calib_data, cascade_forward_fn, num_cas
     cascade_calib_count = min(num_cascade_calib, len(calib_data))
 
     for layer_idx, (layer_name, m) in enumerate(all_layers):
-        # Reset this layer's stats to collect post-quantized inputs from previous layers
-        m.weight_quantizer.act_absmax = None
+        # Reset input_cache to collect post-quantized inputs from previous layers.
+        # act_absmax from Phase 1 (100 images) is kept for stable alpha search.
         m.weight_quantizer.input_cache = []
         m.weight_quantizer.observer_enabled = True
         if hasattr(m, "act_quantizer") and hasattr(m.act_quantizer, "quantizer"):

@@ -347,8 +347,7 @@ def freeze_quant_params_layer_cascade(
     cascade_calib_count = min(num_cascade_calib, len(calib_data))
 
     for layer_idx, (layer_name, m) in enumerate(all_layers):
-        # Reset this layer to collect cascaded inputs
-        m.weight_quantizer.act_absmax = None
+        # Reset input_cache to collect cascaded inputs; keep act_absmax from Phase 1
         m.weight_quantizer.input_cache = []
         m.weight_quantizer.observer_enabled = True
         if hasattr(m, "act_quantizer") and hasattr(m.act_quantizer, "quantizer"):
