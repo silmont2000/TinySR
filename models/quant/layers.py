@@ -34,16 +34,39 @@ EXTRA_SUFFIXES = [
 ]
 
 
-def get_target_suffixes(quant_scope):
+def get_target_suffixes(quant_scope, ffn_blocks=None):
     if quant_scope == "none":
         return []
     if quant_scope == "ffn_only":
         return FFN_SUFFIXES
     if quant_scope == "attn_only":
-        return ATTN_SUFFIXES
+        base = list(ATTN_SUFFIXES)
+        if ffn_blocks is not None:
+            base += get_ffn_block_suffixes(ffn_blocks)
+        return base
     if quant_scope == "dit_full":
         return FFN_SUFFIXES + ATTN_SUFFIXES + EXTRA_SUFFIXES
     raise ValueError(f"Unknown quant_scope: {quant_scope}")
+
+
+def get_ffn_block_suffixes(blocks):
+    """Return FFN suffixes for specific transformer block indices.
+
+    Example: get_ffn_block_suffixes([0, 2, 3]) returns suffixes matching
+    ff.net.0.proj and ff.net.2 in blocks 0, 2, 3.
+    """
+    suffixes = []
+    for b in blocks:
+        suffixes.append(f"transformer_blocks.{b}.ff.net.0.proj")
+        suffixes.append(f"transformer_blocks.{b}.ff.net.2")
+    return suffixes
+
+
+def parse_ffn_blocks(arg):
+    """Parse comma-separated block indices string. Returns None if empty."""
+    if arg is None or not str(arg).strip():
+        return None
+    return [int(s.strip()) for s in str(arg).split(",") if s.strip()]
 
 
 class QuantLinearW4A4(nn.Module):

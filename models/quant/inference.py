@@ -150,10 +150,11 @@ def build_layer_replacement_kwargs(w_bits, a_bits, svdq_rank, svdq_smooth_alpha,
 
 def replace_quant_layers(transformer, quant_scope, quant_config,
                          w_bits, a_bits, svdq_rank, svdq_smooth_alpha,
-                         svdq_iterations=0, act_group_size=64, weight_group_size=-1):
+                         svdq_iterations=0, act_group_size=64, weight_group_size=-1,
+                         ffn_blocks=None):
     if quant_scope == "none":
         return []
-    target_suffixes = get_target_suffixes(quant_scope)
+    target_suffixes = get_target_suffixes(quant_scope, ffn_blocks=ffn_blocks)
     quant_kwargs = build_layer_replacement_kwargs(
         w_bits, a_bits, svdq_rank, svdq_smooth_alpha, svdq_iterations, act_group_size, weight_group_size)
 

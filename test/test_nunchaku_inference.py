@@ -23,7 +23,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from models.tinysr.tinysd3 import TinySD3Transformer2DModel
 from models.vae.autoencoder_tiny import AutoencoderTiny
-from models.quant.layers import get_target_suffixes
+from models.quant.layers import get_target_suffixes, parse_ffn_blocks
 from utils.wavelet_color_fix import adain_color_fix, wavelet_color_fix
 
 
@@ -35,11 +35,13 @@ def parse_args():
     parser.add_argument("--cache_dir", type=str, default="/data/disk2/xby/models")
     parser.add_argument("--embedding_dir", type=str, default="dataset/default/")
     parser.add_argument("--input_dir", type=str, default="dataset/test_image/")
-    parser.add_argument("--output_dir", type=str, default="outputs/tinysr_nunchaku/")
+    parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--nunchaku_state", type=str, required=True)
     parser.add_argument("--rank", type=int, default=32)
     parser.add_argument("--quant_scope", type=str, choices=["ffn_only", "attn_only", "dit_full"],
                         default="dit_full")
+    parser.add_argument("--quant_ffn_blocks", type=str, default=None,
+                        help="Comma-separated block indices to include FFN layers when quant_scope=attn_only.")
     parser.add_argument("--quant_exclude_keywords", type=str, default="")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--mixed_precision", type=str, choices=["fp16", "fp32"], default="fp16")
@@ -291,9 +293,10 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(args.seed)
 
-    # Prefix output dir with the calibration run name (parent of merged_backbone)
-    calib_dir = os.path.basename(os.path.dirname(args.pretrained_model_name_or_path))
-    args.output_dir = f"outputs/tinysr_nunchaku_{calib_dir}"
+    # Output dir: use user-provided value, or auto-derive from pretrained path
+    if args.output_dir is None:
+        calib_dir = os.path.basename(os.path.dirname(args.pretrained_model_name_or_path))
+        args.output_dir = f"outputs/tinysr_nunchaku_{calib_dir}"
     os.makedirs(args.output_dir, exist_ok=True)
 
     print("[NUNCHAKU] loading merged backbone ...")
@@ -308,7 +311,8 @@ if __name__ == "__main__":
     vae = AutoencoderTiny.from_pretrained(
         args.vae_path, torch_dtype=weight_dtype, cache_dir=args.cache_dir)
 
-    target_suffixes = get_target_suffixes(args.quant_scope)
+    target_suffixes = get_target_suffixes(args.quant_scope,
+                                          ffn_blocks=parse_ffn_blocks(args.quant_ffn_blocks))
     exclude_keywords = tuple(
         s.strip() for s in args.quant_exclude_keywords.split(",") if s.strip()
     )

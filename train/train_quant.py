@@ -9,7 +9,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from models.quant.layers import QuantLinearW4A4, collect_quant_meta, set_quant_enabled, set_observer_enabled
+from models.quant.layers import QuantLinearW4A4, collect_quant_meta, set_quant_enabled, set_observer_enabled, parse_ffn_blocks
 from models.quant.calibration import load_calib_cache, save_calib_cache
 from models.quant.calibrate import calibrate_all_layers
 from models.quant.inference import (
@@ -83,6 +83,9 @@ def parse_args():
     parser.add_argument("--align_method", type=str, choices=["wavelet", "adain", "nofix"], default="adain")
     parser.add_argument("--quant_scope", type=str, choices=["none", "ffn_only", "attn_only", "dit_full"],
                         default="ffn_only")
+    parser.add_argument("--quant_ffn_blocks", type=str, default=None,
+                        help="Comma-separated block indices to include FFN layers when quant_scope=attn_only. "
+                             "Example: '0,2,3,4,5,7'.")
     parser.add_argument("--calib_images", type=int, default=8)
     parser.add_argument("--calib_cache", type=str, default=None)
     parser.add_argument("--enable_hadamard_rotate", action="store_true")
@@ -328,7 +331,8 @@ def main():
         transformer, args.quant_scope, args.quant_config,
         args.w_bits, args.a_bits, args.svdq_rank, args.svdq_smooth_alpha,
         svdq_iterations=args.svdq_iterations, act_group_size=args.act_group_size,
-        weight_group_size=args.weight_group_size)
+        weight_group_size=args.weight_group_size,
+        ffn_blocks=parse_ffn_blocks(args.quant_ffn_blocks))
 
     if args.enable_hadamard_rotate:
         from models.quant.hadamard import enable_rotation
