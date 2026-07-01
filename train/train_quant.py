@@ -87,8 +87,10 @@ def parse_args():
     parser.add_argument("--calib_cache", type=str, default=None)
     parser.add_argument("--enable_hadamard_rotate", action="store_true")
     parser.add_argument("--hadamard_mode", type=str, default="random_orthogonal",
-                        choices=["random_orthogonal"],
-                        help="Rotation mode for --enable_hadamard_rotate.")
+                        choices=["random_orthogonal", "fast_hadamard"],
+                        help="Rotation mode for --enable_hadamard_rotate. "
+                             "random_orthogonal: dense QR matrix. "
+                             "fast_hadamard: structured Walsh-Hadamard FWHT.")
     parser.add_argument("--align_nunchaku_inference", action="store_true",
                         help="After calibration, switch QuantLinearW4A4 forward to nunchaku-aligned "
                              "path (dynamic per-group act quant + per-group residual + unsmoothed lora). "
@@ -241,8 +243,15 @@ def save_nunchaku_safetensors(transformer, output_path: str):
     # Save rotation matrices (global, shared by all rotated layers)
     rot_info = getattr(transformer, "_hadamard_rotation_info", None)
     if rot_info:
-        for size, Q in rot_info["matrices"].items():
-            state_dict[f"_rotation.{size}"] = Q.cpu().contiguous()
+        rot_mode = rot_info.get("mode", "random_orthogonal")
+        for size, entry in rot_info["matrices"].items():
+            if rot_mode == "fast_hadamard":
+                state_dict[f"_hadamard_rotation.{size}.rhs"] = entry["rhs"].cpu().contiguous()
+                state_dict[f"_hadamard_rotation.{size}.lhs"] = entry["lhs"].cpu().contiguous()
+                state_dict[f"_hadamard_rotation.{size}.lhs_k"] = torch.tensor(
+                    entry["lhs_k"], dtype=torch.int32)
+            else:
+                state_dict[f"_rotation.{size}"] = entry.cpu().contiguous()
 
     save_file(state_dict, output_path)
     print(f"[nunchaku] saved {layer_count} layers ({len(state_dict)} tensors) -> {output_path}")

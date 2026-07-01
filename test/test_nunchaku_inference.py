@@ -54,13 +54,13 @@ def parse_args():
     parser.add_argument("--profile_nunchaku", action="store_true",
                         help="Enable per-layer nunchaku call counting and timing.")
     parser.add_argument("--benchmark", action="store_true",
-                        help="Benchmark mode: random tensors, skip VAE, measure raw transformer time.")
+                        help="Benchmark mode: random pixel tensors, full pipeline (VAE encode + transformer + VAE decode).")
     parser.add_argument("--bench_iterations", type=int, default=100,
                         help="Number of benchmark iterations.")
-    parser.add_argument("--bench_latent_h", type=int, default=64,
-                        help="Height of random latent tensor for benchmark.")
-    parser.add_argument("--bench_latent_w", type=int, default=64,
-                        help="Width of random latent tensor for benchmark.")
+    parser.add_argument("--bench_image_h", type=int, default=512,
+                        help="Height of random pixel tensor for benchmark (VAE will produce derived latent size).")
+    parser.add_argument("--bench_image_w", type=int, default=512,
+                        help="Width of random pixel tensor for benchmark (VAE will produce derived latent size).")
     return parser.parse_args()
 
 
@@ -218,7 +218,9 @@ def load_nunchaku_state(transformer, state_path):
         if non_nunchaku_missing:
             print(f"[NUNCHAKU]   non-nunchaku missing (backbone, expected): {non_nunchaku_missing}")
     if unexpected:
-        rotation_unexpected = [k for k in unexpected if k.startswith("_rotation.") or k.endswith(".hadamard_rotated")]
+        rotation_unexpected = [k for k in unexpected if (
+            k.startswith("_rotation.") or k.startswith("_hadamard_rotation.")
+            or k.endswith(".hadamard_rotated"))]
         other_unexpected = [k for k in unexpected if k not in rotation_unexpected]
         if other_unexpected:
             print(f"[NUNCHAKU]   unexpected keys: {len(other_unexpected)}")
@@ -226,26 +228,29 @@ def load_nunchaku_state(transformer, state_path):
             print(f"[NUNCHAKU]   rotation keys extracted: {len(rotation_unexpected)} (handled separately)")
 
 
-def run_nunchaku_benchmark(args, transformer, timesteps, pooled_prompt_embeds, weight_dtype, device):
-    """Benchmark transformer only (skip VAE, use random latents)."""
-    in_channels = transformer.config.in_channels
-    latent_h, latent_w = args.bench_latent_h, args.bench_latent_w
-    print(f"[BENCH] latent: {args.batch_size} × {in_channels} × {latent_h} × {latent_w}, "
+def run_nunchaku_benchmark(args, transformer, vae, timesteps, pooled_prompt_embeds, weight_dtype, device):
+    """Benchmark full pipeline: VAE encode → transformer → latent subtract → VAE decode."""
+    image_h, image_w = args.bench_image_h, args.bench_image_w
+    print(f"[BENCH] pixel: {args.batch_size} × 3 × {image_h} × {image_w}, "
           f"{args.bench_iterations} iterations")
 
-    # Random input tensors (mimic VAE-encoded latents)
-    latents = torch.randn(args.bench_iterations, args.batch_size, in_channels,
-                          latent_h, latent_w, device=device, dtype=weight_dtype)
+    # Random pixel tensors (mimic upsampled LR input)
+    pixels = torch.randn(args.bench_iterations, args.batch_size, 3,
+                         image_h, image_w, device=device, dtype=weight_dtype)
 
     # Warmup
     print(f"[BENCH] warming up ({args.warmup} iters)...")
     for i in range(args.warmup):
-        _ = transformer(
-            hidden_states=latents[i % len(latents)],
+        pv = pixels[i % len(pixels)]
+        mi = vae.encode(pv).latents * vae.config.scaling_factor
+        mp = transformer(
+            hidden_states=mi,
             timestep=timesteps,
             pooled_projections=pooled_prompt_embeds,
             return_dict=False,
         )[0]
+        ls = mi - mp
+        _ = vae.decode(ls / vae.config.scaling_factor, return_dict=False)[0]
     if device.type == "cuda":
         torch.cuda.synchronize()
 
@@ -253,13 +258,17 @@ def run_nunchaku_benchmark(args, transformer, timesteps, pooled_prompt_embeds, w
     print(f"[BENCH] running {args.bench_iterations} iterations...")
     times = []
     for i in tqdm(range(args.bench_iterations), desc="bench"):
+        pv = pixels[i]
         start = time.time()
-        _ = transformer(
-            hidden_states=latents[i],
+        mi = vae.encode(pv).latents * vae.config.scaling_factor
+        mp = transformer(
+            hidden_states=mi,
             timestep=timesteps,
             pooled_projections=pooled_prompt_embeds,
             return_dict=False,
         )[0]
+        ls = mi - mp
+        _ = vae.decode(ls / vae.config.scaling_factor, return_dict=False)[0]
         if device.type == "cuda":
             torch.cuda.synchronize()
         times.append(time.time() - start)
@@ -267,7 +276,7 @@ def run_nunchaku_benchmark(args, transformer, timesteps, pooled_prompt_embeds, w
     avg_ms = sum(times) / len(times) * 1000
     avg_per_sample_ms = avg_ms / args.batch_size
     print(f"[BENCH] avg: {avg_ms:.2f}ms/iter  ({avg_per_sample_ms:.2f}ms/sample)  "
-          f"batch={args.batch_size}  latent={latent_h}×{latent_w}")
+          f"batch={args.batch_size}  image={image_h}×{image_w}")
 
 
 if __name__ == "__main__":
@@ -310,12 +319,29 @@ if __name__ == "__main__":
     rotation_mode = None
     rotation_matrices = {}
 
+    # Detect Hadamard rotation: keys like _hadamard_rotation.{size}.rhs / .lhs / .lhs_k
+    hadamard_pending: dict[int, dict] = {}
     for k, v in nk_state.items():
-        if k.startswith("_rotation."):
+        if k.startswith("_hadamard_rotation."):
+            parts = k.split(".")
+            size = int(parts[1])
+            if size not in hadamard_pending:
+                hadamard_pending[size] = {}
+            suffix = parts[2]
+            hadamard_pending[size][suffix] = v
+        elif k.startswith("_rotation."):
             size = int(k.split(".")[1])
             rotation_matrices[size] = v
 
-    if rotation_matrices:
+    if hadamard_pending:
+        rotation_mode = "fast_hadamard"
+        for size, entry in hadamard_pending.items():
+            rotation_matrices[size] = {
+                "rhs": entry["rhs"],
+                "lhs": entry["lhs"],
+                "lhs_k": entry["lhs_k"].item(),
+            }
+    elif rotation_matrices:
         rotation_mode = "random_orthogonal"
 
     replaced = replace_linear_with_nunchaku(
@@ -334,6 +360,16 @@ if __name__ == "__main__":
             Q = rotation_matrices.get(m.in_features)
             if Q is not None:
                 m.register_forward_pre_hook(_make_hook(Q))
+    elif rotation_mode == "fast_hadamard":
+        from models.quant.hadamard import _make_hadamard_rotation_hook as _make_hook
+        from tinysd3_nunchaku_w4a4 import NunchakuSVDQLinear
+        for name, m in transformer.named_modules():
+            if not isinstance(m, NunchakuSVDQLinear):
+                continue
+            entry = rotation_matrices.get(m.in_features)
+            if entry is not None:
+                m.register_forward_pre_hook(_make_hook(
+                    entry["rhs"], entry["lhs"], entry["lhs_k"]))
 
     transformer = transformer.to(device, dtype=weight_dtype).eval()
     vae = vae.to(device, dtype=weight_dtype).eval()
@@ -354,7 +390,7 @@ if __name__ == "__main__":
     pooled_prompt_embeds = torch.load(os.path.join(args.embedding_dir, "pool_embeds.pt"), map_location=device).to(dtype=weight_dtype)
 
     if args.benchmark:
-        run_nunchaku_benchmark(args, transformer, timesteps, pooled_prompt_embeds, weight_dtype, device)
+        run_nunchaku_benchmark(args, transformer, vae, timesteps, pooled_prompt_embeds, weight_dtype, device)
         exit(0)
 
     if os.path.isdir(args.input_dir):
