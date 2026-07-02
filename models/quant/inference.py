@@ -11,7 +11,6 @@ from utils.device import get_optimal_device_name
 from models.quant.layers import (
     get_target_suffixes,
     replace_linear_with_w4a4,
-    replace_linear_with_w4a4_from_config,
     load_smooth_alpha_from_report,
 )
 from models.quant.calibrate import run_calibration, save_calib_cache, load_calib_cache
@@ -54,7 +53,7 @@ def build_layer_replacement_kwargs(w_bits, a_bits, svdq_rank, svdq_smooth_alpha,
     }
 
 
-def replace_quant_layers(transformer, quant_scope, quant_config,
+def replace_quant_layers(transformer, quant_scope,
                          w_bits, a_bits, svdq_rank, svdq_smooth_alpha,
                          svdq_iterations=0, act_group_size=64, weight_group_size=-1,
                          ffn_blocks=None):
@@ -64,24 +63,13 @@ def replace_quant_layers(transformer, quant_scope, quant_config,
     quant_kwargs = build_layer_replacement_kwargs(
         w_bits, a_bits, svdq_rank, svdq_smooth_alpha, svdq_iterations, act_group_size, weight_group_size)
 
-    if quant_config is not None:
-        replaced = replace_linear_with_w4a4_from_config(
-            transformer, quant_config,
-            target_suffixes=target_suffixes,
-            skip_keywords=("lora_",),
-            default_weight_quant_kind="svdq",
-            default_weight_quant_kwargs=quant_kwargs["weight_quant_kwargs"],
-            default_act_quant_kwargs=quant_kwargs["act_quant_kwargs"],
-        )
-    else:
-        replaced = replace_linear_with_w4a4(
-            transformer,
-            target_suffixes=target_suffixes,
-            skip_keywords=("lora_",),
-            weight_quant_kind="svdq",
-            weight_quant_kwargs=quant_kwargs["weight_quant_kwargs"],
-            act_quant_kwargs=quant_kwargs["act_quant_kwargs"],
-        )
+    replaced = replace_linear_with_w4a4(
+        transformer,
+        target_suffixes=target_suffixes,
+        skip_keywords=("lora_",),
+        weight_quant_kwargs=quant_kwargs["weight_quant_kwargs"],
+        act_quant_kwargs=quant_kwargs["act_quant_kwargs"],
+    )
 
     if len(replaced) > 20:
         print(f"  ... and {len(replaced) - 20} more")

@@ -220,14 +220,9 @@ def load_nunchaku_state(transformer, state_path):
         if non_nunchaku_missing:
             print(f"[NUNCHAKU]   non-nunchaku missing (backbone, expected): {non_nunchaku_missing}")
     if unexpected:
-        rotation_unexpected = [k for k in unexpected if (
-            k.startswith("_rotation.") or k.startswith("_hadamard_rotation.")
-            or k.endswith(".hadamard_rotated"))]
-        other_unexpected = [k for k in unexpected if k not in rotation_unexpected]
-        if other_unexpected:
-            print(f"[NUNCHAKU]   unexpected keys: {len(other_unexpected)}")
-        if rotation_unexpected:
-            print(f"[NUNCHAKU]   rotation keys extracted: {len(rotation_unexpected)} (handled separately)")
+        for k in unexpected:
+            print(f"[NUNCHAKU]   unexpected key: {k}")
+        print(f"[NUNCHAKU]   total unexpected: {len(unexpected)}")
 
 
 def run_nunchaku_benchmark(args, transformer, vae, timesteps, pooled_prompt_embeds, weight_dtype, device):
@@ -323,63 +318,11 @@ if __name__ == "__main__":
         s.strip() for s in args.quant_exclude_keywords.split(",") if s.strip()
     )
 
-    # Scan safetensors for rotation info
-    from safetensors.torch import load_file as _load_st
-    nk_state = _load_st(args.nunchaku_state)
-    rotation_mode = None
-    rotation_matrices = {}
-
-    # Detect Hadamard rotation: keys like _hadamard_rotation.{size}.rhs / .lhs / .lhs_k
-    hadamard_pending: dict[int, dict] = {}
-    for k, v in nk_state.items():
-        if k.startswith("_hadamard_rotation."):
-            parts = k.split(".")
-            size = int(parts[1])
-            if size not in hadamard_pending:
-                hadamard_pending[size] = {}
-            suffix = parts[2]
-            hadamard_pending[size][suffix] = v
-        elif k.startswith("_rotation."):
-            size = int(k.split(".")[1])
-            rotation_matrices[size] = v
-
-    if hadamard_pending:
-        rotation_mode = "fast_hadamard"
-        for size, entry in hadamard_pending.items():
-            rotation_matrices[size] = {
-                "rhs": entry["rhs"],
-                "lhs": entry["lhs"],
-                "lhs_k": entry["lhs_k"].item(),
-            }
-    elif rotation_matrices:
-        rotation_mode = "random_orthogonal"
-
     replaced = replace_linear_with_nunchaku(
         transformer, target_suffixes, exclude_keywords, args.rank,
         profile=args.profile_nunchaku)
 
     load_nunchaku_state(transformer, args.nunchaku_state)
-
-    # Register rotation hooks after state is loaded (only on NunchakuSVDQLinear layers)
-    if rotation_mode == "random_orthogonal":
-        from models.quant.hadamard import _make_dense_rotation_hook as _make_hook
-        from tinysd3_nunchaku_w4a4 import NunchakuSVDQLinear
-        for name, m in transformer.named_modules():
-            if not isinstance(m, NunchakuSVDQLinear):
-                continue
-            Q = rotation_matrices.get(m.in_features)
-            if Q is not None:
-                m.register_forward_pre_hook(_make_hook(Q))
-    elif rotation_mode == "fast_hadamard":
-        from models.quant.hadamard import _make_hadamard_rotation_hook as _make_hook
-        from tinysd3_nunchaku_w4a4 import NunchakuSVDQLinear
-        for name, m in transformer.named_modules():
-            if not isinstance(m, NunchakuSVDQLinear):
-                continue
-            entry = rotation_matrices.get(m.in_features)
-            if entry is not None:
-                m.register_forward_pre_hook(_make_hook(
-                    entry["rhs"], entry["lhs"], entry["lhs_k"]))
 
     transformer = transformer.to(device, dtype=weight_dtype).eval()
     vae = vae.to(device, dtype=weight_dtype).eval()

@@ -1,6 +1,3 @@
-import json
-import re
-
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -70,14 +67,8 @@ def parse_ffn_blocks(arg):
 
 
 class QuantLinearW4A4(nn.Module):
-    def __init__(
-        self,
-        linear: nn.Linear,
-        weight_quant_kind="affine",
-        act_quant_kind="affine",
-        weight_quant_kwargs=None,
-        act_quant_kwargs=None,
-    ):
+    def __init__(self, linear: nn.Linear,
+                 weight_quant_kwargs=None, act_quant_kwargs=None):
         super().__init__()
         self.in_features = linear.in_features
         self.out_features = linear.out_features
@@ -102,14 +93,8 @@ class QuantLinearW4A4(nn.Module):
             "ch_axis": -1,
         }
 
-        self.weight_quantizer = build_quant_component(
-            weight_quant_kind,
-            **weight_quant_kwargs,
-        )
-        self.act_quantizer = build_quant_component(
-            act_quant_kind,
-            **act_quant_kwargs,
-        )
+        self.weight_quantizer = build_quant_component(**weight_quant_kwargs)
+        self.act_quantizer = build_quant_component(**act_quant_kwargs)
 
         if getattr(self.act_quantizer, "quantizer", None) is not None:
             q_act = self.act_quantizer.quantizer
@@ -170,78 +155,20 @@ class QuantLinearW4A4(nn.Module):
         self._nunchaku_aligned = True
 
 
-def _expand_braces(pattern):
-    pattern = re.escape(pattern)
-    pattern = pattern.replace(r"\*", ".*")
-    pattern = re.sub(r"\\\{([^{}]+)\\\}", lambda m: "(" + "|".join(re.escape(v)
-                     for v in m.group(1).split(",")) + ")", pattern)
-    return pattern
-
-
-def _compile_layer_pattern(pattern):
-    return re.compile("^" + _expand_braces(pattern) + "$")
-
-
-def _layer_matches(name, rule):
-    for pattern in rule.get("patterns", []):
-        if _compile_layer_pattern(pattern).match(name):
-            return True
-
-    for suffix in rule.get("suffixes", []):
-        if re.search(_expand_braces(suffix) + "$", name):
-            return True
-
-    for prefix in rule.get("prefix", []):
-        if re.match(_expand_braces(prefix), name):
-            return True
-
-    for exact_name in rule.get("names", []):
-        if re.match("^" + _expand_braces(exact_name) + "$", name):
-            return True
-
-    return False
-
-
-def _quant_kwargs_from_strategy(strategy, default_weight_kwargs, default_act_kwargs):
-    weight_kwargs = dict(default_weight_kwargs or {})
-    act_kwargs = dict(default_act_kwargs or {})
-
-    if "weight" in strategy:
-        weight_kwargs.update(strategy["weight"])
-    if "activation" in strategy:
-        act_kwargs.update(strategy["activation"])
-
-    if "w_bits" in strategy:
-        weight_kwargs["bits"] = strategy["w_bits"]
-    if "a_bits" in strategy:
-        act_kwargs["bits"] = strategy["a_bits"]
-
-    for k in ("smooth_alpha", "smooth_scale", "rank", "per_channel", "ch_axis", "eps"):
-        if k in strategy:
-            weight_kwargs[k] = strategy[k]
-
-    return weight_kwargs, act_kwargs
-
-
-def _build_replaced_record(name, weight_quant_kwargs, act_quant_kwargs,
-                           weight_quant_kind, act_quant_kind):
+def _build_replaced_record(name, weight_quant_kwargs, act_quant_kwargs):
     return {
         "name": name,
         "weight_bits": int(weight_quant_kwargs.get("bits", -1)),
         "activation_bits": int(act_quant_kwargs.get("bits", -1)),
-        "weight_quant_kind": weight_quant_kind,
-        "act_quant_kind": act_quant_kind,
     }
 
 
 def _replace_one_linear(
     module, name, child, parent, child_name,
-    weight_quant_kind, act_quant_kind, weight_quant_kwargs, act_quant_kwargs,
+    weight_quant_kwargs, act_quant_kwargs,
 ):
     quant_child = QuantLinearW4A4(
         child,
-        weight_quant_kind=weight_quant_kind,
-        act_quant_kind=act_quant_kind,
         weight_quant_kwargs=weight_quant_kwargs,
         act_quant_kwargs=act_quant_kwargs,
     )
@@ -254,8 +181,6 @@ def replace_linear_with_w4a4(
     module: nn.Module,
     target_suffixes=None,
     skip_keywords=("lora_",),
-    weight_quant_kind="affine",
-    act_quant_kind="affine",
     weight_quant_kwargs=None,
     act_quant_kwargs=None,
 ):
@@ -280,85 +205,10 @@ def replace_linear_with_w4a4(
 
         _replace_one_linear(
             module, name, child, parent, child_name,
-            weight_quant_kind, act_quant_kind,
             weight_quant_kwargs, act_quant_kwargs,
         )
         replaced.append(_build_replaced_record(
             name, weight_quant_kwargs, act_quant_kwargs,
-            weight_quant_kind, act_quant_kind,
-        ))
-
-    return replaced
-
-
-def load_layer_quant_config(config_path):
-    with open(config_path, "r", encoding="utf-8") as f:
-        config = json.load(f)
-
-    if not isinstance(config, dict):
-        raise ValueError("Layer quant config must be a JSON object")
-    if "rules" not in config or not isinstance(config["rules"], list):
-        raise ValueError("Layer quant config must contain a 'rules' list")
-
-    return config
-
-
-def replace_linear_with_w4a4_from_config(
-    module: nn.Module,
-    config,
-    target_suffixes=None,
-    skip_keywords=("lora_",),
-    default_weight_quant_kind="affine",
-    default_act_quant_kind="affine",
-    default_weight_quant_kwargs=None,
-    default_act_quant_kwargs=None,
-):
-    if isinstance(config, str):
-        config = load_layer_quant_config(config)
-
-    default_rule = config.get("default", {})
-    rules = config.get("rules", [])
-    replaced = []
-
-    for name, child in list(module.named_modules()):
-        if not isinstance(child, nn.Linear):
-            continue
-
-        if any(k in name for k in skip_keywords):
-            continue
-
-        if target_suffixes is not None and not any(name.endswith(suf) for suf in target_suffixes):
-            continue
-
-        strategy = dict(default_rule)
-        for rule in rules:
-            if _layer_matches(name, rule):
-                strategy.update(rule)
-
-        if not strategy or not strategy.get("enabled", True):
-            continue
-
-        weight_quant_kind = strategy.get(
-            "weight_quant_kind", default_weight_quant_kind)
-        act_quant_kind = strategy.get("act_quant_kind", default_act_quant_kind)
-        weight_quant_kwargs, act_quant_kwargs = _quant_kwargs_from_strategy(
-            strategy,
-            default_weight_quant_kwargs,
-            default_act_quant_kwargs,
-        )
-
-        parent_name, child_name = name.rsplit(
-            ".", 1) if "." in name else ("", name)
-        parent = module.get_submodule(parent_name) if parent_name else module
-
-        _replace_one_linear(
-            module, name, child, parent, child_name,
-            weight_quant_kind, act_quant_kind,
-            weight_quant_kwargs, act_quant_kwargs,
-        )
-        replaced.append(_build_replaced_record(
-            name, weight_quant_kwargs, act_quant_kwargs,
-            weight_quant_kind, act_quant_kind,
         ))
 
     return replaced

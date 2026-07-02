@@ -104,92 +104,6 @@ class QuantComponent(nn.Module):
         }
 
 
-class AffineQuantComponent(QuantComponent):
-    def __init__(
-        self,
-        bits=4,
-        symmetric=True,
-        per_channel=False,
-        ch_axis=0,
-        group_size=-1,
-        eps=1e-8,
-    ):
-        super().__init__()
-        self.quantizer = UniformAffineQuantizer(
-            bits=bits,
-            symmetric=symmetric,
-            per_channel=per_channel,
-            ch_axis=ch_axis,
-            group_size=group_size,
-            eps=eps,
-        )
-
-    @property
-    def enabled(self):
-        return self.quantizer.enabled
-
-    @enabled.setter
-    def enabled(self, value):
-        if "quantizer" in self._modules:
-            self.quantizer.enabled = value
-        else:
-            self.__dict__["enabled"] = value
-
-    @property
-    def observer_enabled(self):
-        return self.quantizer.observer_enabled
-
-    @observer_enabled.setter
-    def observer_enabled(self, value):
-        if "quantizer" in self._modules:
-            self.quantizer.observer_enabled = value
-            self.quantizer.observer.enabled = value
-        else:
-            self.__dict__["observer_enabled"] = value
-
-    @torch.no_grad()
-    def collect_stats(self, x):
-        self.quantizer.observer(x)
-        return x
-
-    @torch.no_grad()
-    def freeze(self):
-        self.quantizer.calculate_qparams()
-        self.observer_enabled = False
-
-    @torch.no_grad()
-    def reset(self):
-        device = self.quantizer.scale.device
-        self.quantizer.observer.min_val = torch.tensor(
-            float("inf"), device=device)
-        self.quantizer.observer.max_val = torch.tensor(
-            float("-inf"), device=device)
-        self.quantizer.scale = torch.tensor(1.0, device=device)
-        self.quantizer.zero_point = torch.tensor(0.0, device=device)
-        self.quantizer.calibrated = False
-
-    def forward(self, x):
-        return self.quantizer(x)
-
-    def meta(self):
-        scale = self.quantizer.scale.detach()
-        return {
-            "type": self.__class__.__name__,
-            "enabled": bool(self.enabled),
-            "observer_enabled": bool(self.observer_enabled),
-            "bits": int(self.quantizer.bits),
-            "symmetric": bool(self.quantizer.symmetric),
-            "per_channel": bool(self.quantizer.per_channel),
-            "ch_axis": int(self.quantizer.ch_axis),
-            "qmin": int(self.quantizer.qmin),
-            "qmax": int(self.quantizer.qmax),
-            "calibrated": bool(self.quantizer.calibrated),
-            "scale_shape": list(scale.shape),
-            "scale_min": float(scale.min().cpu()),
-            "scale_max": float(scale.max().cpu()),
-        }
-
-
 class LowRankBranch(nn.Module):
     def __init__(self, in_features, out_features, rank, alpha=1.0, weight=None):
         super().__init__()
@@ -482,11 +396,5 @@ class LowRankAffineQuantComponent(QuantComponent):
         }
 
 
-def build_quant_component(kind="affine", **kwargs):
-    if kind == "none":
-        return QuantComponent()
-    if kind == "affine":
-        return AffineQuantComponent(**kwargs)
-    if kind in ("low_rank_affine", "svdq"):
-        return LowRankAffineQuantComponent(**kwargs)
-    raise ValueError(f"Unknown quant component kind: {kind}")
+def build_quant_component(**kwargs):
+    return LowRankAffineQuantComponent(**kwargs)

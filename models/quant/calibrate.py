@@ -7,7 +7,7 @@ import torch.nn as nn
 from typing import Union
 
 from models.quant.ops import affine_fake_quant_weight, gptq_quantize_linear_weight, fake_quant_activation
-from models.quant.components import LowRankAffineQuantComponent, AffineQuantComponent, decompose_svd_branch
+from models.quant.components import LowRankAffineQuantComponent, decompose_svd_branch
 from models.quant.layers import QuantLinearW4A4, iter_quant_layers, set_quant_enabled, set_observer_enabled
 
 
@@ -401,13 +401,13 @@ def save_calib_cache(transformer: nn.Module, path: str):
     for name, m in iter_quant_layers(transformer):
         entry = {}
         aq = m.act_quantizer
-        if isinstance(aq, AffineQuantComponent):
+        if isinstance(aq, LowRankAffineQuantComponent):
             entry["act_scale"] = aq.quantizer.scale.detach().cpu()
             entry["act_zero_point"] = aq.quantizer.zero_point.detach().cpu()
             entry["act_calibrated"] = aq.quantizer.calibrated
 
         wq = m.weight_quantizer
-        if isinstance(wq, (AffineQuantComponent, LowRankAffineQuantComponent)):
+        if isinstance(wq, LowRankAffineQuantComponent):
             entry["w_scale"] = wq.quantizer.scale.detach().cpu()
             entry["w_zero_point"] = wq.quantizer.zero_point.detach().cpu()
             entry["w_calibrated"] = wq.quantizer.calibrated
@@ -441,13 +441,13 @@ def load_calib_cache(transformer: nn.Module, path: str):
         dtype = m.weight.dtype
 
         aq = m.act_quantizer
-        if isinstance(aq, AffineQuantComponent):
+        if isinstance(aq, LowRankAffineQuantComponent):
             aq.quantizer.scale = entry["act_scale"].to(device=device, dtype=dtype)
             aq.quantizer.zero_point = entry["act_zero_point"].to(device=device, dtype=dtype)
             aq.quantizer.calibrated = entry["act_calibrated"]
 
         wq = m.weight_quantizer
-        if isinstance(wq, (AffineQuantComponent, LowRankAffineQuantComponent)):
+        if isinstance(wq, LowRankAffineQuantComponent):
             w_scale = entry["w_scale"].to(device=device, dtype=dtype)
             w_zero = entry["w_zero_point"].to(device=device, dtype=dtype)
             if wq.quantizer.per_channel:

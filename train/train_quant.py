@@ -37,8 +37,7 @@ def parse_args():
                              "Default 64 matches nunchaku SVDQ-W4A4.")
     parser.add_argument("--weight_group_size", type=int, default=-1,
                         help="Per-group size for weight residual quantization. -1 = per-channel GPTQ. "
-                             "Set to 64 to match nunchaku.")
-    parser.add_argument("--quant_config", type=str, default=None)
+                              "Set to 64 to match nunchaku.")
     parser.add_argument("--rank", type=int, default=64)
     parser.add_argument("--svdq_rank", type=int, default=32)
 
@@ -80,12 +79,6 @@ def parse_args():
                              "Example: '0,2,3,4,5,7'.")
     parser.add_argument("--calib_images", type=int, default=8)
     parser.add_argument("--calib_cache", type=str, default=None)
-    parser.add_argument("--enable_hadamard_rotate", action="store_true")
-    parser.add_argument("--hadamard_mode", type=str, default="random_orthogonal",
-                        choices=["random_orthogonal", "fast_hadamard"],
-                        help="Rotation mode for --enable_hadamard_rotate. "
-                             "random_orthogonal: dense QR matrix. "
-                             "fast_hadamard: structured Walsh-Hadamard FWHT.")
     parser.add_argument("--align_nunchaku_inference", action="store_true",
                         help="After calibration, switch QuantLinearW4A4 forward to nunchaku-aligned "
                              "path (dynamic per-group act quant + per-group residual + unsmoothed lora). "
@@ -235,19 +228,6 @@ def save_nunchaku_safetensors(transformer, output_path: str):
     if layer_count == 0:
         print("[nunchaku] WARNING: no SVDQ layers found — empty safetensors saved")
 
-    # Save rotation matrices (global, shared by all rotated layers)
-    rot_info = getattr(transformer, "_hadamard_rotation_info", None)
-    if rot_info:
-        rot_mode = rot_info.get("mode", "random_orthogonal")
-        for size, entry in rot_info["matrices"].items():
-            if rot_mode == "fast_hadamard":
-                state_dict[f"_hadamard_rotation.{size}.rhs"] = entry["rhs"].cpu().contiguous()
-                state_dict[f"_hadamard_rotation.{size}.lhs"] = entry["lhs"].cpu().contiguous()
-                state_dict[f"_hadamard_rotation.{size}.lhs_k"] = torch.tensor(
-                    entry["lhs_k"], dtype=torch.int32)
-            else:
-                state_dict[f"_rotation.{size}"] = entry.cpu().contiguous()
-
     save_file(state_dict, output_path)
     print(f"[nunchaku] saved {layer_count} layers ({len(state_dict)} tensors) -> {output_path}")
 
@@ -269,15 +249,10 @@ def main():
     if len(image_names) == 0:
         raise RuntimeError(f"No input images found in {args.input_dir}")
 
-    if args.quant_config:
-        print(
-            f"[INFO] quant_config mode: {args.quant_config} — skipping calibration, using config values")
-        calib_image_names = []
-    else:
-        calib_image_names = get_image_names(args.calib_input_dir)
-        if len(calib_image_names) == 0:
-            raise RuntimeError(
-                f"No calibration images found in {args.calib_input_dir}")
+    calib_image_names = get_image_names(args.calib_input_dir)
+    if len(calib_image_names) == 0:
+        raise RuntimeError(
+            f"No calibration images found in {args.calib_input_dir}")
     print(f"[INFO] images: {len(image_names)}")
     print(f"[INFO] calib_images: {len(calib_image_names)}")
     print(f"[INFO] quant_scope: {args.quant_scope}")
@@ -320,22 +295,13 @@ def main():
             json.dump(dict(transformer.config), f, indent=2)
         print(f"[MERGED] saved merged backbone ({len(transformer.state_dict())} keys) -> {out_dir}/")
     replaced_layers = replace_quant_layers(
-        transformer, args.quant_scope, args.quant_config,
+        transformer, args.quant_scope,
         args.w_bits, args.a_bits, args.svdq_rank, args.svdq_smooth_alpha,
         svdq_iterations=args.svdq_iterations, act_group_size=args.act_group_size,
         weight_group_size=args.weight_group_size,
         ffn_blocks=parse_ffn_blocks(args.quant_ffn_blocks))
 
-    if args.enable_hadamard_rotate:
-        from models.quant.hadamard import enable_rotation
-        rotation_info = enable_rotation(transformer, mode=args.hadamard_mode)
-        transformer._hadamard_rotation_info = rotation_info
-
-    if args.quant_config:
-        print("[INFO] freezing with config-provided per-layer params (no calibration)")
-        calibrate_all_layers(
-            transformer, do_search=False, compute_error=False)
-    elif args.quant_scope != "none" and args.calib_cache and os.path.exists(args.calib_cache):
+    if args.quant_scope != "none" and args.calib_cache and os.path.exists(args.calib_cache):
         load_calib_cache(transformer, args.calib_cache)
     else:
         calibrate_w4a4(
