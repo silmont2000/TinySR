@@ -4,11 +4,8 @@ from models.quant.layers import (
     set_observer_enabled,
     QuantLinearW4A4,
 )
-from models.quant.inference import (
-    get_weight_dtype,
-    load_models,
-    replace_quant_layers,
-)
+from models.quant.inference import replace_quant_layers
+from models.pipeline import get_weight_dtype, load_models
 from thop import profile, clever_format
 import torch.nn as nn
 import torch

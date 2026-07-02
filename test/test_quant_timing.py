@@ -14,14 +14,9 @@ from PIL import Image
 from torchvision import transforms
 from tqdm import tqdm
 
-from models.quant.inference import (
-    get_image_names,
-    get_weight_dtype,
-    load_models,
-    replace_quant_layers,
-    preprocess_one_image,
-    tile_sample,
-)
+from models.quant.inference import replace_quant_layers
+from models.pipeline import get_image_names, get_weight_dtype, load_models, preprocess_one_image
+from models.quant.tiler import tile_sample
 from models.quant.layers import set_quant_enabled, set_observer_enabled
 from models.quant.components import LowRankBranch
 from models.vae.autoencoder_tiny import AutoencoderTiny
