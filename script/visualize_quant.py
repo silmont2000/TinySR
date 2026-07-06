@@ -20,6 +20,7 @@ Usage:
 
 import argparse
 import glob
+import math
 import os
 import sys
 from pathlib import Path
@@ -270,6 +271,13 @@ def parse_args():
                         help="Number of calibration images for attention quant (default 20)")
     parser.add_argument("--propagate_error", action="store_true",
                         help="Measure per-block error propagation through remaining network")
+    parser.add_argument("--propagate_hf", action="store_true",
+                        help="Also compute high-frequency image error (Laplacian 3/5/7)")
+    parser.add_argument("--trace_gram", action="store_true",
+                        help="Also compute V·V^T Gram loss for to_v layers (token-value subspace distortion)")
+    parser.add_argument("--propagate_fft", type=float, default=None,
+                        help="FFT low/high cutoff ratio (0-1). E.g. 0.5 = split at 50%% Nyquist. "
+                             "Outputs err_fft_low and err_fft_high.")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--cache_dir", type=str, default="/root/autodl-tmp/.cache/huggingface/")
@@ -295,6 +303,9 @@ def main():
         args.pretrained_model_name_or_path, args.vae_path, args.lora_dir, args.rank,
         args.cache_dir, args.device if torch.cuda.is_available() else "cpu", weight_dtype,
         skip_lora=(args.lora_dir is None))
+    if args.lora_dir:
+        transformer = transformer.merge_and_unload()
+        print(f"  LoRA merged")
     device = next(transformer.parameters()).device
 
     # ── resolve image list ───────────────────────────────────
@@ -458,6 +469,176 @@ def main():
         fig.savefig(gate_plot, dpi=120, bbox_inches="tight")
         plt.close(fig)
         print(f"[gates] plot saved -> {gate_plot}")
+
+    # ── error propagation analysis (quantize one layer at a time) ─────
+    if args.propagate_error:
+        from models.quant.layers import replace_linear_with_w4a4, set_quant_enabled, set_observer_enabled
+        from models.quant.calibrate import calibrate_one_layer, compute_smooth_scale
+        from models.quant.inference import build_layer_replacement_kwargs
+
+        qt_kw = build_layer_replacement_kwargs(w_bits=4, a_bits=4, svdq_rank=args.svd_rank,
+                                                svdq_smooth_alpha=args.alpha)
+
+        # FP16 reference + capture all layer outputs (forward hooks)
+        ref_outputs = {}
+        def _make_fwd_hook(store):
+            def _hook(module, inputs, output):
+                store["out"] = output.detach().clone()
+            return _hook
+        fwd_handles = {}
+        for name in layer_names:
+            m = transformer.get_submodule(name)
+            store = {}
+            fwd_handles[name] = (m.register_forward_hook(_make_fwd_hook(store)), store)
+
+        # Hook last block to_v for propagate Gram
+        gram_ref_store = {}
+        if args.trace_gram:
+            gram_ref_h = transformer.transformer_blocks[11].attn.to_v.register_forward_hook(
+                _make_fwd_hook(gram_ref_store))
+
+        img0 = image_paths[0]
+        latent_ref, _ = image_to_latent(4, 512, vae, img0, tensor_transform, device, weight_dtype)
+        latent_ref = latent_ref.to(device, dtype=weight_dtype)
+        set_quant_enabled(transformer, False)
+        with torch.no_grad():
+            y_ref = transformer(hidden_states=latent_ref, timestep=timesteps,
+                                pooled_projections=pooled_proj, return_dict=False)[0].clone()
+        for h, _ in fwd_handles.values(): h.remove()
+        ref_outputs = {name: s["out"] for name, (_, s) in fwd_handles.items()}
+        V_ref_last = gram_ref_store.get("out")
+        if args.trace_gram:
+            gram_ref_h.remove()
+        print(f"\n[propagate] FP16 reference (shape={tuple(y_ref.shape)}), "
+              f"{len(ref_outputs)} layer outputs captured")
+
+        errors = []
+        print(f"{'Layer':<55s} {'err_propagated':>14s} {'err_up':>14s} {'err_down':>14s}")
+        print("-" * 100)
+
+        def _save_one(name):
+            pn, ca = name.rsplit(".", 1); pd = transformer.get_submodule(pn); om = getattr(pd, ca)
+            return (pn, ca, om)
+
+        def _restore_one(pn, ca, om):
+            setattr(transformer.get_submodule(pn), ca, om)
+
+        def _calibrate_one(new_m, name):
+            set_observer_enabled(transformer, False)
+            new_m.weight_quantizer.observer_enabled = True
+            new_m.act_quantizer.observer_enabled = True
+            with torch.no_grad():
+                transformer(hidden_states=latent_ref, timestep=timesteps,
+                             pooled_projections=pooled_proj, return_dict=False)
+            new_m.weight_quantizer.observer_enabled = False
+            new_m.act_quantizer.observer_enabled = False
+            calibrate_one_layer(new_m, name, do_search=False, alpha_grid_size=7)
+            new_m.weight_quantizer.enabled = True
+            new_m.act_quantizer.enabled = True
+
+        for name in tqdm(layer_names, desc="[propagate]"):
+            if not isinstance(transformer.get_submodule(name.rsplit(".",1)[0] if "." in name else ""),
+                              torch.nn.Module) or name not in ref_outputs:
+                continue
+
+            pn, ca, om = _save_one(name)
+
+            # Replace just this ONE layer
+            replace_linear_with_w4a4(transformer, target_suffixes=[name],
+                                      skip_keywords=("lora_",), **qt_kw)
+            new_m = getattr(transformer.get_submodule(pn), ca)
+            _calibrate_one(new_m, name)
+
+            # Forward
+            q_store = {}
+            q_handle = new_m.register_forward_hook(_make_fwd_hook(q_store))
+            gram_quant_store = {}
+            if args.trace_gram and V_ref_last is not None:
+                gram_quant_h = transformer.transformer_blocks[11].attn.to_v.register_forward_hook(
+                    _make_fwd_hook(gram_quant_store))
+            with torch.no_grad():
+                y_quant = transformer(hidden_states=latent_ref, timestep=timesteps,
+                                       pooled_projections=pooled_proj, return_dict=False)[0]
+            q_handle.remove()
+            if args.trace_gram and V_ref_last is not None:
+                gram_quant_h.remove()
+            err_prop = (y_ref - y_quant).pow(2).mean().item()
+
+            # Gram loss at last block: how much quantizing THIS layer distorts block 11's V·V^T
+            err_gram = None
+            if args.trace_gram and V_ref_last is not None:
+                V_quant_last = gram_quant_store.get("out")
+                if V_quant_last is not None and V_ref_last.shape == V_quant_last.shape:
+                    Vr = V_ref_last.float().reshape(-1, V_ref_last.shape[-1])
+                    Vq = V_quant_last.float().reshape(-1, V_quant_last.shape[-1])
+                    Gr = Vr @ Vr.T
+                    Gq = Vq @ Vq.T
+                    err_gram = (Gr - Gq).pow(2).mean().item()
+
+            # HF + FFT (on y_quant)
+            err_hf = {}
+            if args.propagate_hf:
+                def _lap_kernel(k):
+                    w = torch.ones(k, k, dtype=torch.float32, device=device)
+                    w[k//2, k//2] = -(k*k - 1)
+                    return w.view(1,1,k,k)
+                laps = {k: _lap_kernel(k) for k in (3,5,7)}
+                def _hf_err_k(latent, lap):
+                    img = vae.decode(latent / vae.config.scaling_factor, return_dict=False)[0]
+                    return torch.nn.functional.conv2d(img.float(), lap.repeat(3,1,1,1), padding=lap.shape[-1]//2, groups=3)
+                hf_ref = {k: _hf_err_k(y_ref, lap) for k, lap in laps.items()}
+                hf_quant = {k: _hf_err_k(y_quant, lap) for k, lap in laps.items()}
+                for k in (3,5,7):
+                    err_hf[k] = (hf_ref[k] - hf_quant[k]).pow(2).mean().item()
+
+            err_fft = {}
+            if args.propagate_fft is not None:
+                cutoff = args.propagate_fft
+                def _fft_bands(img):
+                    mag = torch.abs(torch.fft.fftshift(torch.fft.fft2(img.float())))
+                    H, W = mag.shape[-2:]; cy, cx = H//2, W//2
+                    y, x = torch.meshgrid(torch.arange(H, device=img.device),
+                                           torch.arange(W, device=img.device), indexing='ij')
+                    r = torch.sqrt((y-cy).float()**2 + (x-cx).float()**2)
+                    thresh = r.max() * cutoff
+                    mask_low = (r < thresh).float().unsqueeze(0).unsqueeze(0)
+                    mask_high = (r >= thresh).float().unsqueeze(0).unsqueeze(0)
+                    el = (mag * mask_low).sum() / mask_low.sum().clamp_min(1)
+                    eh = (mag * mask_high).sum() / mask_high.sum().clamp_min(1)
+                    return el.item(), eh.item()
+                im_ref = vae.decode(y_ref / vae.config.scaling_factor, return_dict=False)[0]
+                im_quant = vae.decode(y_quant / vae.config.scaling_factor, return_dict=False)[0]
+                low_r, high_r = _fft_bands(im_ref)
+                low_q, high_q = _fft_bands(im_quant)
+                err_fft["low"] = (low_r - low_q)**2
+                err_fft["high"] = (high_r - high_q)**2
+
+            _restore_one(pn, ca, om)
+
+            ep_str = f"{err_prop:.4e}" if not math.isnan(err_prop) else "NaN"
+            tqdm.write(f"  {name:<53s} {ep_str:>14s}")
+
+            err_entry = {"layer": name, "err_propagated": err_prop}
+            if args.trace_gram and err_gram is not None:
+                err_entry["err_gram"] = err_gram
+            if args.propagate_hf:
+                for k in (3,5,7): err_entry[f"err_hf_{k}"] = err_hf.get(k)
+            if args.propagate_fft is not None:
+                err_entry["err_fft_low"] = err_fft.get("low")
+                err_entry["err_fft_high"] = err_fft.get("high")
+            errors.append(err_entry)
+
+        # Save CSV
+        if args.dump_metrics:
+            epath = args.dump_metrics.replace(".csv", "_propagate.csv")
+            os.makedirs(os.path.dirname(epath) or ".", exist_ok=True)
+            import csv as _csv
+            with open(epath, "w", newline="") as f:
+                fnames = errors[0].keys()
+                w = _csv.DictWriter(f, fieldnames=fnames)
+                w.writeheader(); w.writerows(errors)
+            print(f"[propagate] saved {len(errors)} layers -> {epath}")
+        print()
 
     # ── free GPU memory before plotting ─────────────────────
     del model_input, pooled_proj, timesteps, image_paths

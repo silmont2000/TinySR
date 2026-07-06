@@ -24,13 +24,15 @@ def compute_smooth_scale(act_absmax, weight_absmax, alpha, eps=1e-8):
 @torch.no_grad()
 def _eval_quant_error(weight, act_absmax, weight_absmax, weight_quantizer, inputs, alpha,
                       act_bits=8, act_symmetric=True, act_scale=None, act_group_size=-1,
-                      gate_weight=None):
+                      gate_weight=None, num_iterations=0):
     """Evaluate reconstruction error for a given alpha value.
     
     If inputs is provided: fake-quantizes both activation and weight, then compares
     output against the FP16 reference. Otherwise compares weight quantization error.
     
     gate_weight: optional per-channel weight (e.g. gate_mlp) for channel-weighted MSE.
+    num_iterations: GPTQ refinement passes (0 = single-shot SVD). Higher = more accurate
+                    error estimate but slower. Default 0 keeps backward compat.
     """
     smooth_scale = compute_smooth_scale(act_absmax, weight_absmax, alpha)
     smoothed_weight = weight * smooth_scale.reshape(1, -1)
@@ -48,7 +50,7 @@ def _eval_quant_error(weight, act_absmax, weight_absmax, weight_quantizer, input
             bits=bits, symmetric=symmetric, eps=eps_val,
             inputs=inputs_smoothed, gptq_block_size=weight_quantizer.gptq_block_size,
             gptq_damp_percentage=weight_quantizer.gptq_damp_percentage,
-            weight_group_size=wgs, num_iterations=0,
+            weight_group_size=wgs, num_iterations=num_iterations,
         )
         q_inputs = fake_quant_activation(inputs_smoothed, bits=act_bits, symmetric=act_symmetric,
                                          eps=eps_val, scale=act_scale, group_size=act_group_size)
@@ -66,8 +68,13 @@ def _eval_quant_error(weight, act_absmax, weight_absmax, weight_quantizer, input
 @torch.no_grad()
 def search_alpha(weight, act_absmax, weight_quantizer, input_cache=None,
                  alpha_grid=None, num_grids=7, act_bits=8, act_symmetric=True,
-                 act_scale=None, act_group_size=-1, gate_weight=None):
-    """Grid-search over α values, returning the one with minimum reconstruction error."""
+                 act_scale=None, act_group_size=-1, gate_weight=None,
+                 num_iterations=0):
+    """Grid-search over α values, returning the one with minimum reconstruction error.
+    
+    num_iterations: GPTQ refinement passes during error evaluation (0 = single-shot).
+                     Set to e.g. 10 for more accurate but slower search.
+    """
     if alpha_grid is None:
         num_grids = max(num_grids, 2)
         alpha_grid = [i / (num_grids - 1) for i in range(num_grids)]
@@ -88,7 +95,7 @@ def search_alpha(weight, act_absmax, weight_quantizer, input_cache=None,
             weight_quantizer=weight_quantizer, inputs=inputs_cat, alpha=alpha,
             act_bits=act_bits, act_symmetric=act_symmetric,
             act_scale=act_scale, act_group_size=act_group_size,
-            gate_weight=gate_weight,
+            gate_weight=gate_weight, num_iterations=num_iterations,
         )
         if error < best_error:
             best_error = error
@@ -144,11 +151,13 @@ def _resolve_alpha(m, layer_name, smooth_alpha_override, do_search, alpha_grid_s
         wq.smooth_alpha = alpha
         alpha_source = "override"
     elif do_search:
+        num_svd_iters = getattr(wq, "num_svd_iterations", 0)
+        search_iters = max(0, min(num_svd_iters, 10))  # cap for efficiency
         alpha, search_err = search_alpha(
             weight=m.weight, act_absmax=act_absmax, weight_quantizer=wq,
             input_cache=input_cache, act_bits=act_bits, act_symmetric=act_sym,
             act_scale=act_scale_val, num_grids=alpha_grid_size, act_group_size=act_group_size,
-            gate_weight=gate_weight,
+            gate_weight=gate_weight, num_iterations=search_iters,
         )
         wq.smooth_alpha = alpha
         alpha_source = "search"

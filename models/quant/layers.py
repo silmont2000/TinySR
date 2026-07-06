@@ -49,21 +49,67 @@ def get_target_suffixes(quant_scope, ffn_blocks=None):
 def get_ffn_block_suffixes(blocks):
     """Return FFN suffixes for specific transformer block indices.
 
-    Example: get_ffn_block_suffixes([0, 2, 3]) returns suffixes matching
-    ff.net.0.proj and ff.net.2 in blocks 0, 2, 3.
+    Supports two formats:
+      (old) [0, 2, 3] → both ff.net.0.proj and ff.net.2
+      (new) [(0, "both"), (2, "up"), (3, "down")] → per-layer mode
+
+    Mode: "both" (default), "up" (ff.net.0.proj only), "down" (ff.net.2 only).
     """
     suffixes = []
-    for b in blocks:
-        suffixes.append(f"transformer_blocks.{b}.ff.net.0.proj")
-        suffixes.append(f"transformer_blocks.{b}.ff.net.2")
+    if not blocks:
+        return suffixes
+    # Detect format
+    first = blocks[0]
+    if isinstance(first, (list, tuple)):
+        for b, mode in blocks:
+            if mode in ("both", "up"):
+                suffixes.append(f"transformer_blocks.{b}.ff.net.0.proj")
+            if mode in ("both", "down"):
+                suffixes.append(f"transformer_blocks.{b}.ff.net.2")
+    else:
+        for b in blocks:
+            suffixes.append(f"transformer_blocks.{b}.ff.net.0.proj")
+            suffixes.append(f"transformer_blocks.{b}.ff.net.2")
     return suffixes
 
 
 def parse_ffn_blocks(arg):
-    """Parse comma-separated block indices string. Returns None if empty."""
+    """Parse comma-separated block spec string. Returns None if empty.
+
+    Formats:
+      "1,6,9"              → [(1,"both"), (6,"both"), (9,"both")]
+      "1.up,6,9.down"      → [(1,"up"), (6,"both"), (9,"down")]
+      "1u,6d"              → [(1,"up"), (6,"down")]   (shorthand)
+    Backward-compat: returns list[int] when all elements are bare numbers.
+    """
     if arg is None or not str(arg).strip():
         return None
-    return [int(s.strip()) for s in str(arg).split(",") if s.strip()]
+    result = []
+    all_bare = True
+    for token in str(arg).split(","):
+        token = token.strip()
+        if not token:
+            continue
+        if token.endswith(".up") or token.endswith("u"):
+            mode = "up"
+            num = token.rstrip("u")
+            if "." in num:
+                num = num.split(".")[0]
+            all_bare = False
+        elif token.endswith(".down") or token.endswith("d"):
+            mode = "down"
+            num = token.rstrip("d")
+            if "." in num:
+                num = num.split(".")[0]
+            all_bare = False
+        else:
+            mode = "both"
+            num = token
+        result.append((int(num), mode))
+    # If all bare (backward compat), return list of ints
+    if all_bare:
+        return [b for b, _ in result]
+    return result
 
 
 class QuantLinearW4A4(nn.Module):
