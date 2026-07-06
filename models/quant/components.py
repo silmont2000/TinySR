@@ -191,6 +191,7 @@ class LowRankAffineQuantComponent(QuantComponent):
         smooth_alpha=0.5,
         num_svd_iterations=0,
         weight_group_size=-1,
+        group_size=-1,
     ):
         super().__init__()
         self.quantizer = UniformAffineQuantizer(
@@ -199,6 +200,7 @@ class LowRankAffineQuantComponent(QuantComponent):
             per_channel=per_channel,
             ch_axis=ch_axis,
             eps=eps,
+            group_size=group_size,
         )
         self.rank = rank
         self.alpha = alpha
