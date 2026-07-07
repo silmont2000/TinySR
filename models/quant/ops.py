@@ -117,7 +117,7 @@ def gptq_per_group_int4(weight, inputs, group_size=64, bits=4, symmetric=True,
 @torch.no_grad()
 def gptq_per_group_dequant(weight, inputs, group_size=64, bits=4, symmetric=True,
                            block_size=128, damp_percentage=0.01, eps=1e-8):
-    """Per-group GPTQ for train_quant calibration, returns dequantized FP weights."""
+    """Per-group GPTQ for post_quant calibration, returns dequantized FP weights."""
     qw_int, scales = gptq_per_group_int4(
         weight, inputs, group_size=group_size, bits=bits, symmetric=symmetric,
         block_size=block_size, damp_percentage=damp_percentage, eps=eps)

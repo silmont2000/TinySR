@@ -82,7 +82,7 @@ def parse_args():
     parser.add_argument("--align_nunchaku_inference", action="store_true",
                         help="After calibration, switch QuantLinearW4A4 forward to nunchaku-aligned "
                              "path (dynamic per-group act quant + per-group residual + unsmoothed lora). "
-                             "Makes train_quant validation output match nunchaku inference exactly.")
+                             "Makes post_quant validation output match nunchaku inference exactly.")
     parser.add_argument("--warmup_images", type=int, default=1)
     parser.add_argument("--latent_tiled_size", type=int, default=64)
     parser.add_argument("--latent_tiled_overlap", type=int, default=8)
