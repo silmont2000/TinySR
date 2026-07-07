@@ -27,7 +27,6 @@ from contextlib import nullcontext
 from pathlib import Path
 import torch.nn.functional as F
 import torch
-from utils.device import get_optimal_device_name
 import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator
@@ -590,7 +589,7 @@ def main(args):
     )
     
     log_dict = {}
-    lpips = pyiqa.create_metric('lpips', as_loss=True).to(get_optimal_device_name())
+    lpips = pyiqa.create_metric('lpips', as_loss=True).cuda()
     autocast_ctx = torch.autocast(accelerator.device.type,dtype=weight_dtype)
     update_ema(ema, transformer.module, decay=0)  # Ensure EMA is initialized with synced weights
     for epoch in range(first_epoch, args.num_train_epochs):

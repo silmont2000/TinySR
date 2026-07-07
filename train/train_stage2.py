@@ -14,7 +14,6 @@
 # See the License for the specific language governing permissions and
 import argparse
 import datetime
-import json
 import logging
 import math
 import os
@@ -25,7 +24,6 @@ from contextlib import nullcontext
 from pathlib import Path
 import torch.nn.functional as F
 import torch
-from utils.device import get_optimal_device_name
 import torch.utils.checkpoint
 import transformers
 from accelerate import Accelerator
@@ -42,12 +40,6 @@ from diffusers import (
 )
 from models.tinysr.tinysd3 import TinySD3Transformer2DModel
 from models.tinysr.sd3 import SD3Transformer2DModel
-from models.tinysr.pyramid_config import PyramidArchConfig
-from models.tinysr.pyramid_model import TinyPyramidSD3Transformer2DModel
-from models.tinysr.stage1_defaults import (
-    CKPT, SMOKE_RANK_PATTERN, make_lora_config,
-    LORA_R, DEFAULT_TIMESTEP, VAE_CKPT, PYRAMID_MULT_CONFIG,
-)
 
 from diffusers.image_processor import  VaeImageProcessor
 from diffusers.optimization import get_scheduler
@@ -119,13 +111,13 @@ def log_validation(
 
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
-    # parser.add_argument(
-    #     "--pretrained_model_name_or_path",
-    #     type=str,
-    #     default=None,
-    #     required=True,
-    #     help="Path to pretrained model or model identifier from huggingface.co/models.",
-    # )
+    parser.add_argument(
+        "--pretrained_model_name_or_path",
+        type=str,
+        default=None,
+        required=True,
+        help="Path to pretrained model or model identifier from huggingface.co/models.",
+    )
     parser.add_argument(
         "--lora_dir",
         type=str,
@@ -140,13 +132,13 @@ def parse_args(input_args=None):
         required=True,
         help="Path to DINOv2 pretrained model.",
     )
-    # parser.add_argument(
-    #     "--teacher_model_name_or_path",
-    #     type=str,
-    #     default=None,
-    #     required=True,
-    #     help="Path to DINOv2 pretrained model.",
-    # )
+    parser.add_argument(
+        "--teacher_model_name_or_path",
+        type=str,
+        default=None,
+        required=True,
+        help="Path to DINOv2 pretrained model.",
+    )
     parser.add_argument(
         "--revision",
         type=str,
@@ -336,8 +328,6 @@ def parse_args(input_args=None):
         "--set_grads_to_none",
         action="store_true",
     )
-    parser.add_argument("--loss_type", type=str, default="a", choices=["a", "b"],
-                        help="Pyramid loss type (a=simple, b=multi-scale)")
 
     if input_args is not None:
         args = parser.parse_args(input_args)
@@ -354,7 +344,6 @@ def collate_fn(examples, weight_dtype=torch.float16):
     lr_img = [example["lr_img"] for example in examples]
     hr_img = [example["hr_img"] for example in examples]
     # latent_hr = [example["latent_hr"] for example in examples]
-    vae_stu = torch.stack([e["vae_stu"] for e in examples])
     
     # prompts = [example["prompt_text"] for example in examples]
     # prompt_embeds = torch.stack([example["prompt_embeds_input"] for example in examples])
@@ -372,11 +361,8 @@ def collate_fn(examples, weight_dtype=torch.float16):
         "hr_img": hr_img.to(dtype=weight_dtype),
         # "latent_hr": latent_hr.to(dtype=weight_dtype),
         "latent_stu": latent_stu.to(dtype=weight_dtype),
-        "vae_stu": vae_stu.to(dtype=weight_dtype),
-
         # "prompts": prompts,
         # "prompt_embeds": prompt_embeds.to(dtype=weight_dtype),
-        
         "pooled_prompt_embeds": pooled_prompt_embeds.to(dtype=weight_dtype),
              }
     return batch
@@ -430,63 +416,33 @@ def main(args):
     if accelerator.is_main_process:
         if args.output_dir is not None:
             os.makedirs(args.output_dir, exist_ok=True)
-    
+
+    transformer = TinySD3Transformer2DModel.from_pretrained(
+        args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
+    )
+    vae = AutoencoderTiny.from_pretrained("your vae path")
+
+    vae.requires_grad_(False)
+    transformer.requires_grad_(False)
     weight_dtype = torch.float16
     if accelerator.mixed_precision == "no":
         weight_dtype = torch.float32
     elif accelerator.mixed_precision == "bf16":
         weight_dtype = torch.bfloat16
 
-
-    # transformer = TinySD3Transformer2DModel.from_pretrained(
-    #     args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
-    # )
-    pc_path = os.path.join(args.lora_dir, "pyramid_config.json")
-    if not os.path.exists(pc_path):
-        raise FileNotFoundError(f"pyramid_config.json not found in {args.lora_dir}")
-    with open(pc_path) as f:
-        pc = PyramidArchConfig.from_dict(json.load(f))
-    mult_config_path = None
-    candidate = os.path.join(args.lora_dir, "mult_config.json")
-    if os.path.isfile(candidate):
-        mult_config_path = candidate
-        print(f"  mult_config loaded from {mult_config_path}")
-    transformer = TinyPyramidSD3Transformer2DModel.from_flat_pretrained(
-        CKPT, pyramid_config=pc,
-        subfolder="transformer",
-        revision=args.revision, variant=args.variant,
-        torch_dtype=weight_dtype,
-        ignore_mismatched_sizes=True,
-        mult_config_path=mult_config_path,
-    )
-    vae = AutoencoderTiny.from_pretrained("checkpoint/vae/separable")
-    vae_decode = AutoencoderKL.from_pretrained("/data/disk2/xby/sd3-medium", subfolder="vae").to(get_optimal_device_name(), weight_dtype)
-
-
-    vae.requires_grad_(False)
-    transformer.requires_grad_(False)
-
     if args.gradient_checkpointing:
         transformer.enable_gradient_checkpointing()
 
-    # transformer_lora_config = LoraConfig(
-    #     r=64,
-    #     lora_alpha=64,
-    #     init_lora_weights="gaussian",
-    #     target_modules=["to_k", "to_q", "to_v", "to_out.0","proj","linear", "linear_1", "linear_2", "net.2"],
-    # )
-    rp_path = os.path.join(args.lora_dir, "rank_pattern.json")
-    if os.path.exists(rp_path):
-        with open(rp_path) as f:
-            rank_pattern = json.load(f)
-    else:
-        rank_pattern = SMOKE_RANK_PATTERN
-    transformer_lora_config = make_lora_config(rank_pattern=rank_pattern)
+    transformer_lora_config = LoraConfig(
+        r=64,
+        lora_alpha=64,
+        init_lora_weights="gaussian",
+        target_modules=["to_k", "to_q", "to_v", "to_out.0","proj","linear", "linear_1", "linear_2", "net.2"],
+    )
     transformer.add_adapter(transformer_lora_config, adapter_name="default")
     transformer.enable_adapters()
-    transformer_lora_state_dict = StableDiffusion3Pipeline.lora_state_dict(args.lora_dir, weight_name="model.safetensors")
+    transformer_lora_state_dict = StableDiffusion3Pipeline.lora_state_dict(args.lora_dir, weight_name="transformer.safetensors")
     load_lora_state_dict_warn(transformer_lora_state_dict, transformer)
-
     
     vae.to(accelerator.device, dtype=weight_dtype)
     transformer.to(accelerator.device, dtype=weight_dtype)
@@ -503,7 +459,7 @@ def main(args):
                 if isinstance(model, type(unwrap_model(transformer))):
                     transformer_lora_layers_to_save = get_peft_model_state_dict(model, adapter_name="default")
                     StableDiffusion3Pipeline.save_lora_weights(
-                output_dir, transformer_lora_layers=transformer_lora_layers_to_save,weight_name=f"model.safetensors"
+                output_dir, transformer_lora_layers=transformer_lora_layers_to_save,weight_name=f"transformer.safetensors"
             ) 
                 elif isinstance(model, type(unwrap_model(model_dis))) :
                     torch.save(model.state_dict(), os.path.join(output_dir, f"model_dis.safetensors"))
@@ -514,7 +470,7 @@ def main(args):
     def load_model_hook(models, input_dir):
         model_dis = models.pop()
         transformer = models.pop()
-        transformer_lora_state_dict = StableDiffusion3Pipeline.lora_state_dict(input_dir,weight_name="model.safetensors")
+        transformer_lora_state_dict = StableDiffusion3Pipeline.lora_state_dict(input_dir,weight_name="transformer.safetensors")
         load_lora_state_dict(transformer_lora_state_dict, transformer)
         model_dis.load_state_dict(torch.load(os.path.join(input_dir, "model_dis.safetensors")))
 
@@ -549,7 +505,7 @@ def main(args):
         eps=args.adam_epsilon,
     )
 
-    model_fea = vit_large(patch_size=14, img_size=518, block_chunks=0, init_values=1.0,num_register_tokens=4)
+    model_fea = vit_large(patch_size=14, img_size=518, block_chunks=0, init_values=1.0)
     util_net.reload_model(model_fea, torch.load(args.DINO_v2_pretrained_model_path))
     patch_resolution = 16 * (512 // 256)
     model_fea.pos_embed.data = timm.layers.pos_embed.resample_abs_pos_embed(
@@ -558,7 +514,7 @@ def main(args):
     model_fea.requires_grad_(False)
     model_fea.to(accelerator.device, dtype=weight_dtype)
 
-    model_dis = ProjectedDiscriminator(c_dim=1024).train()
+    model_dis = ProjectedDiscriminator(c_dim=768).train()
     optimizer_Dis = torch.optim.AdamW(
         model_dis.parameters(),
         lr=args.learning_rate_discrimitor,
@@ -610,11 +566,11 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        tracker_name = "tinysr-stage2"
+        tracker_name = "tinysr"
         log_name = args.log_name
         time = datetime.datetime.now().strftime('%m-%d_%H:%M')
         accelerator.init_trackers(tracker_name, config=vars(args), 
-                                  init_kwargs={"wandb": {"name": f"{log_name}_lr{args.learning_rate}_{time}","mode": 'online'}}
+                                  init_kwargs={"wandb": {"name": f"{log_name}_lr{args.learning_rate}_{time}","mode": 'dryrun'}}
                                   )
         if args.log_code:
             wandb.run.log_code(".", log_name,
@@ -679,9 +635,7 @@ def main(args):
         disable=not accelerator.is_local_main_process,
     )
     log_dict = {}
-    lpips = pyiqa.create_metric('lpips', as_loss=True).to(get_optimal_device_name())
-    maniqa_metric = pyiqa.create_metric('maniqa-pipal', as_loss=True, device=accelerator.device)
-    maniqa_metric.requires_grad_(False)
+    lpips = pyiqa.create_metric('lpips', as_loss=True).cuda()
     autocast_ctx = torch.autocast(accelerator.device.type,dtype=weight_dtype)
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()
@@ -695,27 +649,19 @@ def main(args):
                 log_dict["lq"] = lr_values.float().cpu()
                 log_dict["hq"] = hr_values.float().cpu()
                 with autocast_ctx:
-                    # with torch.no_grad():
-                    #     model_input = vae.encode(lr_values).latents * vae.config.scaling_factor
-                    #     timesteps = torch.tensor([1000.], device=accelerator.device)
-                    #     latent_tea = batch["latent_stu"]
-                    timesteps = torch.tensor([DEFAULT_TIMESTEP], device=accelerator.device)
-                    model_input = batch["vae_stu"]
-                    latent_tea = batch["latent_stu"]
-                       
-                    model_pred, _,_ = transformer(
+                    with torch.no_grad():
+                        model_input = vae.encode(lr_values).latents * vae.config.scaling_factor
+                        timesteps = torch.tensor([1000.], device=accelerator.device)
+                        latent_tea = batch["latent_stu"]
+                        
+                    model_pred = transformer(
                         hidden_states=model_input,
                         timestep=timesteps,
                         pooled_projections=pooled_prompt_embeds,
                         return_dict=False,
-                    )
-                    scale_factor = 64 // pc.sample_size
-
-                    # scale_factor = DEFAULT_PYRAMID_CONFIG.p_states[-1].grid_hw // DEFAULT_PYRAMID_CONFIG.p_states[0].grid_hw
-                    input_up = F.interpolate(model_input.float(
-                    ), scale_factor=scale_factor, mode='bilinear', align_corners=False)
-                    latent_stu = input_up - model_pred.float()
-
+                    )[0]
+                    latent_stu =  model_input - model_pred 
+                    
                     l1_loss =  F.l1_loss(latent_stu.float(), latent_tea.float().detach(), reduction='mean') 
                     
                     image_stu = vae.decode(latent_stu / vae.config.scaling_factor, return_dict=False)[0].clamp(-1, 1)
@@ -739,12 +685,9 @@ def main(args):
                     pred_fake = torch.cat(pred_fake, dim=1)
                     gan_loss = -torch.mean(pred_fake)
 
-                    lpips_loss = lpips(image_stu, hr_values)
-                    maniqa_loss = 1-maniqa_metric(image_stu) 
+                    lpips_loss = lpips(image_stu, hr_values) 
                     # Compute total loss
-                    loss_g = 0.3 * gan_loss + 1 * lpips_loss + 6 * l1_loss + 1 * maniqa_loss
-                    # loss_g = 0.3 * gan_loss  + 1 * lpips_loss
-                    # loss_g = 0.3 * gan_loss
+                    loss_g = 0.3 * gan_loss  + 1 * lpips_loss + 5 * l1_loss
 
                 # backward
                 accelerator.backward(loss_g)
@@ -787,25 +730,14 @@ def main(args):
                                     shutil.rmtree(removing_checkpoint)
 
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                        try:
-                            os.makedirs(save_path, exist_ok=True)
-                            unwrapped = accelerator.unwrap_model(transformer)
-                            with open(os.path.join(save_path, "mult_config.json"), "w") as f:
-                                json.dump(unwrapped._mult_config, f, indent=2)
-                            accelerator.save_state(save_path)
-                            logger.info(f"Saved state to {save_path}")
-                        except (torch.cuda.OutOfMemoryError, RuntimeError, MemoryError) as e:
-                            logger.warning(f"Memory insufficient, skipping checkpoint save at step {global_step}: {e}")
-                            if os.path.exists(save_path):
-                                shutil.rmtree(save_path)
-                            torch.cuda.empty_cache()
+                        accelerator.save_state(save_path)
+                        logger.info(f"Saved state to {save_path}")
 
             logs = {
                     "lpips_loss": lpips_loss.detach().item(), 
                     "gan_loss": gan_loss.detach().item(),
                     "discrimitor_loss": loss_D.detach().item(),
                     "l1_loss": l1_loss.detach().item(),
-                    "maniqa_loss": maniqa_loss.detach().item()
                     }
             progress_bar.set_postfix(**logs)
             if accelerator.is_main_process:
@@ -822,17 +754,8 @@ def main(args):
     if accelerator.is_main_process:
         if accelerator.sync_gradients:
             save_path = os.path.join(args.output_dir, f"checkpoint-latest")
-            try:
-                os.makedirs(save_path, exist_ok=True)
-                with open(os.path.join(save_path, "mult_config.json"), "w") as f:
-                    json.dump(accelerator.unwrap_model(transformer)._mult_config, f, indent=2)
-                accelerator.save_state(save_path)
-                logger.info(f"Saved state to {save_path}")
-            except (torch.cuda.OutOfMemoryError, RuntimeError, MemoryError) as e:
-                logger.warning(f"Memory insufficient, skipping final checkpoint save: {e}")
-                if os.path.exists(save_path):
-                    shutil.rmtree(save_path)
-                torch.cuda.empty_cache()
+            accelerator.save_state(save_path)
+            logger.info(f"Saved state to {save_path}")
 
     accelerator.end_training()
 
