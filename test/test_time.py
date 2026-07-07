@@ -12,7 +12,7 @@ from peft import LoraConfig
 from diffusers import (
     StableDiffusion3Pipeline,
 )
-from models.final_sd3.tinysd3 import TinySD3Transformer2DModel
+from models.tinysr.tinysd3 import TinySD3Transformer2DModel
 from models.vae.autoencoder_tiny  import  AutoencoderTiny
 
 from utils.vaehook import _init_tiled_vae

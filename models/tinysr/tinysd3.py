@@ -70,14 +70,8 @@ class PatchEmbed(nn.Module):
         self.base_size = height // patch_size
         self.interpolation_scale = interpolation_scale
 
-        
-
         print("loading pos_embed")
-        # if (input_size!=256):
         self.register_buffer("pos_embed", torch.load("dataset/cache/pos_embed.pt", map_location="cpu"))
-        # else:
-        # self.register_buffer("pos_embed", torch.load("dataset/cache/pos_embed_256.pt"))
-
         # self.pos_embed = torch.load("dataset/cache/pos_embed.pt")
 
 
@@ -358,8 +352,8 @@ class TinySD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromO
         
         if self.initialized is False:
             hidden_states, scale, shift  = self.norm_out(hidden_states, self.temb)
-            self.scale = scale.detach()
-            self.shift = shift.detach()
+            self.scale = scale
+            self.shift = shift
             self.initialized = True
             del self.norm_out
             del self.temb

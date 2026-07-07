@@ -13,23 +13,116 @@
 # limitations under the License.
 
 
+import itertools
 from typing import Any, Dict, List, Optional, Union
+
+import sys
+sys.path.append(".")
 
 import torch
 import torch.nn as nn
-
 from diffusers.configuration_utils import ConfigMixin, register_to_config
 from diffusers.loaders import FromOriginalModelMixin, PeftAdapterMixin
 from diffusers.models.attention_processor import Attention, AttentionProcessor
 from diffusers.models.modeling_utils import ModelMixin
-from diffusers.models.normalization import AdaLayerNormContinuous
+from diffusers.models.normalization import AdaLayerNormContinuous, RMSNorm
 from diffusers.utils import USE_PEFT_BACKEND, is_torch_version, logging, scale_lora_layers, unscale_lora_layers
 from diffusers.models.embeddings import CombinedTimestepTextProjEmbeddings, PatchEmbed
 from diffusers.models.transformers.transformer_2d import Transformer2DModelOutput
-from diffusers.models.attention import JointTransformerBlock
+
+# from diffusers.models.attention import JointTransformerBlock
+from models.tinysr.sd3block import JointTransformerBlock
+
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
+class PatchEmbed(nn.Module):
+    """2D Image to Patch Embedding with support for SD3 cropping."""
+
+    def __init__(
+        self,
+        height=224,
+        width=224,
+        patch_size=16,
+        in_channels=3,
+        embed_dim=768,
+        layer_norm=False,
+        flatten=True,
+        bias=True,
+        interpolation_scale=1,
+        pos_embed_type="sincos",
+        pos_embed_max_size=None,  # For SD3 cropping
+    ):
+        super().__init__()
+
+        num_patches = (height // patch_size) * (width // patch_size)
+        self.flatten = flatten
+        self.layer_norm = layer_norm
+        self.pos_embed_max_size = pos_embed_max_size
+
+        self.proj = nn.Conv2d(
+            in_channels, embed_dim, kernel_size=(patch_size, patch_size), stride=patch_size, bias=bias
+        )
+        if layer_norm:
+            self.norm = nn.LayerNorm(embed_dim, elementwise_affine=False, eps=1e-6)
+        else:
+            self.norm = None
+
+        self.patch_size = patch_size
+        self.height, self.width = height // patch_size, width // patch_size
+        self.base_size = height // patch_size
+        self.interpolation_scale = interpolation_scale
+
+        print("loading pos_embed")
+        self.pos_embed = torch.load("dataset/cache/pos_embed.pt", map_location="cpu")
+
+
+    def forward(self, latent):
+        if self.pos_embed_max_size is not None:
+            height, width = latent.shape[-2:]
+        else:
+            height, width = latent.shape[-2] // self.patch_size, latent.shape[-1] // self.patch_size
+        latent = self.proj(latent)
+        if self.flatten:
+            latent = latent.flatten(2).transpose(1, 2)  # BCHW -> BNC
+        if self.layer_norm:
+            latent = self.norm(latent)
+        if self.pos_embed is None:
+            return latent.to(latent.dtype)
+        return (latent + self.pos_embed).to(latent.dtype)
+
+
+class AdaLayerNormContinuous(nn.Module):
+    def __init__(
+        self,
+        embedding_dim: int,
+        conditioning_embedding_dim: int,
+        # NOTE: It is a bit weird that the norm layer can be configured to have scale and shift parameters
+        # because the output is immediately scaled and shifted by the projected conditioning embeddings.
+        # Note that AdaLayerNorm does not let the norm layer have scale and shift parameters.
+        # However, this is how it was implemented in the original code, and it's rather likely you should
+        # set `elementwise_affine` to False.
+        elementwise_affine=True,
+        eps=1e-5,
+        bias=True,
+        norm_type="layer_norm",
+    ):
+        super().__init__()
+        self.silu = nn.SiLU()
+        self.linear = nn.Linear(conditioning_embedding_dim, embedding_dim * 2, bias=bias)
+        if norm_type == "layer_norm":
+            self.norm = nn.LayerNorm(embedding_dim, eps, elementwise_affine, bias)
+        elif norm_type == "rms_norm":
+            self.norm = RMSNorm(embedding_dim, eps, elementwise_affine)
+        else:
+            raise ValueError(f"unknown norm_type {norm_type}")
+
+    def forward(self, x: torch.Tensor, conditioning_embedding: torch.Tensor) -> torch.Tensor:
+        # convert back to the original dtype in case `conditioning_embedding`` is upcasted to float32 (needed for hunyuanDiT)
+        emb = self.linear(self.silu(conditioning_embedding).to(x.dtype))
+        scale, shift = torch.chunk(emb, 2, dim=1)
+        x = self.norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
+        return x, scale, shift
 
 class SD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOriginalModelMixin):
     """
@@ -85,7 +178,7 @@ class SD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         self.time_text_embed = CombinedTimestepTextProjEmbeddings(
             embedding_dim=self.inner_dim, pooled_projection_dim=self.config.pooled_projection_dim
         )
-        self.context_embedder = nn.Linear(self.config.joint_attention_dim, self.config.caption_projection_dim)
+        # self.context_embedder = nn.Linear(self.config.joint_attention_dim, self.config.caption_projection_dim)
 
         # `attention_head_dim` is doubled to account for the mixing.
         # It needs to crafted when we get the actual checkpoints.
@@ -102,9 +195,14 @@ class SD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
         )
 
         self.norm_out = AdaLayerNormContinuous(self.inner_dim, self.inner_dim, elementwise_affine=False, eps=1e-6)
+        self.norm = None
+        self.scale = None
+        self.shift = None
         self.proj_out = nn.Linear(self.inner_dim, patch_size * patch_size * self.out_channels, bias=True)
 
         self.gradient_checkpointing = False
+        
+        self.flag = False
 
     # Copied from diffusers.models.unets.unet_3d_condition.UNet3DConditionModel.enable_forward_chunking
     def enable_forward_chunking(self, chunk_size: Optional[int] = None, dim: int = 0) -> None:
@@ -241,12 +339,12 @@ class SD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
     def forward(
         self,
         hidden_states: torch.FloatTensor,
-        encoder_hidden_states: torch.FloatTensor = None,
         pooled_projections: torch.FloatTensor = None,
         timestep: torch.LongTensor = None,
+        block_controlnet_hidden_states: List = None,
         joint_attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
-        encoder_depth = None,
+        encoder_depth: int = None
     ) -> Union[torch.FloatTensor, Transformer2DModelOutput]:
         """
         The [`SD3Transformer2DModel`] forward method.
@@ -290,20 +388,33 @@ class SD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
                 )
 
         height, width = hidden_states.shape[-2:]
-
+        # self.pose_emd = None
+        
         hidden_states = self.pos_embed(hidden_states)  # takes care of adding positional embeddings too.
-        temb = self.time_text_embed(timestep, pooled_projections)
-        encoder_hidden_states = self.context_embedder(encoder_hidden_states)
-
+        # self.pose_emd = pose_emd
+        # print(self.pose_emd == pose_emd)
+        if self.flag is False:
+            temb = self.time_text_embed(timestep, pooled_projections)
+            self.temb = temb
+        
         return_ls = []
         for index_block, block in enumerate(self.transformer_blocks):
-            encoder_hidden_states, hidden_states = block(
-                hidden_states=hidden_states, encoder_hidden_states=encoder_hidden_states, temb=temb
+            hidden_states = block(
+                hidden_states=hidden_states, temb=self.temb
             )
             if encoder_depth is not None and index_block in encoder_depth:
                 return_ls.append(hidden_states)
-
-        hidden_states = self.norm_out(hidden_states, temb)
+        
+        if self.flag is False:
+            hidden_states, scale, shift  = self.norm_out(hidden_states, self.temb)
+            self.scale = scale
+            self.shift = shift
+            self.norm = self.norm_out.norm
+            self.flag = True
+            del self.norm_out
+            del self.time_text_embed
+        else:
+            hidden_states = self.norm(hidden_states) * (1 + self.scale)[:, None, :] + self.shift[:, None, :]
         hidden_states = self.proj_out(hidden_states)
         # unpatchify
         patch_size = self.config.patch_size
@@ -329,3 +440,15 @@ class SD3Transformer2DModel(ModelMixin, ConfigMixin, PeftAdapterMixin, FromOrigi
             return (output,)
 
         return Transformer2DModelOutput(sample=output)
+
+if __name__ == "__main__":
+    from utils.device import get_optimal_device
+    device = get_optimal_device()
+
+    model = SD3Transformer2DModel.from_pretrained("checkpoint/ablation/tinymerge/prune-12-merge-tsd-tiny", subfolder="transformer", low_cpu_mem_usage=False)
+    print(model)
+    model = model.to(torch.float16).to(device)
+    # torch.save(model.state_dict(), "pytorch_model.bin") # 1.3GB
+    a = torch.randn(1, 16, 128, 128).to(torch.float16).to(device)
+    b = torch.randn(1, 2048).to(torch.float16).to(device)
+    model(a, pooled_projections = b, timestep=torch.tensor([1000]).long().to(device), return_dict=True)
