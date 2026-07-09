@@ -49,7 +49,6 @@ def parse_args():
     parser.add_argument("--upscale", type=int, default=4)
     parser.add_argument("--process_size", type=int, default=512)
     parser.add_argument("--align_method", type=str, choices=["wavelet", "adain", "nofix"], default="adain")
-    parser.add_argument("--warmup", type=int, default=30)
     parser.add_argument("--latent_tiled_size", type=int, default=64)
     parser.add_argument("--latent_tiled_overlap", type=int, default=8)
     parser.add_argument("--batch_size", type=int, default=1)
@@ -226,60 +225,60 @@ def load_nunchaku_state(transformer, state_path):
 
 
 def run_nunchaku_benchmark(args, transformer, vae, timesteps, pooled_prompt_embeds, weight_dtype, device):
-    """Benchmark full pipeline: VAE encode → transformer → latent subtract → VAE decode."""
-    image_h, image_w = args.bench_image_h, args.bench_image_w
-    print(f"[BENCH] pixel: {args.batch_size} × 3 × {image_h//4}→{image_h} × {image_w//4}→{image_w}, "
-          f"{args.bench_iterations} iterations")
+    """Benchmark full pipeline: VAE encode → transformer → latent subtract → VAE decode.
 
-    # Warmup
-    print(f"[BENCH] warming up ({args.warmup} iters)...")
-    for i in range(args.warmup):
+    Mirrors test/test_time.py: random inputs are pre-generated outside the timed
+    loop, warmup is one full pass over them, and preprocessing (interpolate + *2-1)
+    is inside the timed region.
+    """
+    image_h, image_w = args.bench_image_h, args.bench_image_w
+    size = (image_h, image_w)
+
+    def main(pixel_values):
         with torch.no_grad():
-            pv = torch.randn(args.batch_size, 3, image_h // 4, image_w // 4,
-                             device=device, dtype=weight_dtype)
-            pv = torch.nn.functional.interpolate(pv, size=(image_h, image_w),
-                                                  mode="bicubic", align_corners=False)
-            pv = pv * 2 - 1
-            mi = vae.encode(pv).latents * vae.config.scaling_factor
-            mp = transformer(
-                hidden_states=mi,
+            pixel_values = torch.nn.functional.interpolate(pixel_values, size=size, mode="bicubic", align_corners=False)
+            pixel_values = pixel_values * 2 - 1
+            pixel_values = pixel_values.to(device, dtype=weight_dtype).clamp(-1, 1)
+
+            model_input = vae.encode(pixel_values).latents * vae.config.scaling_factor
+            model_input = model_input.to(device, dtype=weight_dtype)
+
+            model_pred = transformer(
+                hidden_states=model_input,
                 timestep=timesteps,
                 pooled_projections=pooled_prompt_embeds,
                 return_dict=False,
             )[0]
-            ls = mi - mp
-            _ = vae.decode(ls / vae.config.scaling_factor, return_dict=False)[0]
+            latent_stu = model_input - model_pred
+
+            image = vae.decode(latent_stu / vae.config.scaling_factor, return_dict=False)[0].squeeze(0).clamp(-1, 1)
+            return image
+
+    print(f"[BENCH] pixel: {args.bench_iterations} × {args.batch_size} × 3 × {image_h//4}→{image_h} × {image_w//4}→{image_w}")
+
+    # Pre-generate all random inputs outside the timed loop
+    pixel_values = torch.randn(args.bench_iterations, args.batch_size, 3, image_h // 4, image_w // 4,
+                               dtype=weight_dtype, device=device)
+
+    # Warmup: one full pass over the pre-generated inputs
+    print(f"[BENCH] warming up ({args.bench_iterations} iters)...")
+    for pixel_value in pixel_values:
+        image = main(pixel_value)
     if device.type == "cuda":
         torch.cuda.synchronize()
 
     # Timed run
     print(f"[BENCH] running {args.bench_iterations} iterations...")
-    times = []
-    for i in tqdm(range(args.bench_iterations), desc="bench"):
-        with torch.no_grad():
-            pv = torch.randn(args.batch_size, 3, image_h // 4, image_w // 4,
-                             device=device, dtype=weight_dtype)
-            pv = torch.nn.functional.interpolate(pv, size=(image_h, image_w),
-                                                  mode="bicubic", align_corners=False)
-            pv = pv * 2 - 1
-            start = time.time()
-            mi = vae.encode(pv).latents * vae.config.scaling_factor
-            mp = transformer(
-                hidden_states=mi,
-                timestep=timesteps,
-                pooled_projections=pooled_prompt_embeds,
-                return_dict=False,
-            )[0]
-            ls = mi - mp
-            _ = vae.decode(ls / vae.config.scaling_factor, return_dict=False)[0]
+    total_time = 0.0
+    for pixel_value in tqdm(pixel_values, desc="bench"):
+        start_time = time.time()
+        image = main(pixel_value)
         if device.type == "cuda":
             torch.cuda.synchronize()
-        times.append(time.time() - start)
+        end_time = time.time()
+        total_time += (end_time - start_time)
 
-    avg_ms = sum(times) / len(times) * 1000
-    avg_per_sample_ms = avg_ms / args.batch_size
-    print(f"[BENCH] avg: {avg_ms:.2f}ms/iter  ({avg_per_sample_ms:.2f}ms/sample)  "
-          f"batch={args.batch_size}  image={image_h}×{image_w}")
+    print(f"Average time: {total_time / args.bench_iterations / args.batch_size}")
 
 
 if __name__ == "__main__":
@@ -331,15 +330,6 @@ if __name__ == "__main__":
     print(f"#Param. {param_cnt / 1e6:.1f}M")
 
     timesteps = torch.tensor([1000.0], device=device, dtype=weight_dtype)
-    pooled_prompt_embeds = torch.load(
-        os.path.join(args.embedding_dir, "pool_embeds.pt"),
-        map_location=device,
-    ).to(dtype=weight_dtype)
-
-    timesteps = torch.tensor([1000.0], device=device, dtype=weight_dtype)
-    pooled_prompt_embeds = torch.load(os.path.join(args.embedding_dir, "pool_embeds.pt"), map_location=device).to(dtype=weight_dtype)
-
-    timesteps = torch.tensor([1000.0], device=device, dtype=weight_dtype)
     pooled_prompt_embeds = torch.load(os.path.join(args.embedding_dir, "pool_embeds.pt"), map_location=device).to(dtype=weight_dtype)
 
     if args.benchmark:
@@ -362,28 +352,6 @@ if __name__ == "__main__":
     os.makedirs(args.output_dir+ts, exist_ok=True)
 
     tensor_transforms = transforms.Compose([transforms.ToTensor()])
-
-    print(f"Warming up ({args.warmup} iters)...")
-    w_img = Image.open(image_names[0]).convert("RGB")
-    w_w, w_h = w_img.size
-    w_nh = args.upscale * w_h - (args.upscale * w_h) % 8
-    w_nw = args.upscale * w_w - (args.upscale * w_w) % 8
-    w_lr = w_img.resize((int(w_w * args.upscale), int(w_h * args.upscale)))
-    w_pv = tensor_transforms(w_lr).unsqueeze(0).to(device, dtype=weight_dtype)
-
-    for _ in range(args.warmup):
-        w_pv_interp = torch.nn.functional.interpolate(
-            w_pv, size=(w_nh, w_nw), mode="bicubic", align_corners=False)
-        w_pv_norm = w_pv_interp * 2 - 1
-        w_mi = vae.encode(w_pv_norm).latents * vae.config.scaling_factor
-        w_mp = tile_sample(
-            w_mi, transformer, timesteps, pooled_prompt_embeds, weight_dtype,
-            tile_size=args.latent_tiled_size, tile_overlap=args.latent_tiled_overlap,
-        )
-        _ = w_mi - w_mp
-    if device.type == "cuda":
-        torch.cuda.synchronize()
-    print("Warmup done.")
 
     pbar = tqdm(total=datalen)
     total_time = 0.0
