@@ -255,8 +255,11 @@ def run_nunchaku_benchmark(args, transformer, vae, timesteps, pooled_prompt_embe
     # Timed run
     print(f"[BENCH] running {args.bench_iterations} iterations...")
     times = []
+    mem_records = []
     for i in tqdm(range(args.bench_iterations), desc="bench"):
         with torch.no_grad():
+            if device.type == "cuda":
+                torch.cuda.reset_peak_memory_stats()
             pv = torch.randn(args.batch_size, 3, image_h // 4, image_w // 4,
                              device=device, dtype=weight_dtype)
             pv = torch.nn.functional.interpolate(pv, size=(image_h, image_w),
@@ -274,12 +277,16 @@ def run_nunchaku_benchmark(args, transformer, vae, timesteps, pooled_prompt_embe
             _ = vae.decode(ls / vae.config.scaling_factor, return_dict=False)[0]
         if device.type == "cuda":
             torch.cuda.synchronize()
+            mem_records.append(torch.cuda.max_memory_allocated() / 1024**2)
         times.append(time.time() - start)
 
     avg_ms = sum(times) / len(times) * 1000
     avg_per_sample_ms = avg_ms / args.batch_size
+    mem_arr = np.array(mem_records)
     print(f"[BENCH] avg: {avg_ms:.2f}ms/iter  ({avg_per_sample_ms:.2f}ms/sample)  "
           f"batch={args.batch_size}  image={image_h}×{image_w}")
+    print(f"[BENCH] Peak mem  avg: {np.mean(mem_arr):.0f} MB")
+    print(f"[BENCH] Peak mem  max: {np.max(mem_arr):.0f} MB")
 
 
 if __name__ == "__main__":
