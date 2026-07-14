@@ -8,6 +8,7 @@ Usage:
         --quant_scope dit_full --rank 32
 """
 import argparse
+import gc
 import glob
 import os
 import sys
@@ -331,23 +332,23 @@ if __name__ == "__main__":
 
     load_nunchaku_state(transformer, args.nunchaku_state)
 
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
     transformer = transformer.to(device, dtype=weight_dtype).eval()
     vae = vae.to(device, dtype=weight_dtype).eval()
 
     param_cnt = sum(p.numel() for p in transformer.transformer_blocks.parameters())
     print(f"#Param. {param_cnt / 1e6:.1f}M")
+    if torch.cuda.is_available():
+        print(f"[NUNCHAKU] after to(device): {torch.cuda.memory_allocated() / 1024**2:.0f} MB allocated")
 
     timesteps = torch.tensor([1000.0], device=device, dtype=weight_dtype)
     pooled_prompt_embeds = torch.load(
         os.path.join(args.embedding_dir, "pool_embeds.pt"),
         map_location=device,
     ).to(dtype=weight_dtype)
-
-    timesteps = torch.tensor([1000.0], device=device, dtype=weight_dtype)
-    pooled_prompt_embeds = torch.load(os.path.join(args.embedding_dir, "pool_embeds.pt"), map_location=device).to(dtype=weight_dtype)
-
-    timesteps = torch.tensor([1000.0], device=device, dtype=weight_dtype)
-    pooled_prompt_embeds = torch.load(os.path.join(args.embedding_dir, "pool_embeds.pt"), map_location=device).to(dtype=weight_dtype)
 
     if args.benchmark:
         run_nunchaku_benchmark(args, transformer, vae, timesteps, pooled_prompt_embeds, weight_dtype, device)

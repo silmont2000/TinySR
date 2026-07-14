@@ -19,6 +19,7 @@ from utils.vaehook import _init_tiled_vae
 from utils.wavelet_color_fix import adain_color_fix, wavelet_color_fix
 from utils.util import load_lora_state_dict, load_lora_state_dict_warn
 import json as _json
+import numpy as np
 import torch.nn.functional as tfF
 from models.tinysr.stage1_defaults import DEFAULT_PYRAMID_CONFIG, make_lora_config
 from models.tinysr.pyramid_config import PyramidArchConfig
@@ -179,15 +180,24 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
+    mem_records = []
     for pixel_value in tqdm(pixel_values, desc="Inference"):
+        if torch.cuda.is_available():
+            torch.cuda.reset_peak_memory_stats()
         start_time = time.time()
         image = main(args, pixel_value, (args.process_size, args.process_size))
         if torch.cuda.is_available():
             torch.cuda.synchronize()
+            mem_records.append(torch.cuda.max_memory_allocated() / 1024**2)
         end_time = time.time()
         total_time += (end_time - start_time)
 
-    print(f"Average time: {total_time / args.inference_iterations / args.batch_size}")
+    avg_time = total_time / args.inference_iterations / args.batch_size
+    print(f"Average time: {avg_time:.4f} sec/sample")
+    if mem_records:
+        mem_arr = np.array(mem_records)
+        print(f"Peak mem  avg: {np.mean(mem_arr):.0f} MB")
+        print(f"Peak mem  max: {np.max(mem_arr):.0f} MB")
             
 
 
