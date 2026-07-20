@@ -14,6 +14,7 @@ from models.quant.calibrate import load_calib_cache, save_calib_cache, calibrate
 from models.quant.inference import calibrate_w4a4, replace_quant_layers
 from models.pipeline import get_image_names, get_weight_dtype, load_models, run_inference, save_report
 from models.quant.analysis import ActivationErrorAnalyzer
+from models.quant.ditas import generate_random_calib_data
 
 
 def parse_args():
@@ -71,6 +72,24 @@ def parse_args():
                         help="Disable smooth quantization entirely (smooth_scale = ones). "
                              "Use with --svdq_rank 0 for pure Min-Max baseline. "
                              "Use alone for SmoothQuant-free baseline with SVD.")
+    parser.add_argument("--asymmetric", action="store_true",
+                        help="Use asymmetric quantization (range [0, 2^bits-1]) instead of "
+                             "symmetric (range [-2^(bits-1), 2^(bits-1)-1]). "
+                             "DiTAS, PTQ4DiT, Q-DiT all use asymmetric by default.")
+    parser.add_argument("--ditas", action="store_true",
+                        help="Enable DiTAS mode (Data-free PTQ). "
+                             "Preset: --asymmetric --svdq_rank 32 --svdq_iterations 10 "
+                             "--search_smooth_alpha grid --svdq_alpha_grid 21 "
+                             "--no_gptq --no_svd_early_stop --act_group_size -1. "
+                             "Uses random latent calibration data instead of images.")
+    parser.add_argument("--no_gptq", action="store_true",
+                        help="Skip GPTQ Hessian-based quantization; use simple per-channel "
+                             "minmax instead. Matching DiTAS, Min-Max, SmoothQuant baselines. "
+                             "Ignored for nunchaku export (which always uses GPTQ when available).")
+    parser.add_argument("--no_svd_early_stop", action="store_true",
+                        help="Disable SVD iteration early-stop (always run all iterations). "
+                             "Default early-stop improves or maintains quality; disable only "
+                             "for strict reproduction of DiTAS (fixed 10 iters).")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--upscale", type=int, default=4)
     parser.add_argument("--process_size", type=int, default=512)
@@ -274,12 +293,17 @@ def main():
     if len(image_names) == 0:
         raise RuntimeError(f"No input images found in {args.input_dir}")
 
-    calib_image_names = get_image_names(args.calib_input_dir)
-    if len(calib_image_names) == 0:
-        raise RuntimeError(
-            f"No calibration images found in {args.calib_input_dir}")
-    print(f"[INFO] images: {len(image_names)}")
-    print(f"[INFO] calib_images: {len(calib_image_names)}")
+    if args.ditas:
+        calib_image_names = []  # data-free: random latents generated later
+        print(f"[INFO] images: {len(image_names)}")
+        print(f"[INFO] calib_images: data-free (random latents, {args.calib_images} samples)")
+    else:
+        calib_image_names = get_image_names(args.calib_input_dir)
+        if len(calib_image_names) == 0:
+            raise RuntimeError(
+                f"No calibration images found in {args.calib_input_dir}")
+        print(f"[INFO] images: {len(image_names)}")
+        print(f"[INFO] calib_images: {len(calib_image_names)}")
     print(f"[INFO] quant_scope: {args.quant_scope}")
 
     if args.output_dir is None:
@@ -295,6 +319,24 @@ def main():
             args.weight_group_size = 64
         if args.act_group_size < 0:
             args.act_group_size = 64
+
+    # --- DiTAS preset -------------------------------------------------------
+    if args.ditas:
+        args.asymmetric = True
+        args.svdq_rank = 32
+        args.svdq_iterations = 10
+        args.search_smooth_alpha = "grid"
+        args.svdq_alpha_grid = 21
+        args.no_smooth = False
+        args.no_gptq = True
+        args.no_svd_early_stop = True
+        args.act_group_size = -1          # per-tensor (matching DiTAS pertensoradaAsymQuantizer)
+        if args.calib_images == 8:        # still at argparse default -> override
+            args.calib_images = 50        # DiTAS paper uses 50 denoising steps
+        print(f"[DITAS] preset: asymmetric, rank=32, iters=10, "
+              f"grid_search(21), no_gptq, per-tensor_act, "
+              f"calib_samples={args.calib_images}")
+    # -----------------------------------------------------------------------
 
     # Shared runtime data
     pooled_prompt_embeds = torch.load(
@@ -324,25 +366,50 @@ def main():
         args.w_bits, args.a_bits, args.svdq_rank, args.svdq_smooth_alpha,
         svdq_iterations=args.svdq_iterations, act_group_size=args.act_group_size,
         weight_group_size=args.weight_group_size,
-        ffn_blocks=parse_ffn_blocks(args.quant_ffn_blocks))
+        ffn_blocks=parse_ffn_blocks(args.quant_ffn_blocks),
+        asymmetric=args.asymmetric)
 
     if args.quant_scope != "none" and args.calib_cache and os.path.exists(args.calib_cache):
         load_calib_cache(transformer, args.calib_cache)
     else:
-        calibrate_w4a4(
-            transformer, vae, calib_image_names,
-            pooled_prompt_embeds, timesteps, weight_dtype,
-            quant_scope=args.quant_scope,
-            calib_images=args.calib_images,
-            search_mode=args.search_smooth_alpha,
-            cascade_calib_images=args.cascade_calib_images,
-            load_smooth_alpha_report=args.load_smooth_alpha_report,
-            latent_tiled_size=args.latent_tiled_size,
-            latent_tiled_overlap=args.latent_tiled_overlap,
-            device=args.device, upscale=args.upscale, process_size=args.process_size,
-            alpha_grid_size=args.svdq_alpha_grid,
-            no_smooth=args.no_smooth,
-        )
+        if args.ditas:
+            calib_data_list = generate_random_calib_data(
+                vae, timesteps, pooled_prompt_embeds, weight_dtype,
+                device=device, num_samples=args.calib_images)
+            calibrate_w4a4(
+                transformer, vae, calib_image_names,
+                pooled_prompt_embeds, timesteps, weight_dtype,
+                quant_scope=args.quant_scope,
+                calib_images=args.calib_images,
+                search_mode=args.search_smooth_alpha,
+                cascade_calib_images=args.cascade_calib_images,
+                load_smooth_alpha_report=args.load_smooth_alpha_report,
+                latent_tiled_size=args.latent_tiled_size,
+                latent_tiled_overlap=args.latent_tiled_overlap,
+                device=args.device, upscale=args.upscale, process_size=args.process_size,
+                alpha_grid_size=args.svdq_alpha_grid,
+                no_smooth=args.no_smooth,
+                calib_data_list=calib_data_list,
+                no_gptq=args.no_gptq,
+                no_svd_early_stop=args.no_svd_early_stop,
+            )
+        else:
+            calibrate_w4a4(
+                transformer, vae, calib_image_names,
+                pooled_prompt_embeds, timesteps, weight_dtype,
+                quant_scope=args.quant_scope,
+                calib_images=args.calib_images,
+                search_mode=args.search_smooth_alpha,
+                cascade_calib_images=args.cascade_calib_images,
+                load_smooth_alpha_report=args.load_smooth_alpha_report,
+                latent_tiled_size=args.latent_tiled_size,
+                latent_tiled_overlap=args.latent_tiled_overlap,
+                device=args.device, upscale=args.upscale, process_size=args.process_size,
+                alpha_grid_size=args.svdq_alpha_grid,
+                no_smooth=args.no_smooth,
+                no_gptq=args.no_gptq,
+                no_svd_early_stop=args.no_svd_early_stop,
+            )
         if args.calib_cache:
             save_calib_cache(transformer, args.calib_cache)
 

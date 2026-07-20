@@ -38,16 +38,18 @@ __all__ = [
 # ---- layer replacement utilities ----------------------------------------
 
 def build_layer_replacement_kwargs(w_bits, a_bits, svdq_rank, svdq_smooth_alpha,
-                                   svdq_iterations=0, act_group_size=64, weight_group_size=-1):
+                                   svdq_iterations=0, act_group_size=64, weight_group_size=-1,
+                                   asymmetric=False):
+    symmetric = not asymmetric
     return {
         "weight_quant_kwargs": {
-            "bits": w_bits, "symmetric": True, "per_channel": True,
+            "bits": w_bits, "symmetric": symmetric, "per_channel": True,
             "ch_axis": 0, "rank": svdq_rank, "smooth_alpha": svdq_smooth_alpha,
             "num_svd_iterations": svdq_iterations,
             "weight_group_size": weight_group_size,
         },
         "act_quant_kwargs": {
-            "bits": a_bits, "symmetric": True, "per_channel": False,
+            "bits": a_bits, "symmetric": symmetric, "per_channel": False,
             "group_size": act_group_size,
         },
     }
@@ -56,12 +58,13 @@ def build_layer_replacement_kwargs(w_bits, a_bits, svdq_rank, svdq_smooth_alpha,
 def replace_quant_layers(transformer, quant_scope,
                          w_bits, a_bits, svdq_rank, svdq_smooth_alpha,
                          svdq_iterations=0, act_group_size=64, weight_group_size=-1,
-                         ffn_blocks=None):
+                         ffn_blocks=None, asymmetric=False):
     if quant_scope == "none":
         return []
     target_suffixes = get_target_suffixes(quant_scope, ffn_blocks=ffn_blocks)
     quant_kwargs = build_layer_replacement_kwargs(
-        w_bits, a_bits, svdq_rank, svdq_smooth_alpha, svdq_iterations, act_group_size, weight_group_size)
+        w_bits, a_bits, svdq_rank, svdq_smooth_alpha, svdq_iterations,
+        act_group_size, weight_group_size, asymmetric=asymmetric)
 
     replaced = replace_linear_with_w4a4(
         transformer,
@@ -88,24 +91,38 @@ def calibrate_w4a4(
     load_smooth_alpha_report, latent_tiled_size, latent_tiled_overlap,
     device=None, upscale=4, process_size=512,
     alpha_grid_size=7,
+    no_smooth=False,
+    calib_data_list=None,
+    no_gptq=False,
+    no_svd_early_stop=False,
 ):
-    """Prepare calibration data and run the calibration pipeline."""
+    """Prepare calibration data and run the calibration pipeline.
+    
+    Args:
+        calib_data_list: Optional pre-built list of (latent, timesteps, embeds, dtype)
+            tuples. When provided, skips VAE encoding of calibration images.
+            Used by DiTAS data-free mode.
+        no_gptq: If True, use minmax instead of GPTQ for residual quantization.
+        no_svd_early_stop: If True, run all SVD iterations without early-stopping.
+    """
     if quant_scope == "none":
         return
     if device is None:
         device = get_optimal_device_name()
     device = torch.device(device)
-    tensor_transform = transforms.Compose([transforms.ToTensor()])
-    calib_count = min(max(calib_images, 1), len(calib_image_names))
-    calib_names = calib_image_names[:calib_count]
 
     from models.quant.tiler import tile_sample
 
-    calib_data_list = []
-    for image_path in tqdm(calib_names, desc="Building calib data"):
-        model_input, _ = image_to_latent(
-            upscale, process_size, vae, image_path, tensor_transform, device, weight_dtype)
-        calib_data_list.append((model_input, timesteps, pooled_prompt_embeds, weight_dtype))
+    if calib_data_list is None:
+        tensor_transform = transforms.Compose([transforms.ToTensor()])
+        calib_count = min(max(calib_images, 1), len(calib_image_names))
+        calib_names = calib_image_names[:calib_count]
+
+        calib_data_list = []
+        for image_path in tqdm(calib_names, desc="Building calib data"):
+            model_input, _ = image_to_latent(
+                upscale, process_size, vae, image_path, tensor_transform, device, weight_dtype)
+            calib_data_list.append((model_input, timesteps, pooled_prompt_embeds, weight_dtype))
 
     def _forward_fn(model_input, ts, ppe, wd):
         tile_sample(model_input, transformer, ts, ppe, wd,
@@ -123,4 +140,7 @@ def calibrate_w4a4(
         cascade_calib_images=cascade_calib_images,
         smooth_alpha_override=smooth_alpha_override,
         alpha_grid_size=alpha_grid_size,
+        no_smooth=no_smooth,
+        no_gptq=no_gptq,
+        no_svd_early_stop=no_svd_early_stop,
     )

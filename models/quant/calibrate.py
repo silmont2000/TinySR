@@ -24,7 +24,7 @@ def compute_smooth_scale(act_absmax, weight_absmax, alpha, eps=1e-8):
 @torch.no_grad()
 def _eval_quant_error(weight, act_absmax, weight_absmax, weight_quantizer, inputs, alpha,
                       act_bits=8, act_symmetric=True, act_scale=None, act_group_size=-1,
-                      gate_weight=None, num_iterations=0):
+                      gate_weight=None, num_iterations=0, no_gptq=False, no_svd_early_stop=False):
     """Evaluate reconstruction error for a given alpha value.
     
     If inputs is provided: fake-quantizes both activation and weight, then compares
@@ -51,6 +51,7 @@ def _eval_quant_error(weight, act_absmax, weight_absmax, weight_quantizer, input
             inputs=inputs_smoothed, gptq_block_size=weight_quantizer.gptq_block_size,
             gptq_damp_percentage=weight_quantizer.gptq_damp_percentage,
             weight_group_size=wgs, num_iterations=num_iterations,
+            no_gptq=no_gptq, no_svd_early_stop=no_svd_early_stop,
         )
         q_inputs = fake_quant_activation(inputs_smoothed, bits=act_bits, symmetric=act_symmetric,
                                          eps=eps_val, scale=act_scale, group_size=act_group_size)
@@ -69,7 +70,7 @@ def _eval_quant_error(weight, act_absmax, weight_absmax, weight_quantizer, input
 def search_alpha(weight, act_absmax, weight_quantizer, input_cache=None,
                  alpha_grid=None, num_grids=7, act_bits=8, act_symmetric=True,
                  act_scale=None, act_group_size=-1, gate_weight=None,
-                 num_iterations=0):
+                 num_iterations=0, no_gptq=False, no_svd_early_stop=False):
     """Grid-search over α values, returning the one with minimum reconstruction error.
     
     num_iterations: GPTQ refinement passes during error evaluation (0 = single-shot).
@@ -96,6 +97,7 @@ def search_alpha(weight, act_absmax, weight_quantizer, input_cache=None,
             act_bits=act_bits, act_symmetric=act_symmetric,
             act_scale=act_scale, act_group_size=act_group_size,
             gate_weight=gate_weight, num_iterations=num_iterations,
+            no_gptq=no_gptq, no_svd_early_stop=no_svd_early_stop,
         )
         if error < best_error:
             best_error = error
@@ -108,12 +110,15 @@ def search_alpha(weight, act_absmax, weight_quantizer, input_cache=None,
 
 @torch.no_grad()
 def _resolve_alpha(m, layer_name, smooth_alpha_override, do_search, alpha_grid_size, compute_error,
-                   gate_weight=None):
+                   gate_weight=None, no_smooth=False, no_gptq=False, no_svd_early_stop=False):
     """Determine the best α for one layer, compute smooth_scale and reconstruction error.
     
-    Returns (smooth_scale, alpha, error_str).  smooth_scale may be None for config-only mode.
+    Returns (smooth_scale, alpha, error_str).  smooth_scale may be None for no_smooth or config-only mode.
     """
     wq = m.weight_quantizer
+
+    if no_smooth:
+        return None, 0.0, "no_smooth"
     has_data = hasattr(wq, "act_absmax") and wq.act_absmax is not None
 
     if not has_data:
@@ -158,6 +163,7 @@ def _resolve_alpha(m, layer_name, smooth_alpha_override, do_search, alpha_grid_s
             input_cache=input_cache, act_bits=act_bits, act_symmetric=act_sym,
             act_scale=act_scale_val, num_grids=alpha_grid_size, act_group_size=act_group_size,
             gate_weight=gate_weight, num_iterations=search_iters,
+            no_gptq=no_gptq, no_svd_early_stop=no_svd_early_stop,
         )
         wq.smooth_alpha = alpha
         alpha_source = "search"
@@ -176,6 +182,7 @@ def _resolve_alpha(m, layer_name, smooth_alpha_override, do_search, alpha_grid_s
                 weight_quantizer=wq, inputs=inputs_cat, alpha=alpha,
                 act_bits=act_bits, act_symmetric=act_sym,
                 act_scale=act_scale_val, act_group_size=act_group_size,
+                no_gptq=no_gptq, no_svd_early_stop=no_svd_early_stop,
             )
             error_str = f"err={err.item():.6e}"
     elif alpha_source == "search" and search_err is not None:
@@ -201,20 +208,25 @@ def _resolve_alpha(m, layer_name, smooth_alpha_override, do_search, alpha_grid_s
 
 @torch.no_grad()
 def calibrate_one_layer(m, layer_name, *, do_search=False, compute_error=True,
-                        smooth_alpha_override=None, alpha_grid_size=7, gate_weight=None):
+                        smooth_alpha_override=None, alpha_grid_size=7, gate_weight=None,
+                        no_smooth=False, no_gptq=False, no_svd_early_stop=False):
     """Complete calibration of one QuantLinearW4A4 layer.
     
     1. Resolve optimal α → compute smooth_scale
     2. Freeze act_quantizer (calculate scale from observed min/max)
     3. Build SVD low-rank branch + GPTQ-quantize residual
     4. Freeze weight_quantizer
+    
+    When no_smooth=True, smooth_scale is None (identity) — suitable for pure Min-Max baseline.
+    When no_gptq=True, skip Hessian-based GPTQ — use simple minmax instead (DiTAS baseline).
     """
     wq = m.weight_quantizer
 
     # Step 1: resolve alpha and compute smooth_scale
     smooth_scale, alpha, error_str = _resolve_alpha(
         m, layer_name, smooth_alpha_override, do_search, alpha_grid_size, compute_error,
-        gate_weight=gate_weight)
+        gate_weight=gate_weight, no_smooth=no_smooth,
+        no_gptq=no_gptq, no_svd_early_stop=no_svd_early_stop)
 
     # Step 2: freeze weight quantizer & build SVD branch
     if smooth_scale is not None:
@@ -222,7 +234,8 @@ def calibrate_one_layer(m, layer_name, *, do_search=False, compute_error=True,
         wq.collect_stats(stat_weight)
     wq.freeze()
     if hasattr(wq, "build_branch"):
-        wq.build_branch(m.weight, smooth_scale=smooth_scale)
+        wq.build_branch(m.weight, smooth_scale=smooth_scale,
+                        no_gptq=no_gptq, no_svd_early_stop=no_svd_early_stop)
 
     # Step 3: freeze act quantizer
     m.act_quantizer.freeze()
@@ -234,7 +247,8 @@ def calibrate_one_layer(m, layer_name, *, do_search=False, compute_error=True,
 
 @torch.no_grad()
 def calibrate_all_layers(module, do_search=False, compute_error=True,
-                         smooth_alpha_override=None, alpha_grid_size=7):
+                         smooth_alpha_override=None, alpha_grid_size=7,
+                         no_smooth=False, no_gptq=False, no_svd_early_stop=False):
     """Single-pass calibration: iterate all QuantLinearW4A4 layers, calibrate each one."""
     from tqdm import tqdm
     alpha_counts: dict[float, int] = {}
@@ -249,7 +263,8 @@ def calibrate_all_layers(module, do_search=False, compute_error=True,
 
         calibrate_one_layer(m, name, do_search=do_search, compute_error=compute_error,
                             smooth_alpha_override=smooth_alpha_override, alpha_grid_size=alpha_grid_size,
-                            gate_weight=gate_weight)
+                            gate_weight=gate_weight, no_smooth=no_smooth,
+                            no_gptq=no_gptq, no_svd_early_stop=no_svd_early_stop)
         if do_search:
             alpha = m.weight_quantizer.smooth_alpha
             alpha_counts[alpha] = alpha_counts.get(alpha, 0) + 1
@@ -269,7 +284,8 @@ def calibrate_all_layers(module, do_search=False, compute_error=True,
 @torch.no_grad()
 def calibrate_all_layers_cascade(module, calib_data, cascade_forward_fn, num_cascade_calib=4,
                                  do_search=False, compute_error=True,
-                                 smooth_alpha_override=None, alpha_grid_size=7):
+                                 smooth_alpha_override=None, alpha_grid_size=7,
+                                 no_smooth=False, no_gptq=False, no_svd_early_stop=False):
     """Layer-by-layer cascade calibration.
     
     Each layer is frozen sequentially so that layer N sees pre-quantized activations
@@ -313,7 +329,8 @@ def calibrate_all_layers_cascade(module, calib_data, cascade_forward_fn, num_cas
 
         calibrate_one_layer(m, layer_name, do_search=do_search, compute_error=compute_error,
                             smooth_alpha_override=smooth_alpha_override, alpha_grid_size=alpha_grid_size,
-                            gate_weight=gate_weight)
+                            gate_weight=gate_weight, no_smooth=no_smooth,
+                            no_gptq=no_gptq, no_svd_early_stop=no_svd_early_stop)
         if do_search:
             alpha = m.weight_quantizer.smooth_alpha
             alpha_counts[alpha] = alpha_counts.get(alpha, 0) + 1
@@ -358,6 +375,9 @@ def run_calibration(
     cascade_calib_images: int = 4,
     smooth_alpha_override=None,
     alpha_grid_size: int = 7,
+    no_smooth: bool = False,
+    no_gptq: bool = False,
+    no_svd_early_stop: bool = False,
 ):
     """Orchestrate the full calibration pipeline.
 
@@ -367,6 +387,9 @@ def run_calibration(
     search_mode: None → use preset smooth_alpha
                  "grid" → single-pass grid search
                  "cascade" → layer-by-layer cascade freeze
+    no_smooth:    True → skip smooth_scale entirely (identity), Min-Max baseline.
+    no_gptq:      True → use minmax instead of GPTQ for residual quantization.
+    no_svd_early_stop: True → disable SVD iteration early-stop.
     """
     if quant_scope == "none":
         return
@@ -389,11 +412,13 @@ def run_calibration(
             transformer, calib_data=cascade_calib, cascade_forward_fn=cascade_forward_fn,
             num_cascade_calib=cascade_calib_images, do_search=True, compute_error=True,
             smooth_alpha_override=smooth_alpha_override, alpha_grid_size=alpha_grid_size,
+            no_smooth=no_smooth, no_gptq=no_gptq, no_svd_early_stop=no_svd_early_stop,
         )
     else:
         calibrate_all_layers(
             transformer, do_search=search, compute_error=compute_error,
             smooth_alpha_override=smooth_alpha_override, alpha_grid_size=alpha_grid_size,
+            no_smooth=no_smooth, no_gptq=no_gptq, no_svd_early_stop=no_svd_early_stop,
         )
 
     set_quant_enabled(transformer, True)

@@ -21,11 +21,19 @@ def decompose_svd_branch(
     gptq_damp_percentage: float = 0.01,
     weight_group_size: int = -1,
     num_iterations: int = 0,
+    no_gptq: bool = False,
+    no_svd_early_stop: bool = False,
 ) -> Tuple[Optional["LowRankBranch"], torch.Tensor, List[dict]]:
     """SVD decomposition with optional iterative refinement.
 
     Shared by alpha search (``num_iterations=0``, single SVD for honest ranking)
     and freeze (``num_iterations>0``, iterative refinement like deepcompressor).
+
+    Args:
+        no_gptq: If True, use minmax quantization for the residual even when
+            calibration inputs are available. Matches DiTAS baseline.
+        no_svd_early_stop: If True, run all num_iterations without early-stopping.
+            Matches DiTAS's fixed 10-iteration alternating SVD.
 
     Returns:
         branch: LowRankBranch or None if rank <= 0.
@@ -39,7 +47,7 @@ def decompose_svd_branch(
         return branch, branch.get_effective_weight()
 
     def _quantize(R, inp):
-        if inp is not None:
+        if inp is not None and not no_gptq:
             return gptq_quantize_linear_weight(
                 R, inp, bits=bits, symmetric=symmetric,
                 block_size=gptq_block_size, damp_percentage=gptq_damp_percentage,
@@ -63,7 +71,7 @@ def decompose_svd_branch(
         cand_R = weight - cand_L
         cand_residual = _quantize(cand_R, inputs)
         cand_err = ((weight - cand_L - cand_residual) ** 2).mean().item()
-        if cand_err >= best_err:   # early-stop: no improvement
+        if not no_svd_early_stop and cand_err >= best_err:   # early-stop: no improvement
             break
         branch, residual, best_err = cand_branch, cand_residual, cand_err
         iter_trace.append({
@@ -291,7 +299,8 @@ class LowRankAffineQuantComponent(QuantComponent):
         self.svd_iter_trace = []
 
     @torch.no_grad()
-    def build_branch(self, weight, quant_weight=None, smooth_scale=None):
+    def build_branch(self, weight, quant_weight=None, smooth_scale=None,
+                     no_gptq=False, no_svd_early_stop=False):
         if smooth_scale is not None:
             self.smooth_scale = smooth_scale.detach().to(
                 device=weight.device, dtype=weight.dtype)
@@ -320,6 +329,8 @@ class LowRankAffineQuantComponent(QuantComponent):
             gptq_damp_percentage=self.gptq_damp_percentage,
             weight_group_size=self.weight_group_size,
             num_iterations=self.num_svd_iterations,
+            no_gptq=no_gptq,
+            no_svd_early_stop=no_svd_early_stop,
         )
 
         self.input_cache = []

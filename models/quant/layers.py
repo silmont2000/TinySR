@@ -20,15 +20,15 @@ ATTN_SUFFIXES = [
     "attn.to_q",
     "attn.to_k",
     "attn.to_v",
-    # "attn.to_out.0",
+    "attn.to_out.0",
 ]
 
-# EXTRA_SUFFIXES = [
-#     "proj_out.base_layer",
-#     "proj_out",
-# ]
 EXTRA_SUFFIXES = [
+    "proj_out.base_layer",
+    "proj_out",
 ]
+# EXTRA_SUFFIXES = [
+# ]
 
 
 def get_target_suffixes(quant_scope, ffn_blocks=None):
