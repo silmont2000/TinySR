@@ -67,6 +67,10 @@ def parse_args():
     parser.add_argument("--svdq_alpha_grid", type=int, default=11,
                         help="Number of grid points for alpha search.")
     parser.add_argument("--svdq_iterations", type=int, default=0)
+    parser.add_argument("--no_smooth", action="store_true",
+                        help="Disable smooth quantization entirely (smooth_scale = ones). "
+                             "Use with --svdq_rank 0 for pure Min-Max baseline. "
+                             "Use alone for SmoothQuant-free baseline with SVD.")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--upscale", type=int, default=4)
     parser.add_argument("--process_size", type=int, default=512)
@@ -133,6 +137,7 @@ def save_nunchaku_safetensors(transformer, output_path: str):
     eps = 1e-8
 
     state_dict = {}
+    fp_recon_state_dict = {}  # TEMP: dequantized effective fp weights for spectral analysis
     layer_count = 0
 
     for name, m in transformer.named_modules():
@@ -202,6 +207,18 @@ def save_nunchaku_safetensors(transformer, output_path: str):
         packed_proj_down = packer.pack_lowrank_weight(proj_down_raw, down=True)
         packed_proj_up = packer.pack_lowrank_weight(proj_up_raw, down=False)
 
+        # TEMP: reconstruct the effective fp weight (RAW input space) for offline
+        # spectral analysis. W_recon = dequant(residual) + branch_b @ (branch_a / s),
+        # directly comparable to the original merged_backbone fp weight.
+        dequant_residual = (
+            qweight_int.float().view(out_features, in_features // group_size, group_size)
+            * per_group_scale.float().unsqueeze(-1)
+        ).view(out_features, in_features)
+        low_rank_effective = branch_b.float() @ (
+            branch_a.float() / smooth_scale.float().reshape(1, -1).clamp_min(eps))
+        w_recon = (dequant_residual + low_rank_effective).to(torch.float16)
+        fp_recon_state_dict[f"{name}.weight"] = w_recon.cpu()
+
         state_dict[f"{name}.qweight"] = packed_qweight.cpu()
         state_dict[f"{name}.wscales"] = packed_wscales.cpu()
         state_dict[f"{name}.proj_down"] = packed_proj_down.cpu()
@@ -230,6 +247,14 @@ def save_nunchaku_safetensors(transformer, output_path: str):
 
     save_file(state_dict, output_path)
     print(f"[nunchaku] saved {layer_count} layers ({len(state_dict)} tensors) -> {output_path}")
+
+    # TEMP: companion fp reconstruction for spectral analysis
+    if fp_recon_state_dict:
+        fp_path = output_path.replace(".safetensors", "_fp_recon.safetensors")
+        if fp_path == output_path:
+            fp_path = output_path + "_fp_recon.safetensors"
+        save_file(fp_recon_state_dict, fp_path)
+        print(f"[nunchaku] saved {len(fp_recon_state_dict)} fp-recon weights -> {fp_path}")
 
 
 def main():
@@ -316,6 +341,7 @@ def main():
             latent_tiled_overlap=args.latent_tiled_overlap,
             device=args.device, upscale=args.upscale, process_size=args.process_size,
             alpha_grid_size=args.svdq_alpha_grid,
+            no_smooth=args.no_smooth,
         )
         if args.calib_cache:
             save_calib_cache(transformer, args.calib_cache)
@@ -327,8 +353,8 @@ def main():
                 m.enable_nunchaku_aligned()
         print(f"[ALIGN] nunchaku-aligned inference enabled on QuantLinearW4A4 layers")
 
-    if args.save_nunchaku and args.quant_scope != "none":
-        save_nunchaku_safetensors(transformer, args.save_nunchaku)
+    # if args.save_nunchaku and args.quant_scope != "none":
+    #     save_nunchaku_safetensors(transformer, args.save_nunchaku)
 
     quant_meta = collect_quant_meta(
         transformer) if args.quant_scope != "none" else []
