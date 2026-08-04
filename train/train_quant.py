@@ -1,5 +1,6 @@
 # fmt:off
 import argparse
+import gc
 import os
 import sys
 from datetime import datetime
@@ -359,6 +360,9 @@ def main():
         args.pretrained_model_name_or_path, args.vae_path, args.lora_dir,
         args.rank, args.cache_dir, device, weight_dtype, skip_lora=False)
     transformer = transformer.merge_and_unload()
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
     if args.save_merged_backbone:
         import json
         from safetensors.torch import save_file

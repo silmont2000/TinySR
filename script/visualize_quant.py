@@ -6,7 +6,6 @@ For each specified layer, generates a 5-panel figure showing:
   (b) |W|       — original weight distribution
   (c) |X_hat|   — after smooth-scaling (activation side)
   (d) |W_hat|   — after smooth-scaling (weight side)
-  (e) |R|       — SVD low-rank residual
 
 Usage:
     python script/visualize_quant.py \\
@@ -35,6 +34,13 @@ from tqdm import tqdm
 # Add TinySR to path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+
+# ---------------------------------------------------------------------------
+# per-panel y-axis configuration
+# ---------------------------------------------------------------------------
+# Set absolute ymax for each panel. None = auto (1.05 × data max).
+# Example: {"a": (0, 2.0), "b": (0, 1.5), "c": None, "d": None, "e": (0, 0.3)}
+YLIM_CONFIG = {"a": None, "b": (0,0.4), "c": None, "d": (0,1.0), "e": (0,0.4)}
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -153,24 +159,24 @@ def plot_layer(layer_name: str, x_in: torch.Tensor, weight: torch.Tensor,
         fig, axes = plt.subplots(1, 5, figsize=(22, 3.2))
         fig.suptitle(f"{layer_name}  (α={alpha}, rank={svd_rank})", fontsize=10, y=1.02)
 
-        _plot_fill(axes[0], p50_x, p99_x, pmax_x, ylim=(0, pmax_x.max() * 1.05))
-        axes[0].set_title(f"(a) $|X|$  max={pmax_x.max():.3f}")
+        _plot_fill(axes[0], p50_x, p99_x, pmax_x, ylim=YLIM_CONFIG["a"] or (0, pmax_x.max() * 1.05))
+        axes[0].set_title(r"(a) Original, $|X|$  max={:.3f}".format(pmax_x.max()))
         axes[0].set_xlabel("Channel")
 
-        _plot_fill(axes[1], p50_w, p99_w, pmax_w, ylim=(0, pmax_w.max() * 1.05))
-        axes[1].set_title(f"(b) $|W|$  max={pmax_w.max():.3f}")
+        _plot_fill(axes[1], p50_w, p99_w, pmax_w, ylim=YLIM_CONFIG["b"] or (0, pmax_w.max() * 1.05))
+        axes[1].set_title(r"(b) Original, $|W|$  max={:.3f}".format(pmax_w.max()))
         axes[1].set_xlabel("Channel")
 
-        _plot_fill(axes[2], p50_xh, p99_xh, pmax_xh, ylim=(0, pmax_xh.max() * 1.05))
-        axes[2].set_title(f"(c) $|\\hat X|$  max={pmax_xh.max():.3f}")
+        _plot_fill(axes[2], p50_xh, p99_xh, pmax_xh, ylim=YLIM_CONFIG["c"] or (0, pmax_xh.max() * 1.05))
+        axes[2].set_title(r"(c) After Smoothing, $|\tilde{{X}}| = |X \cdot \operatorname{{diag}}(\lambda)^{{-1}}|$  max={:.3f}".format(pmax_xh.max()))
         axes[2].set_xlabel("Channel")
 
-        _plot_fill(axes[3], p50_wh, p99_wh, pmax_wh)
-        axes[3].set_title(f"(d) $|\\hat W|$  max={pmax_wh.max():.3f}")
+        _plot_fill(axes[3], p50_wh, p99_wh, pmax_wh, ylim=YLIM_CONFIG["d"] or None)
+        axes[3].set_title(r"(d) After Smoothing, $|\tilde{{W}}| = |W \cdot \operatorname{{diag}}(\lambda)|$  max={:.3f}".format(pmax_wh.max()))
         axes[3].set_xlabel("Channel")
 
-        _plot_fill(axes[4], p50_r, p99_r, pmax_r, ylim=(0, max(pmax_wh.max(), pmax_r.max()) * 1.05))
-        axes[4].set_title(f"(e) $|R|$  max={pmax_r.max():.3f}")
+        _plot_fill(axes[4], p50_r, p99_r, pmax_r, ylim=YLIM_CONFIG["e"] or (0, pmax_r.max() * 1.05))
+        axes[4].set_title(r"(e) After SVD, $|R| = |\tilde{{W}} - L_1 L_2|$  max={:.3f}".format(pmax_r.max()))
         axes[4].set_xlabel("Channel")
 
         sv_np = sv.cpu().numpy()

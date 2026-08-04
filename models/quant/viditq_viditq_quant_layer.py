@@ -53,7 +53,9 @@ class ViDiTQuantizedLinear(QuantizedLinear):
 
     @torch.no_grad()
     def set_rotation_matrix(self, device="cuda"):
-        self.rotation_matrix = random_hadamard_matrix(self.in_features, device)
+        R = random_hadamard_matrix(self.in_features, device)
+        self.rotation_matrix = R.to(torch.float16)
+        del R
 
     @torch.no_grad()
     def update_quantized_weight(self):
@@ -61,13 +63,13 @@ class ViDiTQuantizedLinear(QuantizedLinear):
         assert self.channel_mask is not None and self.rotation_matrix is not None
         C_out, C_in = self.fp_module.weight.shape
         self.w_quantizer.init_done = False
-        # scale
         W_scaled = self.fp_module.weight / self.channel_mask.reshape([1, C_in])
         W_scaled_q = self.w_quantizer(W_scaled)
-        # rotate
-        W_rot = torch.matmul(W_scaled_q.double(), self.rotation_matrix).float()
+        rot_dtype = self.rotation_matrix.dtype
+        W_rot = torch.matmul(W_scaled_q.to(rot_dtype), self.rotation_matrix).float()
         self.weight.data = self.w_quantizer(W_rot)
         self.w_quantizer.init_done = True
+        self.fp_module = None  # free original FP weight after quantization
 
     def forward(self, x: torch.Tensor, *args, **kwargs):
         if not self.quant_mode:
@@ -76,7 +78,7 @@ class ViDiTQuantizedLinear(QuantizedLinear):
         dtype_ = x.dtype
         B, N_token, C = x.shape
         x = x * self.channel_mask.reshape([1, 1, C])
-        x = torch.matmul(x.double(), self.rotation_matrix).to(dtype=dtype_)
+        x = torch.matmul(x.to(self.rotation_matrix.dtype), self.rotation_matrix).to(dtype=dtype_)
         x = x.reshape([B * N_token, -1])
         x = self.a_quantizer(x)
         x = x.reshape([B, N_token, C])

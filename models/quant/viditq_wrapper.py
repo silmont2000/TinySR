@@ -104,10 +104,7 @@ def collect_viditq_act_stats(module, calib_data_list, forward_fn):
 
 @torch.no_grad()
 def finalize_viditq_weights(module):
-    """Generate rotation matrices and update quantized weights.
-
-    Must be called after collect_viditq_act_stats.
-    """
+    """Generate rotation matrices and update quantized weights."""
     count = 0
     for name, m in module.named_modules():
         if not isinstance(m, ViDiTQuantizedLinear):
@@ -121,4 +118,5 @@ def finalize_viditq_weights(module):
                 f"(in={m.in_features}, out={m.out_features}): {e}"
             ) from e
         count += 1
+        torch.cuda.empty_cache()
     print(f"[VIDITQ] finalized {count} layers (rotation + weight quant)")
