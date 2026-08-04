@@ -6,15 +6,18 @@ from datetime import datetime
 from pathlib import Path
 
 import torch
+from torchvision import transforms
+from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from models.quant.layers import QuantLinearW4A4, collect_quant_meta, set_quant_enabled, set_observer_enabled, parse_ffn_blocks
+from models.quant.layers import QuantLinearW4A4, collect_quant_meta, set_quant_enabled, set_observer_enabled, parse_ffn_blocks, get_target_suffixes
 from models.quant.calibrate import load_calib_cache, save_calib_cache, calibrate_all_layers
 from models.quant.inference import calibrate_w4a4, replace_quant_layers
-from models.pipeline import get_image_names, get_weight_dtype, load_models, run_inference, save_report
+from models.pipeline import get_image_names, get_weight_dtype, load_models, run_inference, save_report, image_to_latent
 from models.quant.analysis import ActivationErrorAnalyzer
 from models.quant.ditas import generate_random_calib_data
+from models.quant.viditq_wrapper import replace_with_viditq, collect_viditq_act_stats, finalize_viditq_weights
 
 
 def parse_args():
@@ -90,6 +93,12 @@ def parse_args():
                         help="Disable SVD iteration early-stop (always run all iterations). "
                              "Default early-stop improves or maintains quality; disable only "
                              "for strict reproduction of DiTAS (fixed 10 iters).")
+    parser.add_argument("--viditq", action="store_true",
+                        help="Enable ViDiT-Q mode. "
+                             "SmoothQuant + Hadamard rotation, W8A8 static-dynamic PTQ. "
+                             "Uses ViDiTQuantizedLinear instead of QuantLinearW4A4.")
+    parser.add_argument("--viditq_alpha", type=float, default=0.5,
+                        help="SmoothQuant migration strength for ViDiT-Q (default: 0.5).")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--upscale", type=int, default=4)
     parser.add_argument("--process_size", type=int, default=512)
@@ -361,17 +370,54 @@ def main():
         with open(config_path, "w") as f:
             json.dump(dict(transformer.config), f, indent=2)
         print(f"[MERGED] saved merged backbone ({len(transformer.state_dict())} keys) -> {out_dir}/")
-    replaced_layers = replace_quant_layers(
-        transformer, args.quant_scope,
-        args.w_bits, args.a_bits, args.svdq_rank, args.svdq_smooth_alpha,
-        svdq_iterations=args.svdq_iterations, act_group_size=args.act_group_size,
-        weight_group_size=args.weight_group_size,
-        ffn_blocks=parse_ffn_blocks(args.quant_ffn_blocks),
-        asymmetric=args.asymmetric)
+    if args.viditq and args.quant_scope != "none":
+        # --- ViDiT-Q flow ----------------------------------------------------
+        from models.quant.tiler import tile_sample
+        target_suffixes = get_target_suffixes(
+            args.quant_scope, ffn_blocks=parse_ffn_blocks(args.quant_ffn_blocks))
+        replaced_layers = replace_with_viditq(
+            transformer, target_suffixes,
+            w_bits=args.w_bits, a_bits=args.a_bits,
+            w_sym=False, a_sym=True, alpha=args.viditq_alpha)
 
-    if args.quant_scope != "none" and args.calib_cache and os.path.exists(args.calib_cache):
-        load_calib_cache(transformer, args.calib_cache)
+        # build calibration data
+        if args.ditas:
+            calib_data_list = generate_random_calib_data(
+                vae, timesteps, pooled_prompt_embeds, weight_dtype,
+                device=device, num_samples=args.calib_images)
+        else:
+            tensor_transform = transforms.Compose([transforms.ToTensor()])
+            calib_count = min(max(args.calib_images, 1), len(calib_image_names))
+            calib_names = calib_image_names[:calib_count]
+            calib_data_list = []
+            for image_path in tqdm(calib_names, desc="Building calib data"):
+                model_input, _ = image_to_latent(
+                    args.upscale, args.process_size, vae, image_path,
+                    tensor_transform, device, weight_dtype)
+                calib_data_list.append((model_input, timesteps, pooled_prompt_embeds, weight_dtype))
+
+        def _forward_fn(mi, ts, ppe, wd):
+            tile_sample(mi, transformer, ts, ppe, wd,
+                        latent_tiled_size=args.latent_tiled_size,
+                        latent_tiled_overlap=args.latent_tiled_overlap)
+
+        collect_viditq_act_stats(transformer, calib_data_list, _forward_fn)
+        finalize_viditq_weights(transformer)
+        quant_meta = []
+        # ---------------------------------------------------------------------
     else:
+        # --- SVDQ flow (unchanged) -------------------------------------------
+        replaced_layers = replace_quant_layers(
+            transformer, args.quant_scope,
+            args.w_bits, args.a_bits, args.svdq_rank, args.svdq_smooth_alpha,
+            svdq_iterations=args.svdq_iterations, act_group_size=args.act_group_size,
+            weight_group_size=args.weight_group_size,
+            ffn_blocks=parse_ffn_blocks(args.quant_ffn_blocks),
+            asymmetric=args.asymmetric)
+
+    if not args.viditq and args.quant_scope != "none" and args.calib_cache and os.path.exists(args.calib_cache):
+        load_calib_cache(transformer, args.calib_cache)
+    elif not args.viditq:
         if args.ditas:
             calib_data_list = generate_random_calib_data(
                 vae, timesteps, pooled_prompt_embeds, weight_dtype,
