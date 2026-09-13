@@ -107,8 +107,8 @@ if __name__ == "__main__":
     vae = AutoencoderTiny.from_pretrained(args.vae_path, torch_dtype=weight_dtype, cache_dir=args.cache_dir)
     vae_decode = vae
 
-    if args.is_use_tile:
-        _init_tiled_vae(vae, encoder_tile_size=args.vae_encoder_tiled_size, decoder_tile_size=args.vae_decoder_tiled_size)
+    # Native tiled VAE (the vaehook-based tiler is incompatible with this VAE)
+    vae.enable_tiling(True)
 
     if args.lora_dir:
         transformer_lora_config = LoraConfig(
@@ -245,6 +245,5 @@ if __name__ == "__main__":
     print(f"Average Wall time: {total_wall_time / datalen:.4f} sec/image")
     print(f"Peak mem  avg: {np.mean(mem_arr):.0f} MB")
     print(f"Peak mem  max: {np.max(mem_arr):.0f} MB")
-
 
 

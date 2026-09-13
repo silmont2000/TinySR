@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Visualize SVDQuant-style distribution analysis for TinySR linear layers.
 
-For each specified layer, generates a 5-panel figure showing:
+For each specified layer, generates a 5-panel distribution figure plus a thin
+legend strip whose color bands are labeled directly. The panels show:
   (a) |X|       — original input activation distribution
   (b) |W|       — original weight distribution
   (c) |X_hat|   — after smooth-scaling (activation side)
@@ -23,10 +24,13 @@ import math
 import os
 import sys
 from pathlib import Path
+from typing import Optional
 
 import matplotlib
 matplotlib.use("Agg")
+from matplotlib import font_manager
 import matplotlib.pyplot as plt
+from matplotlib.patches import Rectangle
 import numpy as np
 import torch
 from tqdm import tqdm
@@ -40,7 +44,31 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 # ---------------------------------------------------------------------------
 # Set absolute ymax for each panel. None = auto (1.05 × data max).
 # Example: {"a": (0, 2.0), "b": (0, 1.5), "c": None, "d": None, "e": (0, 0.3)}
-YLIM_CONFIG = {"a": None, "b": (0,0.4), "c": None, "d": (0,1.0), "e": (0,0.4)}
+YLIM_CONFIG = {"a": None, "b": (0,0.4), "c": (0,1.0), "d": (0,0.5), "e": (0,0.5)}
+
+# Times New Roman for all text and Times-style math.
+FONT_PATH = "/System/Library/Fonts/Supplemental/Times New Roman.ttf"
+if os.path.exists(FONT_PATH):
+    font_manager.fontManager.addfont(FONT_PATH)
+    FONT_FAMILY = font_manager.FontProperties(fname=FONT_PATH).get_name()
+else:
+    FONT_FAMILY = "Times New Roman"
+
+# Shared legend colors / labels used by all panels.
+LEGEND_COLORS = ("#4dabf7", "#ff922b", "#e03131")
+LEGEND_LABELS = ("50% pct", "99% pct", "Max")
+# Relative heights of the legend bands (bottom -> top). Max is kept a bit
+# smaller than the other two, but not at its real (often tiny) proportion so
+# the labels remain readable.
+LEGEND_HEIGHTS = (0.42, 0.34, 0.24)
+
+# Global font scale applied to every text element in the figure.
+FONT_SCALE = 2
+FONT_SIZE = 10 * FONT_SCALE
+# Subplot titles are sized independently from axes labels / tick labels.
+TITLE_FONT_SCALE = 1.5
+TITLE_FONT_SIZE = int(FONT_SIZE * TITLE_FONT_SCALE)
+AXIS_FONT_SIZE = FONT_SIZE
 
 # ---------------------------------------------------------------------------
 # helpers
@@ -77,13 +105,58 @@ def _plot_fill(ax, p50, p99, pmax, ylim=None):
     """Fill between percentile curves."""
     n = len(p50)
     x = np.arange(n)
-    ax.fill_between(x, 0, p50, alpha=1, color="#4dabf7", label="50% pct", linewidth=0)
-    ax.fill_between(x, p50, p99, alpha=1, color="#ff922b", label="99% pct", linewidth=0)
-    ax.fill_between(x, p99, pmax, alpha=1, color="#e03131", label="Max", linewidth=0)
+    ax.fill_between(x, 0, p50, alpha=1, color=LEGEND_COLORS[0], linewidth=0)
+    ax.fill_between(x, p50, p99, alpha=1, color=LEGEND_COLORS[1], linewidth=0)
+    ax.fill_between(x, p99, pmax, alpha=1, color=LEGEND_COLORS[2], linewidth=0)
     ax.set_xlim(0, n - 1)
     if ylim:
         ax.set_ylim(*ylim)
-    ax.legend(fontsize=6, loc="upper right")
+
+
+def _draw_legend_panel(ax):
+    """Draw a thin vertical color key with labels inside each band.
+
+    The three bands are stacked from bottom to top as blue / orange / red,
+    and each band carries its own label.
+    """
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    y = 0.0
+    for color, label, height in zip(LEGEND_COLORS, LEGEND_LABELS, LEGEND_HEIGHTS):
+        ax.add_patch(Rectangle((0, y), 1, height, facecolor=color, edgecolor="none"))
+        text_color = "white" if color == "#e03131" else "black"
+        ax.text(
+            0.5, y + height / 2, label,
+            ha="center", va="center", fontsize=AXIS_FONT_SIZE,
+            color=text_color, fontweight="medium",
+        )
+        y += height
+    ax.set_xticks([])
+    ax.set_yticks([])
+    ax.axis("off")
+
+
+def _panel_ylim(key: str, pmax: np.ndarray):
+    """Return the ylim used by the main figure for one panel."""
+    cfg = YLIM_CONFIG.get(key)
+    if cfg is not None:
+        return cfg
+    if key == "d":
+        return None
+    return (0, pmax.max() * 1.05)
+
+
+def _export_subplots(export_dir: str, panels):
+    """Save each a-e panel as its own figure with no text annotations."""
+    os.makedirs(export_dir, exist_ok=True)
+    for name, p50, p99, pmax, ylim in panels:
+        fig, ax = plt.subplots(figsize=(7.0, 4.6))
+        _plot_fill(ax, p50, p99, pmax, ylim=ylim)
+        # No title / legend / axis-label text; only the axes and tick labels.
+        out_path = os.path.join(export_dir, f"{name}.png")
+        fig.savefig(out_path, dpi=150, bbox_inches="tight")
+        plt.close(fig)
+        print(f"  subplot saved: {out_path}")
 
 
 # ---------------------------------------------------------------------------
@@ -104,7 +177,8 @@ class InputCaptureHook:
 # ---------------------------------------------------------------------------
 
 def plot_layer(layer_name: str, x_in: torch.Tensor, weight: torch.Tensor,
-               svd_rank: int, alpha: float, output_dir: str, no_plot: bool = False) -> dict:
+               svd_rank: int, alpha: float, output_dir: str, no_plot: bool = False,
+               export_subplots_dir: Optional[str] = None) -> dict:
     """Create the 5-panel SVDQuant figure for one layer.  All compute on CPU.
     
     Returns dict of per-layer metrics for CSV dump.
@@ -147,7 +221,33 @@ def plot_layer(layer_name: str, x_in: torch.Tensor, weight: torch.Tensor,
     residual = w_hat - lr
     p50_r, p99_r, pmax_r = _per_channel_percentiles(residual)
 
-    if no_plot:
+    panels = [
+        ("a", p50_x, p99_x, pmax_x, _panel_ylim("a", pmax_x)),
+        ("b", p50_w, p99_w, pmax_w, _panel_ylim("b", pmax_w)),
+        ("c", p50_xh, p99_xh, pmax_xh, _panel_ylim("c", pmax_xh)),
+        ("d", p50_wh, p99_wh, pmax_wh, _panel_ylim("d", pmax_wh)),
+        ("e", p50_r, p99_r, pmax_r, _panel_ylim("e", pmax_r)),
+    ]
+
+    plt.rcParams.update({
+        "font.family": FONT_FAMILY,
+        "mathtext.fontset": "stix",
+        "font.size": AXIS_FONT_SIZE,
+        "axes.titlesize": TITLE_FONT_SIZE,
+        "axes.labelsize": AXIS_FONT_SIZE,
+        "xtick.labelsize": AXIS_FONT_SIZE,
+        "ytick.labelsize": AXIS_FONT_SIZE,
+    })
+
+    if export_subplots_dir is not None:
+        # Dedicated mode: only the a-e panels, no combined figure.
+        _export_subplots(export_subplots_dir, panels)
+        sv_np = sv.cpu().numpy()
+        cond = float(sv_np[0] / max(sv_np[-1], 1e-8))
+        eff_rank = float(sv_np.sum() / max(sv_np[0], 1e-8))
+        sv_norm = sv_np / sv_np.sum()
+        eff_rank_entropy = float(np.exp(-np.sum(sv_norm * np.log(sv_norm + 1e-12))))
+    elif no_plot:
         # Still need sv_np/cond/eff_rank for metrics
         sv_np = sv.cpu().numpy()
         cond = float(sv_np[0] / max(sv_np[-1], 1e-8))
@@ -156,36 +256,62 @@ def plot_layer(layer_name: str, x_in: torch.Tensor, weight: torch.Tensor,
         eff_rank_entropy = float(np.exp(-np.sum(sv_norm * np.log(sv_norm + 1e-12))))
     else:
         # ── plotting ─────────────────────────────────────────────
-        fig, axes = plt.subplots(1, 5, figsize=(22, 3.2))
-        fig.suptitle(f"{layer_name}  (α={alpha}, rank={svd_rank})", fontsize=10, y=1.02)
+        fig, axes = plt.subplots(
+            1, 6, figsize=(28, 6.0),
+            gridspec_kw={"width_ratios": [1, 1, 1, 1, 1, 0.26]},
+            layout="constrained",
+        )
 
         _plot_fill(axes[0], p50_x, p99_x, pmax_x, ylim=YLIM_CONFIG["a"] or (0, pmax_x.max() * 1.05))
-        axes[0].set_title(r"(a) Original, $|X|$  max={:.3f}".format(pmax_x.max()))
+        axes[0].set_title(
+            "(a) Original " + r"$|X|$" + "\nmax={:.3f}".format(pmax_x.max()),
+            fontsize=TITLE_FONT_SIZE,
+        )
         axes[0].set_xlabel("Channel")
 
         _plot_fill(axes[1], p50_w, p99_w, pmax_w, ylim=YLIM_CONFIG["b"] or (0, pmax_w.max() * 1.05))
-        axes[1].set_title(r"(b) Original, $|W|$  max={:.3f}".format(pmax_w.max()))
+        axes[1].set_title(
+            "(b) Original " + r"$|W|$" + "\nmax={:.3f}".format(pmax_w.max()),
+            fontsize=TITLE_FONT_SIZE,
+        )
         axes[1].set_xlabel("Channel")
 
         _plot_fill(axes[2], p50_xh, p99_xh, pmax_xh, ylim=YLIM_CONFIG["c"] or (0, pmax_xh.max() * 1.05))
-        axes[2].set_title(r"(c) After Smoothing, $|\tilde{{X}}| = |X \cdot \operatorname{{diag}}(\lambda)^{{-1}}|$  max={:.3f}".format(pmax_xh.max()))
+        axes[2].set_title(
+            "(c) After Smoothing\n"
+            + r"$|\tilde{X}| = |X \cdot \operatorname{diag}(\lambda)^{-1}|$"
+            + "\nmax={:.3f}".format(pmax_xh.max()),
+            fontsize=TITLE_FONT_SIZE,
+        )
         axes[2].set_xlabel("Channel")
 
         _plot_fill(axes[3], p50_wh, p99_wh, pmax_wh, ylim=YLIM_CONFIG["d"] or None)
-        axes[3].set_title(r"(d) After Smoothing, $|\tilde{{W}}| = |W \cdot \operatorname{{diag}}(\lambda)|$  max={:.3f}".format(pmax_wh.max()))
+        axes[3].set_title(
+            "(d) After Smoothing\n"
+            + r"$|\tilde{W}| = |W \cdot \operatorname{diag}(\lambda)|$"
+            + "\nmax={:.3f}".format(pmax_wh.max()),
+            fontsize=TITLE_FONT_SIZE,
+        )
         axes[3].set_xlabel("Channel")
 
         _plot_fill(axes[4], p50_r, p99_r, pmax_r, ylim=YLIM_CONFIG["e"] or (0, pmax_r.max() * 1.05))
-        axes[4].set_title(r"(e) After SVD, $|R| = |\tilde{{W}} - L_1 L_2|$  max={:.3f}".format(pmax_r.max()))
+        axes[4].set_title(
+            "(e) After SVD\n"
+            + r"$|R| = |\tilde{W} - L_1 L_2|$"
+            + "\nmax={:.3f}".format(pmax_r.max()),
+            fontsize=TITLE_FONT_SIZE,
+        )
         axes[4].set_xlabel("Channel")
+
+        # Thin vertical color key (blue / orange / red, bottom -> top).
+        _draw_legend_panel(axes[5])
 
         sv_np = sv.cpu().numpy()
         cond = float(sv_np[0] / max(sv_np[-1], 1e-8))
         eff_rank = float(sv_np.sum() / max(sv_np[0], 1e-8))
         sv_norm = sv_np / sv_np.sum()
         eff_rank_entropy = float(np.exp(-np.sum(sv_norm * np.log(sv_norm + 1e-12))))
-        
-        plt.tight_layout()
+
         os.makedirs(output_dir, exist_ok=True)
         safe_name = layer_name.replace(".", "_").replace("/", "_")
         out_path = os.path.join(output_dir, f"svdq_vis_{safe_name}.png")
@@ -260,11 +386,14 @@ def parse_args():
                         help="Max number of images to aggregate (default 20)")
     parser.add_argument("--layers", type=str, nargs="*", default=None,
                         help="Layer names to analyze (default: all ff.net.0.proj + ff.net.2 for blocks 0-11)")
-    parser.add_argument("--alpha", type=float, default=1.0,
-                        help="Smooth alpha (default 1.0)")
+    parser.add_argument("--alpha", type=float, default=0.9,
+                        help="Smooth alpha (default 0.9)")
     parser.add_argument("--svd_rank", type=int, default=32,
                         help="SVD low-rank for residual visualization")
     parser.add_argument("--output_dir", type=str, default="outputs/vis_quant")
+    parser.add_argument("--export_subplots", type=str, default=None,
+                        help="Instead of the combined figure, save individual a-e "
+                             "panels (axes only, no text) into this directory")
     parser.add_argument("--no_plot", action="store_true",
                         help="Skip PNG output (metrics/dumps only)")
     parser.add_argument("--dump_metrics", type=str, default=None,
@@ -684,7 +813,8 @@ def main():
             continue
 
         metrics = plot_layer(name, x_in, weight, args.svd_rank, args.alpha,
-                              args.output_dir, no_plot=args.no_plot)
+                              args.output_dir, no_plot=args.no_plot,
+                              export_subplots_dir=args.export_subplots)
         all_metrics.append(metrics)
 
     # ── dump CSV ─────────────────────────────────────────────

@@ -19,6 +19,10 @@ from models.pipeline import get_image_names, get_weight_dtype, load_models, run_
 from models.quant.analysis import ActivationErrorAnalyzer
 from models.quant.ditas import generate_random_calib_data
 from models.quant.viditq_wrapper import replace_with_viditq, collect_viditq_act_stats, finalize_viditq_weights
+from models.quant.qdit_wrapper import QDITArgs, replace_with_qdit, quantize_model_qdit_gptq
+from models.quant.ptq4dit_wrapper import (
+    PTQ4DiTArgs, replace_with_ptq4dit, collect_ptq4dit_stats, run_ptq4dit_block_recon,
+)
 
 
 def parse_args():
@@ -100,6 +104,48 @@ def parse_args():
                              "Uses ViDiTQuantizedLinear instead of QuantLinearW4A4.")
     parser.add_argument("--viditq_alpha", type=float, default=0.5,
                         help="SmoothQuant migration strength for ViDiT-Q (default: 0.5).")
+    # --- Q-DiT mode (CVPR 2025) --------------------------------------------
+    parser.add_argument("--qdit", action="store_true",
+                        help="Enable Q-DiT mode: dynamic per-token activation quant + "
+                             "per-channel/group weight quant with optional GPTQ refinement. "
+                             "Uses QDiTQuantLinear instead of QuantLinearW4A4.")
+    parser.add_argument("--qdit_use_gptq", action="store_true",
+                        help="Q-DiT: use GPTQ Hessian-based weight refinement (official default).")
+    parser.add_argument("--qdit_no_gptq", action="store_true",
+                        help="Q-DiT: disable GPTQ; plain per-channel/group weight quant.")
+    parser.add_argument("--qdit_weight_group_size", type=int, default=128,
+                        help="Q-DiT weight group size (official default 128). -1 = per-channel.")
+    parser.add_argument("--qdit_act_group_size", type=int, default=128,
+                        help="Q-DiT activation group size (official default 128). -1 = per-token.")
+    parser.add_argument("--qdit_w_sym", action="store_true",
+                        help="Q-DiT symmetric weight quantization (official default: asymmetric).")
+    parser.add_argument("--qdit_a_sym", action="store_true",
+                        help="Q-DiT symmetric activation quantization (official default: asymmetric).")
+    parser.add_argument("--qdit_quant_method", type=str, default="max", choices=["max", "mse"],
+                        help="Q-DiT weight scale search method (official default: max).")
+    parser.add_argument("--qdit_percdamp", type=float, default=0.01,
+                        help="Q-DiT GPTQ Hessian dampening percentage.")
+    parser.add_argument("--qdit_gptq_blocksize", type=int, default=128,
+                        help="Q-DiT GPTQ blocksize.")
+    # --- PTQ4DiT mode (NeurIPS 2024) ----------------------------------------
+    parser.add_argument("--ptq4dit", action="store_true",
+                        help="Enable PTQ4DiT mode: asymmetric per-channel weight quant (mse scale) "
+                             "+ static per-tensor act quant + tau-weighted smoothing + "
+                             "block-wise AdaRound reconstruction. Uses QuantModule.")
+    parser.add_argument("--ptq4dit_iters", type=int, default=1000,
+                        help="PTQ4DiT block reconstruction iterations (official default 20000; "
+                             "reduced for the smaller single-timestep SR calibration set).")
+    parser.add_argument("--ptq4dit_calib_batch_size", type=int, default=8,
+                        help="PTQ4DiT batch size for caching and reconstruction steps "
+                             "(reduced from official 32; the SD3 backbone runs at 1024 tokens).")
+    parser.add_argument("--ptq4dit_sm_abit", type=int, default=8,
+                        help="PTQ4DiT attention-weights (softmax) activation bit-width.")
+    parser.add_argument("--ptq4dit_init_samples", type=int, default=8,
+                        help="PTQ4DiT number of calibration samples for scale-initialization passes.")
+    parser.add_argument("--ptq4dit_no_tau_smooth", action="store_true",
+                        help="Disable PTQ4DiT tau-weighted Spearman input smoothing.")
+    parser.add_argument("--ptq4dit_act_lr", type=float, default=4e-5,
+                        help="PTQ4DiT learning rate for activation deltas in block recon.")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--upscale", type=int, default=4)
     parser.add_argument("--process_size", type=int, default=512)
@@ -136,6 +182,32 @@ def parse_args():
     return parser.parse_args()
 
 # fmt:on
+
+
+def _build_calib_data_list(args, calib_image_names, vae, device, weight_dtype,
+                           timesteps, pooled_prompt_embeds):
+    """Build the shared calibration data list of
+    (latent, timesteps, pooled_prompt_embeds, weight_dtype) tuples.
+    Shared by the ViDiT-Q / Q-DiT / PTQ4DiT flows (image-based, fixed timestep)."""
+    from models.quant.ditas import generate_random_calib_data
+    if args.ditas:
+        return generate_random_calib_data(
+            vae, timesteps, pooled_prompt_embeds, weight_dtype,
+            device=device, num_samples=args.calib_images)
+    tensor_transform = transforms.Compose([transforms.ToTensor()])
+    calib_count = min(max(args.calib_images, 1), len(calib_image_names))
+    calib_names = calib_image_names[:calib_count]
+    calib_data_list = []
+    # CRITICAL: encode under no_grad, otherwise each retained latent keeps the
+    # whole VAE autograd graph alive and GPU memory accumulates to OOM
+    # (the SVDQ calibration path wraps this in no_grad too).
+    with torch.no_grad():
+        for image_path in tqdm(calib_names, desc="Building calib data"):
+            model_input, _ = image_to_latent(
+                args.upscale, args.process_size, vae, image_path,
+                tensor_transform, device, weight_dtype)
+            calib_data_list.append((model_input, timesteps, pooled_prompt_embeds, weight_dtype))
+    return calib_data_list
 
 
 def _derive_output_dir(args):
@@ -374,7 +446,63 @@ def main():
         with open(config_path, "w") as f:
             json.dump(dict(transformer.config), f, indent=2)
         print(f"[MERGED] saved merged backbone ({len(transformer.state_dict())} keys) -> {out_dir}/")
-    if args.viditq and args.quant_scope != "none":
+    if args.qdit and args.quant_scope != "none":
+        # --- Q-DiT flow (CVPR 2025) ------------------------------------------
+        from models.quant.tiler import tile_sample
+        target_suffixes = get_target_suffixes(
+            args.quant_scope, ffn_blocks=parse_ffn_blocks(args.quant_ffn_blocks))
+        qdit_args = QDITArgs(
+            wbits=args.w_bits, abits=args.a_bits,
+            w_sym=args.qdit_w_sym, a_sym=args.qdit_a_sym,
+            weight_group_size=args.qdit_weight_group_size,
+            act_group_size=args.qdit_act_group_size,
+            quant_method=args.qdit_quant_method,
+            percdamp=args.qdit_percdamp,
+            gptq_blocksize=args.qdit_gptq_blocksize,
+            use_gptq=args.qdit_use_gptq and not args.qdit_no_gptq,
+        )
+        replaced_layers = replace_with_qdit(transformer, target_suffixes, qdit_args)
+
+        calib_data_list = _build_calib_data_list(
+            args, calib_image_names, vae, device, weight_dtype,
+            timesteps, pooled_prompt_embeds)
+
+        def _qdit_forward_fn(mi, ts, ppe, wd):
+            tile_sample(mi, transformer, ts, ppe, wd,
+                        latent_tiled_size=args.latent_tiled_size,
+                        latent_tiled_overlap=args.latent_tiled_overlap)
+
+        quantize_model_qdit_gptq(transformer, calib_data_list, _qdit_forward_fn, qdit_args)
+        quant_meta = []
+    elif args.ptq4dit and args.quant_scope != "none":
+        # --- PTQ4DiT flow (NeurIPS 2024) --------------------------------------
+        from models.quant.tiler import tile_sample
+        target_suffixes = get_target_suffixes(
+            args.quant_scope, ffn_blocks=parse_ffn_blocks(args.quant_ffn_blocks))
+        ptq4dit_args = PTQ4DiTArgs(
+            w_bits=args.w_bits, a_bits=args.a_bits,
+            sm_abit=args.ptq4dit_sm_abit,
+            cali_init_samples=args.ptq4dit_init_samples,
+            recon_iters=args.ptq4dit_iters,
+            recon_batch_size=args.ptq4dit_calib_batch_size,
+            act_lr=args.ptq4dit_act_lr,
+            use_tau_smooth=not args.ptq4dit_no_tau_smooth,
+        )
+        replaced_layers = replace_with_ptq4dit(transformer, target_suffixes, ptq4dit_args)
+
+        calib_data_list = _build_calib_data_list(
+            args, calib_image_names, vae, device, weight_dtype,
+            timesteps, pooled_prompt_embeds)
+
+        def _ptq4dit_forward_fn(mi, ts, ppe, wd):
+            tile_sample(mi, transformer, ts, ppe, wd,
+                        latent_tiled_size=args.latent_tiled_size,
+                        latent_tiled_overlap=args.latent_tiled_overlap)
+
+        collect_ptq4dit_stats(transformer, calib_data_list, _ptq4dit_forward_fn, ptq4dit_args)
+        run_ptq4dit_block_recon(transformer, calib_data_list, _ptq4dit_forward_fn, ptq4dit_args)
+        quant_meta = []
+    elif args.viditq and args.quant_scope != "none":
         # --- ViDiT-Q flow ----------------------------------------------------
         from models.quant.tiler import tile_sample
         target_suffixes = get_target_suffixes(
@@ -419,9 +547,9 @@ def main():
             ffn_blocks=parse_ffn_blocks(args.quant_ffn_blocks),
             asymmetric=args.asymmetric)
 
-    if not args.viditq and args.quant_scope != "none" and args.calib_cache and os.path.exists(args.calib_cache):
+    if not (args.viditq or args.qdit or args.ptq4dit) and args.quant_scope != "none" and args.calib_cache and os.path.exists(args.calib_cache):
         load_calib_cache(transformer, args.calib_cache)
-    elif not args.viditq:
+    elif not (args.viditq or args.qdit or args.ptq4dit):
         if args.ditas:
             calib_data_list = generate_random_calib_data(
                 vae, timesteps, pooled_prompt_embeds, weight_dtype,

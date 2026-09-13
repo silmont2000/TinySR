@@ -2,10 +2,7 @@ import torch
 
 
 def gaussian_weights(tile_width, tile_height, nbatches, in_channels, device, dtype):
-    # Smooth blend: var=0.2 keeps weight ~0.5 at tile edges so overlapping tiles
-    # transition gradually. The original var=0.01 makes a very peaked window whose
-    # hard per-tile dominance shows up as visible circular artifacts on large images.
-    var = 0.2
+    var = 0.01
     midpoint_x = (tile_width - 1) / 2
     midpoint_y = tile_height / 2
 
@@ -18,8 +15,7 @@ def gaussian_weights(tile_width, tile_height, nbatches, in_channels, device, dty
                         (tile_height * tile_height) / (2 * var))
 
     weights = torch.outer(y_probs, x_probs)
-    # Keep float32: casting the 2D Gaussian to fp16 underflows at tile edges
-    # (values ~1e-11 < fp16 min subnormal), producing zero contributors -> 0/0 NaN.
+    weights = weights.to(dtype=dtype)
     return weights.expand(nbatches, in_channels, tile_height, tile_width)
 
 
@@ -90,9 +86,9 @@ def tile_sample(
             noise_preds.append(pred)
 
     noise_pred = torch.zeros(
-        lq_latent.shape, device=lq_latent.device, dtype=torch.float32)
+        lq_latent.shape, device=lq_latent.device, dtype=weight_dtype)
     contributors = torch.zeros(
-        lq_latent.shape, device=lq_latent.device, dtype=torch.float32)
+        lq_latent.shape, device=lq_latent.device, dtype=weight_dtype)
 
     for row in range(grid_rows):
         for col in range(grid_cols):
@@ -110,5 +106,5 @@ def tile_sample(
             contributors[:, :, ofs_y: ofs_y + tile_size,
                          ofs_x: ofs_x + tile_size] += tile_weights
 
-    model_pred = noise_pred / contributors.clamp_min(1e-6)
+    model_pred = noise_pred / contributors.clamp_min(1e-8)
     return model_pred.to(lq_latent.device, dtype=weight_dtype)

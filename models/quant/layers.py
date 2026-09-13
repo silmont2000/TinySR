@@ -37,7 +37,9 @@ def get_target_suffixes(quant_scope, ffn_blocks=None):
     if quant_scope == "ffn_only":
         return FFN_SUFFIXES
     if quant_scope == "attn_only":
-        base = list(ATTN_SUFFIXES)
+        # Keep the historical compare.tex scope (46 layers): attention output
+        # projection (to_out.0) stays full precision. dit_full still includes it.
+        base = [s for s in ATTN_SUFFIXES if s != "attn.to_out.0"]
         if ffn_blocks is not None:
             base += get_ffn_block_suffixes(ffn_blocks)
         return base

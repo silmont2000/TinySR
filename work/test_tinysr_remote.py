@@ -70,7 +70,7 @@ tensor_transforms = transforms.Compose([
 def main(args, pixel_values, size):
     with torch.no_grad():
         # Preprocess the input image
-        pixel_values = torch.nn.functional.interpolate(pixel_values, size=size, mode='bilinear', align_corners=False)
+        pixel_values = torch.nn.functional.interpolate(pixel_values, size=size, mode='bicubic', align_corners=False)
         pixel_values = pixel_values * 2 - 1
         pixel_values = pixel_values.to(args.device, dtype=weight_dtype)
 

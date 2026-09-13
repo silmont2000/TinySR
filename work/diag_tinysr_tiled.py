@@ -78,15 +78,32 @@ def main(args, pixel_values, size):
         model_input = vae.encode(pixel_values).latents * vae.config.scaling_factor
         # model_input = vae_decode.encode(pixel_values).latents_dist.sample() * vae.config.scaling_factor
         model_input = model_input.to(args.device, dtype=weight_dtype)
+        mi = model_input.float()
+        print("[DIAG] model_input shape", tuple(mi.shape),
+              "nan", torch.isnan(mi).sum().item(),
+              "min", mi.min().item(), "max", mi.max().item(), "mean", mi.mean().item())
+        torch.save(mi.cpu(), "/root/autodl-tmp/TinySR/outputs/diag_model_input.pt")
 
         # Predict
         model_pred = tile_sample(model_input, transformer, timesteps, pooled_prompt_embeds, weight_dtype,
                                  latent_tiled_size=args.latent_tiled_size, latent_tiled_overlap=args.latent_tiled_overlap)
+        mp = model_pred.float()
+        print("[DIAG] model_pred shape", tuple(mp.shape),
+              "nan", torch.isnan(mp).sum().item(),
+              "min", mp.min().item(), "max", mp.max().item(), "mean", mp.mean().item(),
+              "absmean", mp.abs().mean().item())
+        torch.save(mp.cpu(), "/root/autodl-tmp/TinySR/outputs/diag_model_pred.pt")
 
         latent_stu = model_input - model_pred
+        ls = latent_stu.float()
+        print("[DIAG] latent_stu nan", torch.isnan(ls).sum().item(),
+              "min", ls.min().item(), "max", ls.max().item(), "mean", ls.mean().item())
 
         # Decode the output
         image = vae_decode.decode(latent_stu / vae.config.scaling_factor, return_dict=False)[0].squeeze(0).clamp(-1,1)
+        img = image.float()
+        print("[DIAG] image nan", torch.isnan(img).sum().item(),
+              "min", img.min().item(), "max", img.max().item(), "mean", img.mean().item())
 
         return image
 
@@ -107,8 +124,8 @@ if __name__ == "__main__":
     vae = AutoencoderTiny.from_pretrained(args.vae_path, torch_dtype=weight_dtype, cache_dir=args.cache_dir)
     vae_decode = vae
 
-    if args.is_use_tile:
-        _init_tiled_vae(vae, encoder_tile_size=args.vae_encoder_tiled_size, decoder_tile_size=args.vae_decoder_tiled_size)
+    # Native tiled VAE (the vaehook-based tiler is incompatible with this VAE)
+    vae.enable_tiling(True)
 
     if args.lora_dir:
         transformer_lora_config = LoraConfig(
@@ -171,8 +188,7 @@ if __name__ == "__main__":
 
         lr_scale = lr.resize((int(ori_width*args.upscale), int(ori_height*args.upscale)))
         pixel_values = tensor_transforms(lr).unsqueeze(0).to(args.device, dtype=weight_dtype)
-        for i in range(5):
-            main(args, pixel_values, (new_height, new_width))
+        # warmup removed for diagnostics
 
     if torch.cuda.is_available():
         start_ev = torch.cuda.Event(enable_timing=True)
@@ -245,6 +261,3 @@ if __name__ == "__main__":
     print(f"Average Wall time: {total_wall_time / datalen:.4f} sec/image")
     print(f"Peak mem  avg: {np.mean(mem_arr):.0f} MB")
     print(f"Peak mem  max: {np.max(mem_arr):.0f} MB")
-
-
-

@@ -227,13 +227,7 @@ class AutoencoderTiny(ModelMixin, ConfigMixin, FromOriginalModelMixin, PeftAdapt
         blend_masks = blend_masks.clamp(0, 1).to(x.device)
 
         # output array
-        out = torch.zeros(
-            x.shape[0],
-            self.config.latent_channels,
-            x.shape[-2] // sf,
-            x.shape[-1] // sf,
-            device=x.device,
-        )
+        out = torch.zeros(x.shape[0], 4, x.shape[-2] // sf, x.shape[-1] // sf, device=x.device)
         for i in ti:
             for j in tj:
                 tile_in = x[..., i : i + tile_size, j : j + tile_size]
